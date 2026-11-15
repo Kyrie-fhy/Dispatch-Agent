@@ -1,0 +1,9 @@
+{
+  "compilerOptions": {
+    "target": "ES2019", "module": "CommonJS", "strict": true,
+    "rootDir": "code/miniprogram", "outDir": "code/dist",
+    "types": ["miniprogram-api-typings"], "lib": ["ES2019"],
+    "noEmitOnError": true, "skipLibCheck": true
+  },
+  "include": ["code/miniprogram/**/*.ts"]
+}

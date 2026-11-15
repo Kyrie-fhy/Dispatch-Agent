@@ -1,0 +1,11 @@
+.DS_Store
+node_modules/
+code/dist/
+coverage/
+*.log
+.env
+.env.*
+!.env.example
+project.private.config.json
+*.pem
+*.key

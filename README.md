@@ -21,7 +21,7 @@ npm ci
 npm run check
 ```
 
-使用 npm 和仓库内 package-lock.json。已核验本地 Node 18.15.0、npm 9.5.0，待启用的远端 CI 模板配置 Node 22。当前 GitHub 凭证缺少 workflow 权限，模板位于 scripts/templates/github-actions-check.yml；授权后移动到 .github/workflows/check.yml 并提交即可启用。
+使用 npm 和仓库内 package-lock.json。已核验本地 Node 18.15.0、npm 9.5.0，GitHub Actions 配置使用 Node 22，工作流位于 .github/workflows/check.yml，在推送和 PR 更新时执行同一套检查。远端启用和运行结果见开发任务记录。
 
 ## 微信预览
 

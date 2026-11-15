@@ -1,6 +1,6 @@
 {
   "projectname": "Dispatch Agent",
-  "description": "S1 本地录单原型",
+  "description": "S2 多客户配送原型",
   "appid": "touristappid",
   "compileType": "miniprogram",
   "miniprogramRoot": "code/dist/",

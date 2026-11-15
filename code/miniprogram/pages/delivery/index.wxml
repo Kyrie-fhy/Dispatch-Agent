@@ -1,11 +1,91 @@
+<import src="../order-templates.wxml" />
 <view class="container">
-  <view class="title">正式送货单</view>
-  <view class="hint">S1 展示已确认订单。配送标记和收款将在 S2、S3 接入。</view>
-  <view wx:if="{{error}}" class="error">{{error}}</view>
-  <view wx:elif="{{!list.length}}" class="card">还没有正式单，请先到助手录入并确认。</view>
-  <view wx:for="{{list}}" wx:key="id" class="card">
-    <view>{{item.customer}}</view>
-    <view class="hint">{{item.id}}</view>
-    <view class="amount">订单金额 ¥{{item.total}}</view>
-  </view>
+  <view class="title">送货单</view>
+  <view wx:if="{{error}}" class="error" role="alert">{{error}}</view>
+  <view wx:if="{{notice}}" class="notice">{{notice}}</view>
+  <block wx:if="{{images}}">
+    <view class="section-title">{{images.customer}} · 第 {{images.version}} 版</view>
+    <view class="hint">保存到相册后，可在微信发送给该客户。</view>
+    <view wx:for="{{images.files}}" wx:key="*this" class="card image-card">
+      <image mode="widthFix" src="{{item}}" data-file="{{item}}" bindtap="previewImage" />
+    </view>
+    <button class="primary" bindtap="saveImages" loading="{{busy}}" disabled="{{busy || images.saved === images.files.length}}">
+      保存到相册（{{images.saved}} / {{images.files.length}}）
+    </button>
+    <button wx:if="{{albumSettings}}" bindtap="openAlbumSettings">打开相册权限设置</button>
+    <button bindtap="closeImages" disabled="{{busy}}">返回客户单据</button>
+  </block>
+  <block wx:elif="{{amendment}}">
+    <view class="section-title">{{amendment.customer.customer}} · 更正单据</view>
+    <view wx:if="{{preview}}" class="card">
+      <view class="section-title">更正预览</view>
+      <view wx:for="{{preview.changes}}" wx:key="id" class="line">
+        <block wx:if="{{item.before}}">
+          <view class="muted">原明细 · {{item.beforeStatus}}</view>
+          <template is="order-line" data="{{line: item.before}}" />
+        </block>
+        <block wx:if="{{item.after}}">
+          <view class="muted">更正后 · {{item.afterStatus}}</view>
+          <template is="order-line" data="{{line: item.after}}" />
+        </block>
+        <view wx:else>移除此明细</view>
+      </view>
+      <view class="subtotal">客户订单金额 ¥{{preview.before}} → ¥{{preview.after}}</view>
+      <view class="subtotal">取货变化</view>
+      <view wx:if="{{!preview.picking.length}}" class="hint">本次取货数量无变化</view>
+      <view wx:for="{{preview.picking}}" wx:key="id" class="line">{{item.brand}} {{item.product}} · {{item.specification}} {{item.before}} → {{item.after}} {{item.unit}}</view>
+      <button class="primary" bindtap="confirmAmendment">确认更正</button>
+      <button bindtap="editAgain">返回修改</button>
+    </view>
+    <view wx:else class="card">
+      <template is="edit-lines" data="{{form: form}}" />
+      <button class="primary" bindtap="showAmendmentPreview">预览更正</button>
+    </view>
+    <button bindtap="cancelAmendment">取消更正</button>
+  </block>
+  <block wx:elif="{{detail}}">
+    <button bindtap="backToList" disabled="{{busy}}">返回客户列表</button>
+    <view class="card">
+      <view class="section-title">{{detail.customer}} · 第 {{detail.version}} 版</view>
+      <view class="hint reference">{{detail.id}}</view>
+      <view wx:for="{{detail.items}}" wx:key="id" class="line">
+        <template is="order-line" data="{{line: item}}" />
+        <view class="line-status">
+          <text class="{{item.delivered ? 'delivered' : 'muted'}}">{{item.label}}</text>
+          <button wx:if="{{detail.active}}" size="mini" data-id="{{item.id}}" bindtap="toggleLine" disabled="{{busy}}">
+            {{item.delivered ? '改为未配送' : '标记已送达'}}
+          </button>
+        </view>
+      </view>
+      <view class="amount">订单金额 ¥{{detail.total}}</view>
+      <block wx:if="{{detail.active}}">
+        <button class="primary" bindtap="deliverCustomer" disabled="{{busy}}">本客户全部已送达</button>
+        <button bindtap="startAmendment" disabled="{{busy}}">更正单据</button>
+      </block>
+      <button bindtap="exportImages" loading="{{busy}}" disabled="{{busy}}">导出明细图</button>
+    </view>
+  </block>
+  <block wx:else>
+    <view wx:if="{{current}}" class="card">
+      <view class="section-title">本趟 · 第 {{current.version}} 版</view>
+      <view class="hint">{{current.openedAt}} · 整趟订单金额 ¥{{current.total}}</view>
+      <button wx:for="{{current.customers}}" wx:key="id" data-trip-id="{{current.id}}" data-customer-id="{{item.id}}" bindtap="openCustomer">
+        {{index + 1}}. {{item.name}} · ¥{{item.total}}
+      </button>
+    </view>
+    <view wx:elif="{{!error}}" class="card">
+      还没有当前配送趟。
+      <navigator url="/pages/assistant/index" open-type="switchTab" class="link">去助手录单</navigator>
+    </view>
+    <view wx:if="{{history.length}}" class="section-title">历史单据</view>
+    <view wx:for="{{history}}" wx:for-item="trip" wx:key="id" class="card">
+      <button data-id="{{trip.id}}" bindtap="toggleHistory">{{trip.openedAt}} · ¥{{trip.total}}</button>
+      <block wx:if="{{historyId === trip.id}}">
+        <button wx:for="{{trip.customers}}" wx:key="id" data-trip-id="{{trip.id}}" data-customer-id="{{item.id}}" bindtap="openCustomer">
+          {{index + 1}}. {{item.name}} · ¥{{item.total}}
+        </button>
+      </block>
+    </view>
+  </block>
+  <canvas type="2d" id="order-canvas" class="order-canvas" />
 </view>

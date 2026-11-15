@@ -29,9 +29,9 @@ npm run check
 npm run build
 ```
 
-用微信开发者工具导入本项目根目录，运行目录由 project.config.json 指向 code/dist。修改源码后重新执行构建。需准备自己的有效 AppID 与开发者权限，当前 touristappid 是占位配置。
+用微信开发者工具导入本项目根目录，运行目录由 project.config.json 指向 code/dist。修改源码后重新执行构建。S1 预览可以用自己的微信小程序测试号，将 AppID 填入本地 project.private.config.json，仓库配置中的 touristappid 是占位值。
 
-本机尚未安装微信开发者工具，用户尚未准备 AppID 和安卓测试条件。当前通过的是代码编译、业务检查与页面事件模拟，微信页面视觉和真机体验待验收。
+微信开发者工具已通过三个页面编译、切换和录单主路径验证。用户已在 iQOO Z11 上完成安卓录单与退出恢复体验。[S1 验收记录](docs/S1验收.md)
 
 ## 目录
 

@@ -1,0 +1,50 @@
+<view class="container">
+  <view class="title">整理送货单</view>
+  <view class="hint">S1 本地原型 · 手动录入，数据保存在本机</view>
+  <view wx:if="{{error}}" class="error" role="alert">{{error}}</view>
+  <view wx:if="{{loaded}}">
+    <view wx:if="{{confirmedOrder}}" class="card">
+      <view class="title">已生成正式单据</view>
+      <view>{{confirmedOrder.customer}}</view>
+      <view class="hint">{{confirmedOrder.id}}</view>
+      <view wx:for="{{confirmedOrder.items}}" wx:key="id" class="line">
+        <view>{{item.brand}} · {{item.product}} · {{item.specification}}</view>
+        <view>{{item.quantity}} {{item.unit}} × ¥{{item.price}} = ¥{{item.amount}}</view>
+      </view>
+      <view class="amount">订单金额 ¥{{confirmedOrder.total}}</view>
+      <view class="hint">配送状态与实际应收将在后续阶段接入。</view>
+      <button class="primary" bindtap="nextOrder">开始下一张草稿</button>
+    </view>
+    <view wx:elif="{{previewOrder}}" class="card">
+      <view class="title">确认送货单</view>
+      <view>{{previewOrder.customer}}</view>
+      <view wx:for="{{previewOrder.items}}" wx:key="id" class="line">
+        <view>{{item.brand}} · {{item.product}} · {{item.specification}}</view>
+        <view>{{item.quantity}} {{item.unit}} × ¥{{item.price}} = ¥{{item.amount}}</view>
+      </view>
+      <view class="amount">订单金额 ¥{{previewOrder.total}}</view>
+      <button class="primary" bindtap="confirmOrder">确认生成正式单</button>
+      <button bindtap="backToEdit">返回修改</button>
+    </view>
+    <view wx:else>
+      <button bindtap="fillSample">填入验收样例：2 箱 × 82 元</button>
+      <view class="card">
+        <label>客户名称</label>
+        <input value="{{draft.customer}}" bindinput="editCustomer" placeholder="例如：王记餐饮" maxlength="100" />
+      </view>
+      <view wx:for="{{draft.items}}" wx:key="id" class="card">
+        <view>货品 {{index + 1}}</view>
+        <label>货品名称</label><input value="{{item.product}}" data-index="{{index}}" data-field="product" bindinput="editItem" placeholder="例如：水饺" maxlength="100" />
+        <label>品牌</label><input value="{{item.brand}}" data-index="{{index}}" data-field="brand" bindinput="editItem" placeholder="例如：安井" maxlength="100" />
+        <label>规格</label><input value="{{item.specification}}" data-index="{{index}}" data-field="specification" bindinput="editItem" placeholder="例如：500g" maxlength="100" />
+        <label>计价单位</label><input value="{{item.unit}}" data-index="{{index}}" data-field="unit" bindinput="editItem" placeholder="箱、袋等" maxlength="20" />
+        <label>数量</label><input type="number" value="{{item.quantity}}" data-index="{{index}}" data-field="quantity" bindinput="editItem" placeholder="填写正整数" maxlength="12" />
+        <label>单价（元）</label><input type="digit" value="{{item.price}}" data-index="{{index}}" data-field="price" bindinput="editItem" placeholder="例如：82.00" maxlength="14" />
+        <button wx:if="{{draft.items.length > 1}}" data-index="{{index}}" bindtap="removeItem">移除此货品</button>
+      </view>
+      <button bindtap="addItem">添加货品</button>
+      <button class="primary" bindtap="showPreview">预览送货单</button>
+    </view>
+  </view>
+  <button bindtap="resetDemo">重置演示数据</button>
+</view>

@@ -1,0 +1,12 @@
+page { background: #f5f7f6; color: #18362b; font-family: -apple-system, sans-serif; font-size: 30rpx; }
+.container { padding: 32rpx 28rpx 60rpx; }
+.title { font-size: 42rpx; font-weight: 650; margin-bottom: 16rpx; }
+.hint { color: #63716b; font-size: 26rpx; line-height: 1.7; margin: 12rpx 0 24rpx; }
+.card { background: #fff; border: 1rpx solid #dfe8e3; border-radius: 20rpx; padding: 28rpx; margin: 24rpx 0; }
+label { display: block; margin: 20rpx 0 10rpx; font-size: 26rpx; }
+input { background: #f4f7f5; padding: 20rpx; border-radius: 10rpx; height: 48rpx; color: #18362b; }
+button { margin-top: 20rpx; font-size: 28rpx; border-radius: 12rpx; }
+.primary { background: #12664d; color: white; }
+.error { color: #a13221; line-height: 1.6; padding: 20rpx 0; }
+.amount { font-size: 40rpx; font-weight: 650; padding-top: 20rpx; }
+.line { padding: 16rpx 0; border-bottom: 1rpx solid #e9eeeb; line-height: 1.7; }

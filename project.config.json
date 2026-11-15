@@ -1,0 +1,8 @@
+{
+  "projectname": "Dispatch Agent",
+  "description": "S1 本地录单原型",
+  "appid": "touristappid",
+  "compileType": "miniprogram",
+  "miniprogramRoot": "code/dist/",
+  "setting": { "es6": true, "minified": true, "urlCheck": true }
+}

@@ -1,6 +1,7 @@
 .DS_Store
 node_modules/
 code/dist/
+code/server-dist/
 coverage/
 *.log
 .env

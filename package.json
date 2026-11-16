@@ -3,12 +3,26 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit",
     "build": "node scripts/build.cjs",
     "test": "npm run build && node --test tests/*.test.cjs",
     "check:docs": "node scripts/check-docs.cjs",
-    "check": "npm run typecheck && npm test && npm run check:docs"
+    "check": "npm run typecheck && npm test && npm run check:docs",
+    "build:server": "tsc -p tsconfig.server.json",
+    "db:migrate": "npm run build:server && node code/server-dist/server/migrate.js",
+    "serve:local": "npm run build:server && node code/server-dist/server/main.js",
+    "test:server": "npm run build:server && node --test tests/server/*.test.cjs"
   },
-  "engines": { "node": ">=18.15.0" },
-  "devDependencies": { "typescript": "5.9.3", "miniprogram-api-typings": "5.3.1" }
+  "engines": {
+    "node": ">=18.15.0"
+  },
+  "devDependencies": {
+    "@types/node": "18.19.130",
+    "@types/pg": "8.23.1",
+    "miniprogram-api-typings": "5.3.1",
+    "typescript": "5.9.3"
+  },
+  "dependencies": {
+    "pg": "8.23.1"
+  }
 }

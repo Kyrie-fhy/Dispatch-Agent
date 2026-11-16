@@ -12,6 +12,7 @@
 - [S2 操作验收](docs/S2验收.md)
 - [S3 操作验收](docs/S3验收.md)
 - [S4 操作验收](docs/S4验收.md)
+- [S5 本地草稿服务联调](docs/S5本地联调.md)
 - [开发里程碑](docs/Dispatch%20Agent%20开发里程碑.md)
 - [需求分析](docs/需求分析文档.md)
 - [项目级 Agent 约定](AGENTS.md)
@@ -23,7 +24,7 @@ npm ci
 npm run check
 ```
 
-依赖版本由 `package-lock.json` 锁定。本地和 GitHub Actions 使用同一套检查。工具链和工作流配置见[技术方案](docs/技术方案.md)。
+依赖版本由 `package-lock.json` 锁定。GitHub Actions 还会在 PostgreSQL 18 上运行 `npm run test:server`，验证账号隔离和草稿保存。服务启动及本地集成检查见 [S5 本地联调](docs/S5本地联调.md)。
 
 ## 微信预览
 
@@ -42,7 +43,8 @@ AGENTS.md             项目开发规则
 README.md             使用入口
 project.config.json   微信项目配置
 code/miniprogram/     TypeScript、WXML、WXSS 源码
-code/dist/            本地构建结果，忽略提交
+code/dist/            小程序构建结果，忽略提交
+code/server/          本地草稿服务和数据库迁移
 docs/                 需求、方案、里程碑和验收
 tests/                业务与页面事件检查
 scripts/              构建和文档链接检查
@@ -52,4 +54,4 @@ scripts/              构建和文档链接检查
 
 `main` 保存已合并的版本。每项工作从 `main` 新建短期分支，通过 PR 汇总改动与检查结果。
 
-重置演示数据会清除当前设备的本地原型数据，需要在页面弹窗中确认。账户隔离与远端保存到 S5 实现。
+重置演示数据会清除当前设备的本地原型数据，需要在页面弹窗中确认。S5 本地草稿服务已验证账号隔离与保存，微信预览仍使用本地演示数据。

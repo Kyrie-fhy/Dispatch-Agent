@@ -7,6 +7,7 @@ const { test } = require('node:test');
 const { Pool } = require('pg');
 const { migrate } = require('../../code/server-dist/server/migrate');
 const { startLocalServer } = require('../../code/server-dist/server/main');
+const { configuredWechatLogin } = require('../../code/server-dist/server/wechat-login');
 
 async function isolatedDatabase(t, beforeMigrate) {
   const url = new URL(process.env.DISPATCH_TEST_ADMIN_URL);
@@ -65,11 +66,11 @@ function runPostgresClient(tool, database, args, input) {
   return result.stdout;
 }
 
-async function start(db) {
+async function start(db, wechat) {
   const pool = db.pool();
   let server;
   try {
-    server = await startLocalServer(pool, 0);
+    server = await startLocalServer(pool, 0, wechat);
   } catch (error) {
     await pool.end();
     throw error;
@@ -863,4 +864,97 @@ test('a logical backup restores the S5 ledger, account policies and confirmation
   } finally {
     await restricted.end();
   }
+});
+
+test('WeChat code exchange restores an app-scoped workspace and keeps development sessions separate', { timeout: 20_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const codeRequest = (api, code, extra) => api.request('/v1/session/wechat', {
+    method: 'POST', body: { code, ...extra },
+  });
+  let api = await start(db);
+  const development = await login(api, 'a');
+  assert.equal((await codeRequest(api, 'unused')).status, 404);
+  await api.stop();
+
+  const firstApp = 'wx1111111111111111';
+  const otherApp = 'wx2222222222222222';
+  const secret = 'mock-only-secret-for-test';
+  const returnedKey = 'mock-wechat-session-key';
+  const config = appId => ({ DISPATCH_WECHAT_APP_ID: appId, DISPATCH_WECHAT_APP_SECRET: secret });
+  assert.throws(() => configuredWechatLogin({ DISPATCH_WECHAT_APP_ID: firstApp }), /DISPATCH_WECHAT_APP_SECRET/);
+  const used = new Set();
+  const mockWechat = appId => configuredWechatLogin(config(appId), async (url, options) => {
+    assert.equal(url.origin + url.pathname, 'https://api.weixin.qq.com/sns/jscode2session');
+    assert.equal(url.searchParams.get('appid'), appId);
+    assert.equal(url.searchParams.get('secret'), secret);
+    assert.equal(url.searchParams.get('grant_type'), 'authorization_code');
+    assert.equal(options.redirect, 'error');
+    const code = url.searchParams.get('js_code');
+    if (code === 'upstream-error') throw new Error('simulated upstream error containing ' + secret);
+    if (code === 'busy') return Response.json({ errcode: 45011 });
+    if (code === 'invalid' || used.has(code)) return Response.json({ errcode: 40029, errmsg: secret });
+    used.add(code);
+    return Response.json({ openid: code.startsWith('a-') ? 'mock-openid-a' : 'mock-openid-b',
+      session_key: returnedKey, unionid: 'mock-unionid' });
+  });
+  api = await start(db, mockWechat(firstApp));
+  assert.equal((await api.request('/v1/session/development', { method: 'POST', body: { account: 'a' } })).status, 404);
+  assert.equal((await api.request('/v1/workspace', { token: development })).status, 401);
+  assert.equal((await codeRequest(api, '')).status, 400);
+  assert.deepEqual(await codeRequest(api, 'invalid'), {
+    status: 401, data: { error: 'wechat_code_rejected', message: '微信登录凭证不可用，请重新获取' },
+  });
+  const outage = await codeRequest(api, 'upstream-error');
+  assert.equal(outage.status, 502);
+  assert.ok(!JSON.stringify(outage).includes(secret));
+  assert.equal((await codeRequest(api, 'busy')).status, 429);
+  const bOnly = await db.admin.query("SELECT count(*)::int AS count FROM dispatch.accounts WHERE identity_provider = 'wechat'");
+  assert.equal(bOnly.rows[0].count, 0);
+
+  const initial = await codeRequest(api, 'a-first', { openid: 'not-a-trusted-identity', appId: otherApp });
+  assert.equal(initial.status, 201, JSON.stringify(initial.data));
+  assert.deepEqual(Object.keys(initial.data).sort(), ['expiresAt', 'token']);
+  const { token: a } = initial.data;
+  assert.equal((await codeRequest(api, 'a-first')).status, 401);
+  const aTrip = await formalExample(api, a);
+  const next = await tripCommand(api, a, 'next-draft', { requestId: 'wx-next', draftId: aTrip.trip.id });
+  assert.equal(next.status, 200);
+  const saved = await save(api, a, next.data.draft, 'wx-save', '微信试用草稿');
+  assert.equal(saved.status, 200);
+  const bLogin = await codeRequest(api, 'b-first');
+  assert.equal(bLogin.status, 201);
+  const b = bLogin.data.token;
+  assert.notEqual((await read(api, b)).id, saved.data.draft.id);
+  assert.equal((await api.request(`/v1/trips/${aTrip.trip.id}`, { token: b })).status, 404);
+  assert.equal((await save(api, b, saved.data.draft, 'wx-foreign', '跨账号写入')).status, 404);
+  const accounts = await db.admin.query("SELECT identity_subject FROM dispatch.accounts WHERE identity_provider = 'wechat' ORDER BY identity_subject");
+  assert.deepEqual(accounts.rows.map(row => row.identity_subject), [
+    firstApp + ':mock-openid-a', firstApp + ':mock-openid-b',
+  ]);
+  assert.ok(!JSON.stringify(accounts.rows).includes(returnedKey));
+  const expiry = await db.admin.query(`UPDATE dispatch.sessions SET expires_at = now() - interval '1 second'
+    WHERE account_id IN (SELECT id FROM dispatch.accounts WHERE identity_subject = $1)`, [firstApp + ':mock-openid-a']);
+  assert.equal(expiry.rowCount, 1);
+  assert.equal((await api.request('/v1/workspace', { token: a })).status, 401);
+
+  await api.stop();
+  api = await start(db, mockWechat(firstApp));
+  const resumed = await codeRequest(api, 'a-second');
+  assert.equal(resumed.status, 201);
+  const newToken = resumed.data.token;
+  assert.notEqual(newToken, a);
+  assert.deepEqual(await read(api, newToken), saved.data.draft);
+  assert.deepEqual((await api.request(`/v1/trips/${aTrip.trip.id}`, { token: newToken })).data, aTrip);
+  assert.equal((await api.request('/v1/session', { method: 'DELETE', token: newToken })).status, 204);
+  assert.equal((await api.request('/v1/workspace', { token: newToken })).status, 401);
+  const again = await codeRequest(api, 'a-third');
+  assert.equal(again.status, 201);
+
+  await api.stop();
+  api = await start(db, mockWechat(otherApp));
+  assert.equal((await api.request('/v1/workspace', { token: again.data.token })).status, 401);
+  const separate = await codeRequest(api, 'a-another-app');
+  assert.equal(separate.status, 201);
+  assert.notEqual((await read(api, separate.data.token)).id, saved.data.draft.id);
+  assert.equal((await api.request(`/v1/trips/${aTrip.trip.id}`, { token: separate.data.token })).status, 404);
 });

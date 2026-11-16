@@ -1,5 +1,6 @@
 import { ItemInput, money, OrderLine } from '../core/orders';
-import { CustomerOrder, DeliveryStatus, TripVersion } from '../core/trips';
+import { localDay } from '../core/settlement';
+import { CustomerOrder, DeliveryStatus, latest, TripState, TripVersion } from '../core/trips';
 
 const fields = [
   { key: 'product', label: '货品', type: 'text', max: 100 },
@@ -35,4 +36,20 @@ export function tripView(version: Pick<TripVersion, 'customers' | 'totalCents'>)
 
 export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : '操作失败，请重试';
+}
+
+export function partyOptions(state: TripState) {
+  const trips = new Map(state.trips.map(trip => [trip.id, trip]));
+  const recentByParty = new Map<string, { time: number; summary: string }>();
+  for (const account of state.ledger.accounts) {
+    const trip = trips.get(account.tripId)!;
+    const time = Date.parse(trip.versions[0].savedAt);
+    if ((recentByParty.get(account.partyId)?.time ?? -Infinity) > time) continue;
+    const line = latest(trip).customers.find(entry => entry.id === account.sheetId)!.items[0];
+    recentByParty.set(account.partyId, { time, summary: ` · ${localDay(new Date(time))} ${line.brand} ${line.product}` });
+  }
+  return state.ledger.parties.map((party, index) => {
+    const recent = recentByParty.get(party.id)?.summary ?? '';
+    return { ...party, number: index + 1, label: `${party.name} · 客户 ${index + 1}${recent}` };
+  });
 }

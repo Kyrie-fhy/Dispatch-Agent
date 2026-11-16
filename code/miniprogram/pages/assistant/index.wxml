@@ -14,6 +14,7 @@
     </block>
     <block wx:elif="{{previewTrip}}">
       <view class="section-title">整趟预览</view>
+      <view wx:for="{{previewTrip.identities}}" wx:key="index" class="hint">{{index + 1}}. {{item}}</view>
       <template is="trip-customers" data="{{summary: previewTrip}}" />
       <view class="amount">整趟订单金额 ¥{{previewTrip.total}}</view>
       <button class="primary" bindtap="confirmTrip">确认生成正式单</button>
@@ -29,8 +30,15 @@
         <button bindtap="addCustomer">添加客户</button>
       </view>
       <view class="card" wx:if="{{active}}">
-        <label for="customer-name">客户名称</label>
-        <input id="customer-name" data-id="{{active.id}}" value="{{active.customer}}" bindinput="editCustomer" placeholder="例如：王记餐饮" maxlength="100" />
+        <picker wx:if="{{parties.length}}" range="{{parties}}" range-key="label" bindchange="chooseExisting">
+          <view class="link">{{chosenExisting ? partyLabel : '选择已有客户'}}</view>
+        </picker>
+        <block wx:if="{{!chosenExisting}}">
+          <label for="customer-name">客户名称</label>
+          <input id="customer-name" data-id="{{active.id}}" value="{{active.customer}}" bindinput="editCustomer" placeholder="例如：王记餐饮" maxlength="100" />
+        </block>
+        <view wx:if="{{chosenNew}}" class="hint">确认出单时新建客户</view>
+        <button wx:else bindtap="chooseNew">新建客户</button>
         <template is="edit-lines" data="{{form: form}}" />
         <button wx:if="{{draft.customers.length > 1}}" bindtap="removeCustomer">移除此客户</button>
       </view>

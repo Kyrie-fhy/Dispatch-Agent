@@ -21,6 +21,11 @@ export function money(cents: number): string {
   const fraction = absolute % 100;
   return `${cents < 0 ? '-' : ''}${(absolute - fraction) / 100}.${String(fraction).padStart(2, '0')}`;
 }
+export function yuanToCents(input: string): number {
+  if (!/^(0|[1-9]\d*)(\.\d{1,2})?$/.test(input)) return NaN;
+  const [yuan, fraction = ''] = input.split('.');
+  return Number(yuan) * 100 + Number(fraction.padEnd(2, '0'));
+}
 export function preview(draft: Draft): Order {
   if (!draft.customer.trim()) throw new Error('请填写客户名称');
   if (draft.items.length === 0) throw new Error('请至少添加一条货品');
@@ -29,9 +34,8 @@ export function preview(draft: Draft): Order {
       if (!item[key].trim()) throw new Error(`第 ${index + 1} 条：请填写${label}`);
     }
     if (!/^[1-9]\d*$/.test(item.quantity)) throw new Error(`第 ${index + 1} 条：数量须为正整数`);
-    if (!/^(0|[1-9]\d*)(\.\d{1,2})?$/.test(item.price)) throw new Error(`第 ${index + 1} 条：单价须为最多两位小数的金额`);
-    const [yuan, fraction = ''] = item.price.split('.');
-    const cents = Number(yuan) * 100 + Number(fraction.padEnd(2, '0'));
+    const cents = yuanToCents(item.price);
+    if (Number.isNaN(cents)) throw new Error(`第 ${index + 1} 条：单价须为最多两位小数的金额`);
     const quantity = Number(item.quantity);
     const amountCents = cents * quantity;
     if (cents <= 0 || !Number.isSafeInteger(cents) || !Number.isSafeInteger(quantity) || !Number.isSafeInteger(amountCents)) {

@@ -1,30 +1,38 @@
 import { emptyItem } from '../../core/orders';
-import { currentTrip, CustomerDraft, emptyCustomer, emptyTrip, latest, previewTrip, TripDraft } from '../../core/trips';
+import { currentTrip, CustomerDraft, emptyCustomer, emptyTrip, latest, TripDraft } from '../../core/trips';
 import { newId, trips } from '../../services/orders';
-import { editLines, errorMessage, formLines, tripView } from '../order-view';
+import { editLines, errorMessage, formLines, partyOptions, tripView } from '../order-view';
 
 function sampleCustomer(customer: string, brand: string, quantity: string, price: string): CustomerDraft {
   const draft = emptyCustomer(newId);
-  return { ...draft, customer, items: [{ ...draft.items[0], product: '水饺', brand, specification: '500g', quantity, price }] };
+  return { ...draft, customer, partyId: null, items: [{ ...draft.items[0], product: '水饺', brand, specification: '500g', quantity, price }] };
 }
 
 Page({
   data: {
     draft: emptyTrip(() => 'loading'), activeId: '', active: null as CustomerDraft | null,
     form: [] as ReturnType<typeof formLines>,
-    previewTrip: null as (ReturnType<typeof tripView> & { id: string; revision: number }) | null,
+    previewTrip: null as (ReturnType<typeof tripView> & { id: string; revision: number; identities: string[] }) | null,
     confirmed: null as (ReturnType<typeof tripView> & { version: number }) | null,
+    parties: [] as ReturnType<typeof partyOptions>, partyLabel: '', chosenNew: false, chosenExisting: false,
     error: '', loaded: false,
   },
 
   onLoad() { this.reload(); },
-  onShow() { if (this.data.confirmed) this.reload(); },
+  onShow() {
+    if (this.data.confirmed) { this.reload(); return; }
+    try {
+      this.setData({ parties: partyOptions(trips.load()) });
+      this.showDraft(this.data.draft, this.data.activeId);
+    } catch (error) { this.fail(error); }
+  },
 
   reload() {
     try {
       const state = trips.load();
       const current = currentTrip(state);
       const version = current?.id === state.draft.id ? latest(current) : null;
+      this.setData({ parties: partyOptions(state) });
       this.showDraft(state.draft, state.draft.customers[0].id);
       this.setData({ confirmed: version ? { ...tripView(version), version: version.version } : null, previewTrip: null, loaded: true, error: '' });
     } catch (error) { this.fail(error); }
@@ -34,7 +42,9 @@ Page({
 
   showDraft(draft: TripDraft, activeId: string) {
     const active = draft.customers.find(customer => customer.id === activeId) ?? draft.customers[0];
-    this.setData({ draft, activeId: active.id, active, form: formLines(active.items) });
+    this.setData({ draft, activeId: active.id, active, form: formLines(active.items),
+      chosenExisting: typeof active.partyId === 'string', chosenNew: active.partyId === null,
+      partyLabel: this.data.parties.find(party => party.id === active.partyId)?.label ?? '' });
   },
 
   persist(draft: TripDraft, activeId?: string) {
@@ -73,6 +83,22 @@ Page({
     if (active && active.id === event.currentTarget.dataset.id) this.editActive({ ...active, customer: event.detail.value });
   },
 
+  chooseExisting(event: WechatMiniprogram.PickerChange) {
+    const party = this.data.parties[Number(event.detail.value)];
+    const { active, draft } = this.data;
+    if (!party || !active) return;
+    if (draft.customers.some(customer => customer.id !== active.id && customer.partyId === party.id)) {
+      this.fail(new Error('本趟已选择该客户，请回到该客户单添加货品'));
+      return;
+    }
+    this.editActive({ ...active, customer: party.name, partyId: party.id });
+  },
+
+  chooseNew() {
+    const { active } = this.data;
+    if (active) this.editActive({ ...active, partyId: null });
+  },
+
   editItem(event: WechatMiniprogram.Input) {
     const { active } = this.data;
     const { id, field } = event.currentTarget.dataset;
@@ -102,8 +128,12 @@ Page({
     try {
       const draft = trips.saveDraft(this.data.draft);
       this.showDraft(draft, this.data.activeId);
-      const preview = tripView(previewTrip(draft));
-      this.setData({ previewTrip: { ...preview, id: draft.id, revision: draft.revision }, error: '' });
+      const checked = trips.previewDraft(draft);
+      const preview = tripView(checked);
+      const identities = checked.choices.map((choice, index) => choice
+        ? this.data.parties.find(party => party.id === choice.id)?.label ?? choice.name
+        : `${preview.customers[index].customer} · 新建客户`);
+      this.setData({ previewTrip: { ...preview, id: draft.id, revision: draft.revision, identities }, error: '' });
     } catch (error) { this.fail(error); }
   },
 
@@ -126,7 +156,7 @@ Page({
   },
 
   resetDemo() {
-    wx.showModal({ title: '重置本地演示数据', content: '将清除本机草稿、正式单据和配送状态，是否继续？', success: result => {
+    wx.showModal({ title: '重置本地演示数据', content: '将清除本机草稿、正式单据、配送状态、客户和对账收款记录，是否继续？', success: result => {
       if (!result.confirm) return;
       try { trips.reset(); this.reload(); } catch (error) { this.fail(error); }
     } });

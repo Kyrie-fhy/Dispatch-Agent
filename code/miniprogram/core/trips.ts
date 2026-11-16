@@ -95,6 +95,21 @@ export function previewTrip(draft: TripDraft): Pick<TripVersion, 'customers' | '
   return { customers, totalCents: sumOrders(customers) };
 }
 
+export function resolveCustomerChoices(draft: TripDraft, parties: Party[]): (Party | null)[] {
+  const byId = new Map(parties.map(party => [party.id, party]));
+  const selected = new Set<string>();
+  return draft.customers.map((customer, index) => {
+    if (customer.partyId === undefined) throw new Error(`请为第 ${index + 1} 位客户选择已有客户或新建`);
+    if (customer.partyId === null) return null;
+    const party = byId.get(customer.partyId);
+    if (!party) throw new Error('未找到所选客户，请重新选择');
+    if (selected.has(party.id)) throw new Error('本趟已选择该客户，请回到该客户单添加货品');
+    if (party.name !== customer.customer.trim()) throw new Error('客户名称已变化，请重新选择客户');
+    selected.add(party.id);
+    return party;
+  });
+}
+
 const pickingFields = ['product', 'brand', 'specification', 'unit'] as const;
 
 export function pickingKey(item: ItemInput): string {
@@ -125,7 +140,7 @@ export function pickingChanges(before: CustomerOrder[], after: CustomerOrder[]):
   });
 }
 
-function statusesFor(customers: CustomerOrder[], status: DeliveryStatus): Trip['statuses'] {
+export function statusesFor(customers: CustomerOrder[], status: DeliveryStatus): Trip['statuses'] {
   return Object.fromEntries(customers.flatMap(customer => customer.items.map(item => [item.id, status])));
 }
 
@@ -238,7 +253,7 @@ export class TripService {
     if (state.draft.id !== draftId || state.draft.revision !== revision) throw new Error('草稿已变化，请重新预览');
     this.checkAssistantQuantities(state);
     const { customers, totalCents } = previewTrip(state.draft);
-    const choices = this.customerChoices(state);
+    const choices = resolveCustomerChoices(state.draft, state.ledger.parties);
     const trip: Trip = { id: draftId, origin: 's2', versions: [{ version: 1, customers, totalCents, savedAt: this.now() }],
       statuses: statusesFor(customers, 'pending'), statusRevision: 0 };
     const parties = [...state.ledger.parties];
@@ -258,7 +273,7 @@ export class TripService {
     if (state.draft.id !== draft.id || state.draft.revision !== draft.revision) throw new Error('草稿已变化，请重新预览');
     this.checkAssistantQuantities(state);
     const result = previewTrip(state.draft);
-    const choices = this.customerChoices(state);
+    const choices = resolveCustomerChoices(state.draft, state.ledger.parties);
     return { ...result, choices };
   }
 
@@ -482,19 +497,6 @@ export class TripService {
     const party = state.ledger.parties.find(entry => entry.id === id);
     if (!party) throw new Error('未找到所选客户，请重新选择');
     return party;
-  }
-
-  private customerChoices(state: TripState): (Party | null)[] {
-    const selected = new Set<string>();
-    return state.draft.customers.map((customer, index) => {
-      if (customer.partyId === undefined) throw new Error(`请为第 ${index + 1} 位客户选择已有客户或新建`);
-      if (customer.partyId === null) return null;
-      const party = this.requireParty(state, customer.partyId);
-      if (selected.has(party.id)) throw new Error('本趟已选择该客户，请回到该客户单添加货品');
-      if (party.name !== customer.customer.trim()) throw new Error('客户名称已变化，请重新选择客户');
-      selected.add(party.id);
-      return party;
-    });
   }
 
   private accountBasis(state: TripState, trip: Trip, customer: CustomerOrder): string {

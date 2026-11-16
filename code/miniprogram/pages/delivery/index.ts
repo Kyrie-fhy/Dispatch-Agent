@@ -1,3 +1,4 @@
+import { takeDeliverySheet } from '../../services/delivery-link';
 import { emptyItem, ItemInput, money } from '../../core/orders';
 import { localDay, OpeningPreview, ReceiptPreview, settlementTotals, Sheet, tripBalance } from '../../core/settlement';
 import { Amendment, currentTrip, DeliveryPreview, latest, pickingKey, Trip, TripState } from '../../core/trips';
@@ -74,7 +75,11 @@ Page({
     busy: false, albumSettings: false, error: '', notice: '',
   },
 
-  onShow() { this.refresh(); },
+  onShow() {
+    this.refresh();
+    const target = takeDeliverySheet();
+    if (target) this.showCustomer(target.tripId, target.sheetId);
+  },
 
   fail(error: unknown) { this.setData({ error: errorMessage(error), notice: '' }); },
 
@@ -100,11 +105,16 @@ Page({
 
   openCustomer(event: WechatMiniprogram.TouchEvent) {
     const { tripId, customerId } = event.currentTarget.dataset;
+    this.showCustomer(tripId, customerId);
+  },
+
+  showCustomer(tripId: string, customerId: string) {
     try {
       const state = trips.load();
       const trip = state.trips.find(entry => entry.id === tripId);
       if (!trip) throw new Error('未找到该配送趟，请重新打开');
-      this.setData({ detail: customerDetail(trip, customerId, state), reconciling: false, book: false, error: '', notice: '' });
+      this.setData({ detail: customerDetail(trip, customerId, state), reconciling: false, book: false, error: '', notice: '',
+        amendment: null, preview: null, form: [], replacements: [], images: null, deliveryPreview: null, ...emptyEntry() });
     } catch (error) { this.fail(error); }
   },
 

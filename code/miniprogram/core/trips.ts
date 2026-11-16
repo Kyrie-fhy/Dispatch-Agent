@@ -1,3 +1,4 @@
+import { AssistantNotes, readAssistantNotes } from './assistant-notes';
 import { emptyItem, isDraft, isObject, ItemInput, OrderLine, preview, readState as readS1 } from './orders';
 import { Account, accountFor, checkOpening, emptyLedger, Ledger, localDay, OpeningPreview,
   parseAmount, Party, planReceipt, readLedger, Receipt, ReceiptPreview, settlementTotals, Sheet, sheetBalance, tripBalance } from './settlement';
@@ -20,7 +21,7 @@ export interface Trip {
   statuses: Record<string, DeliveryStatus>;
   statusRevision: number;
 }
-export interface TripState { schemaVersion: 3; draft: TripDraft; trips: Trip[]; ledger: Ledger }
+export interface TripState { schemaVersion: 3; draft: TripDraft; trips: Trip[]; ledger: Ledger; assistant?: AssistantNotes }
 export interface TripStorage { read(): unknown; write(state: TripState): void }
 export interface PickingLine { id: string; product: string; brand: string; specification: string; unit: string; quantity: number }
 export interface PickingChange extends Omit<PickingLine, 'quantity'> { before: number; after: number }
@@ -206,17 +207,27 @@ export class TripService {
     }
     const ledger = raw.schemaVersion === 2 ? emptyLedger() : readLedger(raw.ledger, raw.trips);
     const state: TripState = { schemaVersion: 3, draft: raw.draft, trips: raw.trips, ledger };
+    const assistant = readAssistantNotes(raw.assistant);
+    if (assistant) state.assistant = assistant;
     if (raw.schemaVersion === 2) this.storage.write(state);
     return state;
   }
 
-  saveDraft(draft: TripDraft): TripDraft {
+  prepareAssistantDemo(): void {
+    const state = this.load();
+    if (state.assistant?.demoPartyId) return;
+    const party = { id: this.id(), name: '客户 A' };
+    this.write({ ...state, assistant: { aliases: [], ...state.assistant, demoPartyId: party.id },
+      ledger: { ...state.ledger, parties: [...state.ledger.parties, party] } });
+  }
+
+  saveDraft(draft: TripDraft, assistant?: AssistantNotes): TripDraft {
     const state = this.load();
     if (state.draft.id !== draft.id || state.draft.revision !== draft.revision) throw new Error('草稿已更新，请重新打开后编辑');
     if (state.trips.some(trip => trip.id === draft.id)) throw new Error('这趟已确认，请开始下一趟');
     if (!isTripDraft(draft)) throw new Error('草稿格式不正确');
     const saved = { ...draft, revision: draft.revision + 1 };
-    this.storage.write({ ...state, draft: saved });
+    this.storage.write({ ...state, draft: saved, ...(assistant ? { assistant } : {}) });
     return saved;
   }
 
@@ -225,6 +236,7 @@ export class TripService {
     const existing = state.trips.find(trip => trip.id === draftId && trip.origin === 's2');
     if (existing) return existing;
     if (state.draft.id !== draftId || state.draft.revision !== revision) throw new Error('草稿已变化，请重新预览');
+    this.checkAssistantQuantities(state);
     const { customers, totalCents } = previewTrip(state.draft);
     const choices = this.customerChoices(state);
     const trip: Trip = { id: draftId, origin: 's2', versions: [{ version: 1, customers, totalCents, savedAt: this.now() }],
@@ -244,6 +256,7 @@ export class TripService {
   previewDraft(draft: TripDraft) {
     const state = this.load();
     if (state.draft.id !== draft.id || state.draft.revision !== draft.revision) throw new Error('草稿已变化，请重新预览');
+    this.checkAssistantQuantities(state);
     const result = previewTrip(state.draft);
     const choices = this.customerChoices(state);
     return { ...result, choices };
@@ -443,6 +456,14 @@ export class TripService {
       before: sheetBalance(state.ledger, trip, original), after: sheetBalance(state.ledger, trip, corrected, statuses),
       unchecked: corrected.items.filter(item => statuses[item.id] !== 'delivered'),
       picking: pickingChanges(previous.customers, customers) };
+  }
+
+  private checkAssistantQuantities(state: TripState): void {
+    const pending = state.assistant?.draft;
+    if (pending?.id === state.draft.id && pending.quantities.some(question =>
+      state.draft.customers.some(customer => customer.items.some(item => item.id === question.itemId)))) {
+      throw new Error('请先在助手中确认数量是改成还是追加');
+    }
   }
 
   private requireTrip(state: TripState, id: string): Trip {

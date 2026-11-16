@@ -1,1 +1,28 @@
-/* Common page styles are defined in app.wxss. */
+.subtitle { font-size: 27rpx; color: #526860; line-height: 1.6; }
+.composer-header, .composer-controls, .chips { display: flex; flex-wrap: wrap; gap: 12rpx; align-items: center; }
+.composer-header { justify-content: space-between; }
+.badge { color: #087056; border-radius: 24rpx; background: #e0f4eb; padding: 6rpx 16rpx; font-size: 22rpx; }
+.material-title { color: #526860; font-size: 25rpx; margin: 20rpx 0 10rpx; }
+.material-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12rpx; }
+.material { border: 1rpx solid #c9ded4; border-radius: 14rpx; padding: 12rpx; background: #f5fbf8; }
+.material-label { color: #12664d; font-size: 24rpx; font-weight: 650; }
+.material-paper { margin-top: 7rpx; padding: 8rpx; background: #fff; font-size: 23rpx; line-height: 1.4; white-space: pre-line; }
+.selected, .transcript { margin-top: 12rpx; font-size: 23rpx; color: #12664d; }
+.chips button, .composer-controls button { margin: 0; }
+.chips button { font-size: 24rpx; line-height: 2.25; padding: 0 18rpx; }
+.composer textarea { box-sizing: border-box; width: 100%; height: 150rpx; padding: 16rpx; margin: 16rpx 0 12rpx; background: #f4f7f5; border-radius: 12rpx; }
+.composer-controls { margin-top: 12rpx; justify-content: flex-end; }
+.outline, .picker-choice { background: #fff; color: #12664d; }
+.picker-choice { border: 1rpx solid #b8d5c8; padding: 16rpx; margin-top: 12rpx; border-radius: 10rpx; }
+.example, .notice { font-size: 26rpx; line-height: 1.65; margin-top: 16rpx; }
+.example { padding-top: 16rpx; border-top: 1rpx solid #dfe8e3; }
+.question, .activity-item { border-top: 1rpx solid #dfe8e3; padding-top: 18rpx; margin-top: 18rpx; }
+.history { color: #12664d; font-weight: 650; }
+.action-card button { white-space: normal; line-height: 1.55; padding: 18rpx; }
+.draft-summary { margin: 12rpx 0; }
+.message, .activity-detail { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 26rpx; line-height: 1.55; }
+.message { border-radius: 10rpx; background: #ecf5ef; padding: 12rpx 16rpx; }
+.activity-detail { padding: 10rpx 0; color: #355a4e; }
+.needs-action { color: #a13221; }
+.material-marked { border-color: #12664d; background: #def2e8; }
+.material-image { display: block; border-radius: 8rpx; margin: 7rpx 0 0; width: 100%; }

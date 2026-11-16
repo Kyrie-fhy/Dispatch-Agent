@@ -28,3 +28,4 @@ jobs:
       - run: npm run test:server
         env:
           DISPATCH_TEST_ADMIN_URL: postgresql://postgres:dispatch-ci@127.0.0.1:5432/postgres
+          DISPATCH_TEST_PG_CONTAINER: ${{ job.services.postgres.id }}

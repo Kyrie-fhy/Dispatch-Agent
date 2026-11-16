@@ -12,7 +12,6 @@ test('non-loopback database requires explicit trial mode and verified TLS', t =>
   t.after(() => rmSync(directory, { recursive: true }));
   const ca = rootCertificates[0];
   const caFile = join(directory, 'ca.pem');
-  writeFileSync(caFile, ca);
 
   const variable = 'DISPATCH_DB_URL';
   const url = 'postgresql://dispatch_trial_api:example@postgres.internal:5432/dispatch_trial';
@@ -23,6 +22,9 @@ test('non-loopback database requires explicit trial mode and verified TLS', t =>
   const trial = { ...env, DISPATCH_SERVER_MODE: 'trial' };
   assert.throws(() => databaseOptions(variable, trial), /DISPATCH_DB_CA_FILE/);
   trial.DISPATCH_DB_CA_FILE = caFile;
+  writeFileSync(caFile, '');
+  assert.throws(() => databaseOptions(variable, trial), /无 CA 证书/);
+  writeFileSync(caFile, ca);
   assert.deepEqual(databaseOptions(variable, trial).ssl, { ca, rejectUnauthorized: true });
   assert.throws(() => databaseOptions(variable, { ...trial, [variable]: url + '?sslmode=disable' }), /TLS/);
   assert.throws(() => databaseOptions(variable, { ...trial, [variable]: url + '?host=elsewhere' }), /TLS/);

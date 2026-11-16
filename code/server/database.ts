@@ -74,5 +74,7 @@ export function databaseOptions(variable: string, env = process.env): PoolConfig
   }
   const caFile = env.DISPATCH_DB_CA_FILE;
   if (!caFile) throw new Error('试用环境请设置 DISPATCH_DB_CA_FILE');
-  return { ...base, ssl: { ca: readFileSync(caFile, 'utf8'), rejectUnauthorized: true } };
+  const ca = readFileSync(caFile, 'utf8');
+  if (!ca.trim()) throw new Error('DISPATCH_DB_CA_FILE 中无 CA 证书');
+  return { ...base, ssl: { ca, rejectUnauthorized: true } };
 }

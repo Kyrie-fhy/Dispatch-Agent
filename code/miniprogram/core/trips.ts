@@ -140,7 +140,7 @@ function isCustomers(value: unknown): value is CustomerDraft[] {
   return valid && unique(value.map(customer => customer.id)) && unique(value.flatMap(customer => customer.items.map((item: ItemInput) => item.id)));
 }
 
-function isTripDraft(value: unknown): value is TripDraft {
+export function isTripDraft(value: unknown): value is TripDraft {
   return isObject(value) && typeof value.id === 'string' && !!value.id
     && Number.isSafeInteger(value.revision) && Number(value.revision) >= 0 && isCustomers(value.customers);
 }

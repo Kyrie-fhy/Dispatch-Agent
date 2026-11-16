@@ -1,7 +1,8 @@
 import { createServer, IncomingMessage, Server, ServerResponse } from 'node:http';
 import { Pool } from 'pg';
 import { localDatabaseUrl, requireApplicationRole } from './database';
-import { readSaveDraft } from './draft-input';
+import { readAmendmentInput, readSaveDraft } from './draft-input';
+import { AmendmentStore } from './amendments';
 import { DraftStore } from './drafts';
 import { DeliveryStore } from './delivery';
 import { LedgerStore } from './ledger';
@@ -50,7 +51,7 @@ function resourceId(path: string, collection: 'drafts' | 'trips'): string | null
   return uuidPattern.test(id) ? id : null;
 }
 
-async function handle(store: DraftStore, trips: TripStore, delivery: DeliveryStore, ledger: LedgerStore,
+async function handle(store: DraftStore, trips: TripStore, delivery: DeliveryStore, ledger: LedgerStore, amendments: AmendmentStore,
   request: IncomingMessage, response: ServerResponse): Promise<void> {
   const host = request.headers.host ?? '';
   if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host)) {
@@ -114,7 +115,7 @@ async function handle(store: DraftStore, trips: TripStore, delivery: DeliverySto
     return;
   }
 
-  const sheetRoute = /^\/v1\/trips\/([^/]+)\/sheets\/([^/]+)(?:\/(delivery(?:\/(?:preview|confirm))?|review|ledger|(?:opening|receipt)\/(?:preview|confirm)))?$/.exec(path);
+  const sheetRoute = /^\/v1\/trips\/([^/]+)\/sheets\/([^/]+)(?:\/(delivery(?:\/(?:preview|confirm))?|review|ledger|(?:opening|receipt|amendment)\/(?:preview|confirm)))?$/.exec(path);
   if (sheetRoute && uuidPattern.test(sheetRoute[1])) {
     const [, sheetTripId, key, action] = sheetRoute;
     let sheetId: string;
@@ -140,6 +141,10 @@ async function handle(store: DraftStore, trips: TripStore, delivery: DeliverySto
         sendJson(response, 200, { preview: await ledger.previewReceipt(account, sheetKey, readReceiptInput(body)) });
       } else if (action === 'receipt/confirm') {
         sendJson(response, 200, { receipt: await ledger.confirmReceipt(account, sheetKey, readConfirmInput(body)) });
+      } else if (action === 'amendment/preview') {
+        sendJson(response, 200, { preview: await amendments.preview(account, sheetKey, readAmendmentInput(body)) });
+      } else if (action === 'amendment/confirm') {
+        sendJson(response, 200, { version: await amendments.confirm(account, sheetKey, readConfirmInput(body)) });
       } else if (action === 'delivery/preview') {
         const preview = await delivery.preview(account, sheetTripId, sheetId, readDeliveryInput(body));
         sendJson(response, 200, { preview });
@@ -162,8 +167,9 @@ export async function startLocalServer(pool: Pool, port: number): Promise<Server
   const trips = new TripStore(pool);
   const delivery = new DeliveryStore(pool);
   const ledger = new LedgerStore(pool);
+  const amendments = new AmendmentStore(pool);
   const server = createServer({ requestTimeout: 15_000 }, (request, response) => {
-    void handle(store, trips, delivery, ledger, request, response).catch(error => {
+    void handle(store, trips, delivery, ledger, amendments, request, response).catch(error => {
       if (response.destroyed) return;
       if (error instanceof HttpError) {
         sendJson(response, error.status, { error: error.code, message: error.message });

@@ -1,6 +1,6 @@
 import { AssistantNotes, readAssistantNotes } from './assistant-notes';
 import { emptyItem, isDraft, isObject, ItemInput, OrderLine, preview, readState as readS1 } from './orders';
-import { Account, accountFor, checkOpening, emptyLedger, Ledger, localDay, OpeningPreview,
+import { Account, accountFor, checkOpening, deliveredBalance, emptyLedger, Ledger, localDay, OpeningPreview,
   parseAmount, Party, planReceipt, readLedger, Receipt, ReceiptPreview, settlementTotals, Sheet, sheetBalance, tripBalance } from './settlement';
 
 export interface CustomerDraft { id: string; customer: string; items: ItemInput[]; partyId?: string | null }
@@ -153,6 +153,40 @@ function isCustomers(value: unknown): value is CustomerDraft[] {
   const valid = value.every(customer => isObject(customer) && isDraft({ ...customer, revision: 0 })
     && (customer.partyId === undefined || customer.partyId === null || (typeof customer.partyId === 'string' && !!customer.partyId)));
   return valid && unique(value.map(customer => customer.id)) && unique(value.flatMap(customer => customer.items.map((item: ItemInput) => item.id)));
+}
+
+export function planAmendment(previous: Pick<TripVersion, 'customers'>, beforeStatuses: Trip['statuses'],
+  original: CustomerOrder, customer: CustomerDraft, replacementStatuses: Amendment['replacementStatuses'], paid: number) {
+  const corrected = customerOrder({ ...customer, customer: original.customer });
+  const customers = previous.customers.map(customer => customer.id === corrected.id ? corrected : customer);
+  if (!isCustomers(customers)) throw new Error('更正后的明细标识重复或不完整');
+  const before = new Map(original.items.map(item => [item.id, item]));
+  const after = new Map(corrected.items.map(item => [item.id, item]));
+  const changes: LineChange[] = [];
+  for (const id of new Set([...before.keys(), ...after.keys()])) {
+    const oldLine = before.get(id);
+    const newLine = after.get(id);
+    const beforeStatus = oldLine ? beforeStatuses[id] : undefined;
+    const sameProduct = oldLine && newLine && pickingKey(oldLine) === pickingKey(newLine);
+    if (sameProduct && oldLine.quantity === newLine.quantity && oldLine.price === newLine.price) continue;
+    let afterStatus: DeliveryStatus | undefined;
+    if (newLine) {
+      afterStatus = sameProduct ? beforeStatus : 'pending';
+      if (!sameProduct && beforeStatus === 'delivered') {
+        const selected = replacementStatuses?.[id];
+        if (selected !== 'delivered' && selected !== 'pending') throw new Error('请确认替换货品的配送状态');
+        afterStatus = selected;
+      }
+    }
+    changes.push({ id, before: oldLine, after: newLine, beforeStatus, afterStatus });
+  }
+  if (!changes.length) throw new Error('请先修改明细');
+  const updated = new Map(changes.map(change => [change.id, change.afterStatus]));
+  const statuses = Object.fromEntries(customers.flatMap(customer => customer.items.map(({ id }) => [id, updated.get(id) ?? beforeStatuses[id]])));
+  return { customers, customer: corrected, original, changes, statuses, totalCents: sumOrders(customers),
+    before: deliveredBalance(original, beforeStatuses, paid), after: deliveredBalance(corrected, statuses, paid),
+    unchecked: corrected.items.filter(item => statuses[item.id] !== 'delivered'),
+    picking: pickingChanges(previous.customers, customers) };
 }
 
 export function isTripDraft(value: unknown): value is TripDraft {
@@ -441,36 +475,8 @@ export class TripService {
     }
     const original = this.requireCustomer(trip, amendment.customer.id);
     if (this.accountBasis(state, trip, original) !== amendment.accountBasis) throw new Error('客户账目已变化，请重新预览');
-    const corrected = customerOrder({ ...amendment.customer, customer: original.customer });
-    const customers = previous.customers.map(customer => customer.id === corrected.id ? corrected : customer);
-    if (!isCustomers(customers)) throw new Error('更正后的明细标识重复或不完整');
-    const before = new Map(original.items.map(item => [item.id, item]));
-    const after = new Map(corrected.items.map(item => [item.id, item]));
-    const changes: LineChange[] = [];
-    for (const id of new Set([...before.keys(), ...after.keys()])) {
-      const oldLine = before.get(id);
-      const newLine = after.get(id);
-      const beforeStatus = oldLine ? trip.statuses[id] : undefined;
-      const sameProduct = oldLine && newLine && pickingKey(oldLine) === pickingKey(newLine);
-      if (sameProduct && oldLine.quantity === newLine.quantity && oldLine.price === newLine.price) continue;
-      let afterStatus: DeliveryStatus | undefined;
-      if (newLine) {
-        afterStatus = sameProduct ? beforeStatus : 'pending';
-        if (!sameProduct && beforeStatus === 'delivered') {
-          const selected = amendment.replacementStatuses?.[id];
-          if (selected !== 'delivered' && selected !== 'pending') throw new Error('请确认替换货品的配送状态');
-          afterStatus = selected;
-        }
-      }
-      changes.push({ id, before: oldLine, after: newLine, beforeStatus, afterStatus });
-    }
-    if (!changes.length) throw new Error('请先修改明细');
-    const updated = new Map(changes.map(change => [change.id, change.afterStatus]));
-    const statuses = Object.fromEntries(customers.flatMap(customer => customer.items.map(({ id }) => [id, updated.get(id) ?? trip.statuses[id]])));
-    return { customers, customer: corrected, original, changes, statuses, totalCents: sumOrders(customers),
-      before: sheetBalance(state.ledger, trip, original), after: sheetBalance(state.ledger, trip, corrected, statuses),
-      unchecked: corrected.items.filter(item => statuses[item.id] !== 'delivered'),
-      picking: pickingChanges(previous.customers, customers) };
+    return planAmendment(previous, trip.statuses, original, amendment.customer, amendment.replacementStatuses,
+      sheetBalance(state.ledger, trip, original).paid);
   }
 
   private checkAssistantQuantities(state: TripState): void {

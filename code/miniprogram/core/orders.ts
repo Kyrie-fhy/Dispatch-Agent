@@ -16,7 +16,11 @@ export function emptyItem(id: string): ItemInput {
 export function initialState(id: string): State {
   return { schemaVersion: 1, draft: { id, revision: 0, customer: '', items: [emptyItem(`${id}-1`)] }, orders: [] };
 }
-export function money(cents: number): string { return (cents / 100).toFixed(2); }
+export function money(cents: number): string {
+  const absolute = Math.abs(cents);
+  const fraction = absolute % 100;
+  return `${cents < 0 ? '-' : ''}${(absolute - fraction) / 100}.${String(fraction).padStart(2, '0')}`;
+}
 export function preview(draft: Draft): Order {
   if (!draft.customer.trim()) throw new Error('请填写客户名称');
   if (draft.items.length === 0) throw new Error('请至少添加一条货品');
@@ -39,10 +43,10 @@ export function preview(draft: Draft): Order {
   if (!Number.isSafeInteger(totalCents)) throw new Error('订单总额超出可计算范围');
   return { id: draft.id, revision: draft.revision, customer: draft.customer.trim(), items, totalCents, confirmedAt: '' };
 }
-function isObject(value: unknown): value is Record<string, unknown> {
+export function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
-function isDraft(value: unknown): value is Draft {
+export function isDraft(value: unknown): value is Draft {
   if (!isObject(value) || typeof value.id !== 'string' || !value.id || typeof value.customer !== 'string' || !Number.isSafeInteger(value.revision) || Number(value.revision) < 0 || !Array.isArray(value.items) || !value.items.length) return false;
   const keys = ['id', 'product', 'brand', 'specification', 'unit', 'quantity', 'price'];
   return value.items.every(item => isObject(item) && keys.every(key => typeof item[key] === 'string') && !!item.id)

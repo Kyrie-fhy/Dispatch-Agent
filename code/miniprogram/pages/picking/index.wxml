@@ -1,1 +1,25 @@
-<view class="container"><view class="title">取货清单</view><view class="card"><view>取货汇总将在 S2 接入</view><view class="hint">当前可在助手中手动录单、预览并确认生成正式送货单。</view></view></view>
+<view class="container">
+  <view class="title">取货清单</view>
+  <view wx:if="{{error}}" class="error">{{error}}</view>
+  <view wx:elif="{{!version}}" class="card">
+    还没有正式送货单。
+    <navigator url="/pages/assistant/index" open-type="switchTab" class="link">去助手录单</navigator>
+  </view>
+  <block wx:else>
+    <view class="card" wx:if="{{version > 1}}">
+      <view class="section-title">第 {{version}} 版取货变化</view>
+      <view wx:if="{{!changes.length}}" class="hint">本次取货数量无变化</view>
+      <view wx:for="{{changes}}" wx:key="id" class="line">
+        <view>{{item.brand}} {{item.product}} · {{item.specification}}</view>
+        <view class="subtotal">{{item.before}} → {{item.after}} {{item.unit}}</view>
+      </view>
+    </view>
+    <view class="card">
+      <view class="section-title">本趟应取 · 第 {{version}} 版</view>
+      <view wx:for="{{rows}}" wx:key="id" class="line">
+        <view class="product">{{item.brand}} {{item.product}} · {{item.specification}}</view>
+        <view>{{item.quantity}} {{item.unit}}</view>
+      </view>
+    </view>
+  </block>
+</view>

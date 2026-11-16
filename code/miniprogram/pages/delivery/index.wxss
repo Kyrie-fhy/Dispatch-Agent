@@ -1,1 +1,8 @@
-/* Common page styles are defined in app.wxss. */
+.reference { overflow-wrap: anywhere; }
+.line-status { display: flex; align-items: center; justify-content: space-between; margin-top: 8rpx; gap: 12rpx; }
+.line-status button { margin: 0; }
+.delivered, .notice { color: #12664d; }
+.notice { padding: 16rpx; border-radius: 12rpx; background: #def2e8; }
+.image-card { padding: 0; overflow: hidden; }
+.image-card image { width: 100%; display: block; }
+.order-canvas { position: fixed; top: 0; left: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; }

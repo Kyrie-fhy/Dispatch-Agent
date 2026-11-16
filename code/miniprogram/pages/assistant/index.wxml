@@ -1,8 +1,93 @@
 <import src="../order-templates.wxml" />
 <view class="container">
-  <view class="title">整理送货单</view>
+  <view class="title">配送助手</view>
+  <view class="subtitle">发材料整理送货单，也可以指定已出单的客户送达、改单或收款。</view>
   <view wx:if="{{error}}" class="error" role="alert">{{error}}</view>
   <block wx:if="{{loaded}}">
+    <view class="card composer">
+      <view class="composer-header">
+        <view class="section-title">发送给助手</view>
+        <view class="badge">模拟识别</view>
+      </view>
+      <view class="material-title">选模拟图片 · 可多选</view>
+      <view class="material-grid">
+        <view class="material {{item.marked ? 'material-marked' : ''}}" wx:for="{{images}}" wx:key="id" data-id="{{item.id}}" bindtap="pickImage" role="button">
+          <view class="material-label">{{item.marked ? '✓ ' : ''}}{{item.label}}</view>
+          <image wx:if="{{item.asset}}" class="material-image" src="{{item.asset}}" mode="widthFix" />
+          <view wx:else class="material-paper">{{item.caption}}</view>
+        </view>
+      </view>
+      <view class="selected" wx:if="{{selected.length}}">已选 {{selected.length}} 张，按选择顺序发送</view>
+      <view class="material-title">语音转写示例 · 发前可编辑</view>
+      <view class="chips">
+        <button wx:for="{{voice}}" wx:key="label" data-index="{{index}}" bindtap="pickVoice">{{item.label}}</button>
+      </view>
+      <textarea value="{{text}}" bindinput="editMessage" maxlength="800" placeholder="输入文字，如：生成送货单" />
+      <view wx:if="{{transcribed}}" class="muted transcript">模拟转写 · 可修改输入框中的内容</view>
+      <view class="composer-controls">
+        <button class="outline" bindtap="toggleHelp">{{help ? '收起示例' : '输入示例'}}</button>
+        <button class="primary" bindtap="send">发送</button>
+      </view>
+      <view class="example" wx:if="{{help}}">
+        <view>录入：录入 客户 C 三全 水饺 500g 1箱 75</view>
+        <view>缺字段用「-」，如规格「-」、数量「-箱」、单位「2-」。</view>
+        <view>补充：补充 客户 A 水饺 规格 500g 单价 82</view>
+        <view>确认数量：客户 A 水饺 再要 3 箱</view>
+        <view>改单：修改 客户 B 水饺/箱 单价 81</view>
+        <view>送达：客户 A 全部送达</view>
+        <view>收款：客户 A 收到 100 元</view>
+        <button wx:if="{{!demoReady}}" bindtap="prepareDemo">准备 A 的模拟历史价</button>
+      </view>
+    </view>
+    <view wx:if="{{notice}}" class="card notice">
+      <view>{{notice}}</view>
+      <button wx:if="{{completedTarget}}" class="outline" data-trip="{{completedTarget.tripId}}" data-sheet="{{completedTarget.sheetId}}" bindtap="openDelivery">打开该客户单 · 对账或导图</button>
+    </view>
+    <view wx:if="{{selection}}" class="card action-card">
+      <view class="section-title">选择原单或明细</view>
+      <button wx:for="{{selection.targets}}" wx:key="id" data-id="{{item.id}}" bindtap="chooseOfficial">{{item.label}}</button>
+      <button class="outline" bindtap="cancelOfficial">取消</button>
+    </view>
+    <view wx:if="{{official}}" class="card action-card">
+      <view class="section-title">{{official.title}}</view>
+      <view class="line">{{official.label}}</view>
+      <view wx:for="{{official.details}}" wx:key="*this" class="line">{{item}}</view>
+      <button class="primary" bindtap="commitOfficial">确认提交</button>
+      <button class="outline" bindtap="cancelOfficial">取消</button>
+    </view>
+    <view wx:if="{{!confirmed && !previewTrip && questions.length}}" class="card action-card">
+      <view class="section-title">待补充 · 整趟一起出单</view>
+      <view wx:for="{{questions}}" wx:key="id" wx:for-item="customer" class="question">
+        <view class="product">{{customer.name}}</view>
+        <block wx:if="{{customer.identity}}">
+          <view class="muted">请选择这条材料属于哪个客户；新叫法会关联到所选客户。</view>
+          <picker wx:if="{{parties.length}}" range="{{parties}}" range-key="label" data-id="{{customer.id}}" bindchange="chooseQuestionParty">
+            <view class="picker-choice">关联已有客户 ›</view>
+          </picker>
+          <button data-id="{{customer.id}}" bindtap="newQuestionParty">新建客户</button>
+        </block>
+        <view wx:for="{{customer.lines}}" wx:key="id" wx:for-item="line" class="line">
+          <view>{{line.label}}</view>
+          <view wx:if="{{line.missing}}" class="muted">请补充或核对：{{line.missing}}</view>
+          <view wx:if="{{line.history}}">
+            <view class="history">{{line.historyLabel}}</view>
+            <button data-customer="{{customer.id}}" data-item="{{line.id}}" data-source="{{line.history.source}}" data-price="{{line.history.price}}" bindtap="useHistory">沿用此价</button>
+            <view class="muted">也可回复本次单价，或手动编辑。</view>
+          </view>
+          <block wx:if="{{line.quantity}}">
+            <view>「{{line.quantity.source}}」</view>
+            <view wx:if="{{line.quantityChanged}}" class="muted">该行数量或单位已修改，请保留手动结果或重新发送。</view>
+            <block wx:else>
+              <button data-id="{{line.id}}" data-choice="replace" bindtap="chooseQuantity">改成 {{line.quantity.requested}}{{line.unit}}</button>
+              <button data-id="{{line.id}}" data-choice="append" bindtap="chooseQuantity">追加到 {{line.sum}}{{line.unit}}</button>
+            </block>
+            <button data-id="{{line.id}}" data-choice="keep" bindtap="chooseQuantity">保留当前数量</button>
+          </block>
+        </view>
+        <button data-customer="{{customer.id}}" bindtap="openManual">手动补充 {{customer.name}}</button>
+      </view>
+    </view>
+    <button wx:if="{{!confirmed && !previewTrip}}" class="primary generate" bindtap="sendGenerate">生成送货单</button>
     <block wx:if="{{confirmed}}">
       <view class="card">
         <view class="section-title">已出单 · 第 {{confirmed.version}} 版</view>
@@ -17,10 +102,16 @@
       <view wx:for="{{previewTrip.identities}}" wx:key="index" class="hint">{{index + 1}}. {{item}}</view>
       <template is="trip-customers" data="{{summary: previewTrip}}" />
       <view class="amount">整趟订单金额 ¥{{previewTrip.total}}</view>
-      <button class="primary" bindtap="confirmTrip">确认生成正式单</button>
+      <button class="primary" bindtap="confirmTrip" disabled="{{busy}}">确认生成正式单</button>
       <button bindtap="backToEdit">返回修改</button>
     </block>
     <block wx:else>
+      <button wx:if="{{!manual}}" class="outline" bindtap="toggleManual">手动编辑草稿</button>
+      <view wx:if="{{!manual}}" class="hint draft-summary">本趟草稿
+        <text wx:for="{{draft.customers}}" wx:key="id" wx:if="{{item.customer}}"> · {{item.customer}}</text>
+      </view>
+      <view id="manual-editor" wx:if="{{manual}}">
+      <button class="outline" bindtap="toggleManual">收起手动编辑</button>
       <view class="card">
         <view class="section-title">本趟客户</view>
         <view class="customer-options">
@@ -44,7 +135,23 @@
       </view>
       <button class="primary" bindtap="showPreview">预览整趟</button>
       <button bindtap="fillSample">填入 A/B/C 验收样例</button>
+      </view>
     </block>
+    <view wx:if="{{jobs.length}}" class="card activity">
+      <view class="section-title">处理记录</view>
+      <view class="activity-item" wx:for="{{jobs}}" wx:key="id">
+        <view class="message">{{item.label}}</view>
+        <view class="activity-detail {{item.status === 'failed' || item.status === 'stale' ? 'needs-action' : ''}}">
+          <text wx:if="{{item.status === 'done'}}">✓ </text>{{item.detail}}
+        </view>
+        <view class="chips" wx:if="{{item.status === 'failed' || item.status === 'stale' || item.status === 'manual' || item.status === 'skipped'}}">
+          <button wx:if="{{item.skipped.length && item.draftId === draft.id && !confirmed}}" size="mini" data-id="{{item.id}}" bindtap="restoreDuplicate">仍然补录</button>
+          <button wx:if="{{(item.status === 'failed' || item.status === 'stale') && item.draftId === draft.id}}" size="mini" data-id="{{item.id}}" bindtap="retryMaterial">重试</button>
+          <button wx:if="{{item.text}}" size="mini" data-id="{{item.id}}" bindtap="reuseText">编辑原文</button>
+          <button wx:if="{{!confirmed}}" size="mini" bindtap="openManual">手动补充</button>
+        </view>
+      </view>
+    </view>
   </block>
   <button bindtap="resetDemo">重置演示数据</button>
 </view>

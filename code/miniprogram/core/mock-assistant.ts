@@ -220,4 +220,3 @@ export function officialTargets(state: TripState, intent: Official): OfficialTar
   const preferred = candidates.filter(candidate => candidate.tripId === current?.id);
   return preferred.length ? preferred : candidates;
 }
-

@@ -3,7 +3,8 @@ import { emptyItem, ItemInput, money } from '../../core/orders';
 import { localDay, OpeningPreview, ReceiptPreview, settlementTotals, Sheet, tripBalance } from '../../core/settlement';
 import { Amendment, currentTrip, DeliveryPreview, latest, pickingKey, Trip, TripState } from '../../core/trips';
 import { generateOrderImages, saveOrderImage } from '../../services/order-images';
-import { newId, trips } from '../../services/orders';
+import { newId } from '../../services/ids';
+import { trips } from '../../services/orders';
 import { deliveryLabel, editLines, errorMessage, formLines, lineView } from '../order-view';
 import { balanceView, settlementView } from './settlement-view';
 

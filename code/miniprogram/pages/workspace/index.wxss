@@ -1,0 +1,5 @@
+.workspace-actions { display: flex; flex-wrap: wrap; gap: 12rpx; margin: 20rpx 0; }
+.workspace-actions button { flex: 1; margin: 0; white-space: nowrap; }
+.session-actions { display: flex; gap: 12rpx; justify-content: flex-end; margin-bottom: 24rpx; }
+.session-actions button { margin: 0; }
+.session-actions button::after { border: 0; }

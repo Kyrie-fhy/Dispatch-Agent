@@ -63,7 +63,10 @@ function edit(page, id, fields) {
   for (const [field, value] of Object.entries(fields)) page.editItem(input({ id, field }, value));
 }
 
-function nameCustomer(page, name) { page.editCustomer(input({ id: page.data.activeId }, name)); }
+function nameCustomer(page, name) {
+  page.editCustomer(input({ id: page.data.activeId }, name));
+  page.chooseNew();
+}
 
 function openCustomer(page, index, trip = page.data.current) {
   page.openCustomer(tap({ tripId: trip.id, customerId: trip.customers[index].id }));
@@ -235,4 +238,103 @@ test('long customer images paginate with all rows and album saving resumes after
   await delivery.saveImages();
   assert.deepEqual(env.saved, files);
   assert.equal(delivery.data.images.saved, files.length);
+});
+
+test('delivery page reconciles A/B/C, previews split payments and receives a historical balance', () => {
+  const env = environment();
+  const assistant = env.load('assistant');
+  const delivery = env.load('delivery');
+  assistant.onLoad();
+  assistant.fillSample();
+  assistant.showPreview();
+  assistant.confirmTrip();
+  delivery.onShow();
+  openCustomer(delivery, 0);
+  delivery.deliverCustomer();
+  delivery.startReconcile();
+  delivery.confirmReconcile();
+  delivery.startOpening();
+  delivery.editDay(input({}, '2026-07-01'));
+  delivery.editAmount(input({}, '60'));
+  delivery.editSource(input({}, '旧手账 1'));
+  delivery.showEntryPreview();
+  delivery.confirmEntry();
+  assert.equal(delivery.data.detail.account.historic, '60.00');
+  delivery.backToList();
+  openCustomer(delivery, 1);
+  delivery.startReconcile();
+  assert.equal(delivery.data.detail.unchecked.length, 2);
+  delivery.toggleLine(tap({ id: delivery.data.detail.items[0].id }));
+  delivery.confirmReconcile();
+  assert.equal(delivery.data.detail.account.due, '240.00');
+  assert.equal(delivery.data.detail.total, '300.00');
+  delivery.backToList();
+  openCustomer(delivery, 2);
+  delivery.startReconcile();
+  delivery.confirmReconcile();
+  assert.equal(delivery.data.current.reviewed, 3);
+  assert.equal(delivery.data.current.due, '404.00');
+  delivery.backToList();
+
+  openCustomer(delivery, 0);
+  delivery.startReceipt();
+  delivery.editAmount(input({}, '100'));
+  delivery.showEntryPreview();
+  assert.deepEqual(delivery.data.entryPreview.allocations.map(entry => entry.value), ['60.00', '40.00']);
+  delivery.cancelEntry();
+  assert.equal(delivery.data.detail.account.remaining, '164.00');
+  delivery.startReceipt();
+  delivery.editAmount(input({}, '100'));
+  delivery.showEntryPreview();
+  env.failWrites(true);
+  delivery.confirmEntry();
+  assert.match(delivery.data.error, /保存失败/);
+  assert.equal(delivery.data.detail.account.paid, '0.00');
+  assert.equal(delivery.data.entryPreview.amount, '100.00');
+  env.failWrites(false);
+  delivery.confirmEntry();
+  delivery.confirmEntry();
+  assert.equal(delivery.data.detail.account.remaining, '124.00');
+  assert.equal(delivery.data.detail.account.receipts.length, 1);
+
+  assistant.onShow();
+  assistant.nextTrip();
+  const a = assistant.data.parties.findIndex(party => party.name === '客户 A');
+  assistant.chooseExisting(input({}, String(a)));
+  edit(assistant, assistant.data.active.items[0].id, { product: '水饺', brand: '安井', specification: '500g', quantity: '1', price: '50' });
+  assistant.showPreview();
+  assert.match(assistant.data.previewTrip.identities[0], /客户 A · 客户 1/);
+  assistant.confirmTrip();
+  const reopened = env.load('delivery');
+  reopened.onShow();
+  openCustomer(reopened, 0, reopened.data.history[0]);
+  reopened.startReceipt();
+  reopened.editAmount(input({}, '124'));
+  reopened.showEntryPreview();
+  reopened.confirmEntry();
+  assert.equal(reopened.data.detail.account.paid, '164.00');
+  assert.equal(reopened.data.detail.account.remaining, '0.00');
+  assert.equal(reopened.data.detail.account.receipts.length, 2);
+  assert.equal(reopened.data.current.historic, '0.00');
+  assert.equal(reopened.data.current.paid, '0.00');
+
+  const line = reopened.data.detail.items[0].id;
+  reopened.startAmendment();
+  edit(reopened, line, { brand: '三全', price: '90' });
+  reopened.showAmendmentPreview();
+  assert.match(reopened.data.error, /确认替换货品的配送状态/);
+  reopened.selectReplacement(tap({ id: line, status: 'delivered' }));
+  reopened.showAmendmentPreview();
+  assert.equal(reopened.data.preview.afterBalance.remaining, '16.00');
+  reopened.confirmAmendment();
+  assert.equal(reopened.data.detail.version, 2);
+  assert.equal(reopened.data.detail.account.paid, '164.00');
+  assert.equal(reopened.data.current.total, '50.00');
+  reopened.toggleLine(tap({ id: line }));
+  assert.equal(reopened.data.deliveryPreview.after.excess, '164.00');
+  reopened.cancelDelivery();
+  assert.equal(reopened.data.detail.account.remaining, '16.00');
+  reopened.toggleLine(tap({ id: line }));
+  reopened.confirmDelivery();
+  assert.equal(reopened.data.detail.account.excess, '164.00');
 });

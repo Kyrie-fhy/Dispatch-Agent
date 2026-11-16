@@ -1,6 +1,12 @@
 <import src="../order-templates.wxml" />
+<template name="balance-change">
+  <view class="line">应收 ¥{{before.due}} → ¥{{after.due}}</view>
+  <view>本单累计实收 ¥{{before.paid}} → ¥{{after.paid}}</view>
+  <view>本单欠款 ¥{{before.remaining}} → ¥{{after.remaining}}</view>
+  <view wx:if="{{before.hasExcess || after.hasExcess}}">多收 ¥{{before.excess}} → ¥{{after.excess}}</view>
+</template>
 <view class="container">
-  <view class="title">送货单</view>
+  <view class="title">送货与对账</view>
   <view wx:if="{{error}}" class="error" role="alert">{{error}}</view>
   <view wx:if="{{notice}}" class="notice">{{notice}}</view>
   <block wx:if="{{images}}">
@@ -14,6 +20,45 @@
     </button>
     <button wx:if="{{albumSettings}}" bindtap="openAlbumSettings">打开相册权限设置</button>
     <button bindtap="closeImages" disabled="{{busy}}">返回客户单据</button>
+  </block>
+  <block wx:elif="{{deliveryPreview}}">
+    <view class="card">
+      <view class="section-title">配送状态变更</view>
+      <view wx:for="{{deliveryPreview.lines}}" wx:key="index">{{item}} · {{deliveryPreview.status}}</view>
+      <template is="balance-change" data="{{before: deliveryPreview.before, after: deliveryPreview.after}}" />
+      <button class="primary" bindtap="confirmDelivery">确认更新</button>
+      <button bindtap="cancelDelivery">返回单据</button>
+    </view>
+  </block>
+  <block wx:elif="{{entry}}">
+    <view class="card">
+      <view class="section-title">{{entry === 'receipt' ? '记收款' : '补录旧欠款'}}</view>
+      <view class="hint">{{detail.account.party}}</view>
+      <block wx:if="{{entryPreview}}">
+        <view class="amount">{{entry === 'receipt' ? '本次收到' : '旧欠款'}} ¥{{entryPreview.amount}}</view>
+        <view wx:if="{{entry === 'opening'}}" class="hint">{{day}} {{source}}</view>
+        <view wx:for="{{entryPreview.allocations}}" wx:key="id" class="line">
+          <view class="reference">{{item.label}}</view>
+          <view>抵扣 ¥{{item.value}} · 剩余 ¥{{item.remaining}}</view>
+        </view>
+        <button class="primary" bindtap="confirmEntry">{{entry === 'receipt' ? '确认收款' : '确认补录'}}</button>
+        <button bindtap="editEntry">返回修改</button>
+      </block>
+      <block wx:else>
+        <block wx:if="{{entry === 'opening'}}">
+          <picker mode="date" value="{{day}}" end="{{today}}" bindchange="editDay">
+            <view class="link">发生日期 {{day}}</view>
+          </picker>
+          <label for="opening-source">来源（选填）</label>
+          <input id="opening-source" value="{{source}}" bindinput="editSource" placeholder="例如：旧手账第 3 页" maxlength="100" />
+        </block>
+        <view wx:else class="hint">可抵扣欠款 ¥{{detail.account.available}}</view>
+        <label for="settlement-amount">{{entry === 'receipt' ? '本次收到金额（元）' : '未付金额（元）'}}</label>
+        <input id="settlement-amount" type="digit" value="{{amount}}" bindinput="editAmount" placeholder="0.00" maxlength="24" />
+        <button class="primary" bindtap="showEntryPreview">{{entry === 'receipt' ? '预览分配' : '预览补录'}}</button>
+      </block>
+      <button bindtap="cancelEntry">取消</button>
+    </view>
   </block>
   <block wx:elif="{{amendment}}">
     <view class="section-title">{{amendment.customer.customer}} · 更正单据</view>
@@ -31,6 +76,11 @@
         <view wx:else>移除此明细</view>
       </view>
       <view class="subtotal">客户订单金额 ¥{{preview.before}} → ¥{{preview.after}}</view>
+      <template is="balance-change" data="{{before: preview.beforeBalance, after: preview.afterBalance}}" />
+      <block wx:if="{{detail.account.reviewed && preview.unchecked.length}}">
+        <view class="subtotal">请核对以下未送达项</view>
+        <view wx:for="{{preview.unchecked}}" wx:key="id" class="hint">{{item.brand}} {{item.product}} · {{item.quantity}} {{item.unit}}</view>
+      </block>
       <view class="subtotal">取货变化</view>
       <view wx:if="{{!preview.picking.length}}" class="hint">本次取货数量无变化</view>
       <view wx:for="{{preview.picking}}" wx:key="id" class="line">{{item.brand}} {{item.product}} · {{item.specification}} {{item.before}} → {{item.after}} {{item.unit}}</view>
@@ -39,6 +89,13 @@
     </view>
     <view wx:else class="card">
       <template is="edit-lines" data="{{form: form}}" />
+      <view wx:for="{{replacements}}" wx:key="id" class="line">
+        <view>替换为 {{item.label}}</view>
+        <view class="line-status">
+          <button size="mini" class="{{item.status === 'delivered' ? 'primary' : ''}}" data-id="{{item.id}}" data-status="delivered" bindtap="selectReplacement">已送达</button>
+          <button size="mini" class="{{item.status === 'pending' ? 'primary' : ''}}" data-id="{{item.id}}" data-status="pending" bindtap="selectReplacement">未配送</button>
+        </view>
+      </view>
       <button class="primary" bindtap="showAmendmentPreview">预览更正</button>
     </view>
     <button bindtap="cancelAmendment">取消更正</button>
@@ -48,27 +105,85 @@
     <view class="card">
       <view class="section-title">{{detail.customer}} · 第 {{detail.version}} 版</view>
       <view class="hint reference">{{detail.id}}</view>
+      <view wx:if="{{detail.account.party}}" class="hint">{{detail.account.party}}</view>
       <view wx:for="{{detail.items}}" wx:key="id" class="line">
         <template is="order-line" data="{{line: item}}" />
         <view class="line-status">
           <text class="{{item.delivered ? 'delivered' : 'muted'}}">{{item.label}}</text>
-          <button wx:if="{{detail.active}}" size="mini" data-id="{{item.id}}" bindtap="toggleLine" disabled="{{busy}}">
+          <button size="mini" data-id="{{item.id}}" bindtap="toggleLine" disabled="{{busy}}">
             {{item.delivered ? '改为未配送' : '标记已送达'}}
           </button>
+          <button wx:if="{{item.unrecorded}}" size="mini" data-id="{{item.id}}" bindtap="markPending" disabled="{{busy}}">确认未配送</button>
         </view>
       </view>
       <view class="amount">订单金额 ¥{{detail.total}}</view>
-      <block wx:if="{{detail.active}}">
-        <button class="primary" bindtap="deliverCustomer" disabled="{{busy}}">本客户全部已送达</button>
-        <button bindtap="startAmendment" disabled="{{busy}}">更正单据</button>
-      </block>
+      <button bindtap="deliverCustomer" disabled="{{busy}}">本客户全部已送达</button>
+      <button bindtap="startAmendment" disabled="{{busy}}">更正单据</button>
       <button bindtap="exportImages" loading="{{busy}}" disabled="{{busy}}">导出明细图</button>
+    </view>
+    <view class="card">
+      <view class="section-title">对账</view>
+      <view class="amount">本次应收 ¥{{detail.account.due}}</view>
+      <view wx:if="{{!detail.account.reviewed}}" class="hint">待核对 · 已标记送达金额</view>
+      <view>本单累计实收 ¥{{detail.account.paid}}</view>
+      <view>本单剩余欠款 ¥{{detail.account.remaining}}</view>
+      <view>{{detail.active ? '历史欠款' : '其他单据欠款'}} ¥{{detail.account.historic}}</view>
+      <view wx:if="{{detail.account.hasExcess}}">本单多收 ¥{{detail.account.excess}}</view>
+      <button wx:if="{{!detail.account.reviewed && !reconciling}}" class="primary" bindtap="startReconcile">开始对账</button>
+      <block wx:if="{{reconciling}}">
+        <block wx:if="{{!detail.account.party}}">
+          <view class="subtotal">确认这张单的客户归属</view>
+          <picker wx:if="{{detail.account.parties.length}}" range="{{detail.account.parties}}" range-key="label" bindchange="chooseParty">
+            <view class="link">选择已有客户</view>
+          </picker>
+          <button bindtap="createParty">新建客户「{{detail.customer}}」</button>
+        </block>
+        <block wx:else>
+          <view wx:if="{{detail.unchecked.length}}" class="subtotal">核对以下未送达或未记录明细</view>
+          <view wx:for="{{detail.unchecked}}" wx:key="id" class="line">
+            <view>{{item.brand}} {{item.product}} · {{item.quantity}} {{item.unit}} · {{item.label}}</view>
+            <view class="line-status">
+              <button size="mini" data-id="{{item.id}}" bindtap="toggleLine">补标已送达</button>
+              <button wx:if="{{item.unrecorded}}" size="mini" data-id="{{item.id}}" bindtap="markPending">确认未配送</button>
+            </view>
+          </view>
+          <button class="primary" bindtap="confirmReconcile" disabled="{{detail.unrecorded}}">确认对账</button>
+        </block>
+        <button bindtap="cancelReconcile">稍后核对</button>
+      </block>
+      <block wx:if="{{detail.account.party}}">
+        <button wx:if="{{detail.account.canReceive}}" class="primary" bindtap="startReceipt">记收款</button>
+        <button bindtap="startOpening">补录旧欠款</button>
+        <button bindtap="toggleBook">{{book ? '收起账目明细' : '查看欠款与收款去向'}}</button>
+      </block>
+    </view>
+    <view wx:if="{{book}}" class="card">
+      <view class="section-title">账目明细</view>
+      <view wx:if="{{!detail.account.debts.length && !detail.account.unreviewed.length && !detail.account.receipts.length}}" class="hint">暂无其他单据或收款记录</view>
+      <view wx:for="{{detail.account.debts}}" wx:key="id" class="line">
+        <view class="reference">{{item.label}}</view>
+        <view>实收 ¥{{item.paid}} · 剩余欠款 ¥{{item.remaining}}</view>
+        <view wx:if="{{item.hasExcess}}">多收 ¥{{item.excess}}</view>
+        <button wx:if="{{item.sheet}}" size="mini" data-trip-id="{{item.sheet.tripId}}" data-customer-id="{{item.sheet.sheetId}}" bindtap="openCustomer">查看原单</button>
+      </view>
+      <view wx:for="{{detail.account.unreviewed}}" wx:key="tripId" class="line">
+        <button size="mini" data-trip-id="{{item.tripId}}" data-customer-id="{{item.sheetId}}" bindtap="openCustomer">{{item.label}} · 打开原单</button>
+      </view>
+      <view wx:for="{{detail.account.receipts}}" wx:key="id" class="line">
+        <view class="subtotal">{{item.day}} · 收到 ¥{{item.amount}}</view>
+        <view wx:for="{{item.allocations}}" wx:for-item="allocation" wx:key="debtId" class="reference">{{allocation.label}} · ¥{{allocation.amount}}</view>
+      </view>
     </view>
   </block>
   <block wx:else>
     <view wx:if="{{current}}" class="card">
       <view class="section-title">本趟 · 第 {{current.version}} 版</view>
       <view class="hint">{{current.openedAt}} · 整趟订单金额 ¥{{current.total}}</view>
+      <view class="line">已核对 {{current.reviewed}} / {{current.count}} · 本趟应收 ¥{{current.due}}</view>
+      <view wx:if="{{current.reviewed < current.count}}" class="hint">待核对的已送达金额 ¥{{current.unchecked}}</view>
+      <view>本趟累计实收 ¥{{current.paid}} · 欠款 ¥{{current.remaining}}</view>
+      <view>历史欠款 ¥{{current.historic}}</view>
+      <view wx:if="{{current.hasExcess}}">本趟多收 ¥{{current.excess}}</view>
       <button wx:for="{{current.customers}}" wx:key="id" data-trip-id="{{current.id}}" data-customer-id="{{item.id}}" bindtap="openCustomer">
         {{index + 1}}. {{item.name}} · ¥{{item.total}}
       </button>
@@ -81,6 +196,11 @@
     <view wx:for="{{history}}" wx:for-item="trip" wx:key="id" class="card">
       <button data-id="{{trip.id}}" bindtap="toggleHistory">{{trip.openedAt}} · ¥{{trip.total}}</button>
       <block wx:if="{{historyId === trip.id}}">
+        <view class="line">已核对 {{trip.reviewed}} / {{trip.count}} · 本趟应收 ¥{{trip.due}}</view>
+        <view wx:if="{{trip.reviewed < trip.count}}" class="hint">待核对的已送达金额 ¥{{trip.unchecked}}</view>
+        <view>本趟累计实收 ¥{{trip.paid}} · 欠款 ¥{{trip.remaining}}</view>
+        <view>其他单据欠款 ¥{{trip.historic}}</view>
+        <view wx:if="{{trip.hasExcess}}">本趟多收 ¥{{trip.excess}}</view>
         <button wx:for="{{trip.customers}}" wx:key="id" data-trip-id="{{trip.id}}" data-customer-id="{{item.id}}" bindtap="openCustomer">
           {{index + 1}}. {{item.name}} · ¥{{item.total}}
         </button>

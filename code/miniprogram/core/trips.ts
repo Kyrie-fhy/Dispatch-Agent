@@ -1,6 +1,8 @@
 import { emptyItem, isDraft, isObject, ItemInput, OrderLine, preview, readState as readS1 } from './orders';
+import { Account, accountFor, checkOpening, emptyLedger, Ledger, localDay, OpeningPreview,
+  parseAmount, Party, planReceipt, readLedger, Receipt, ReceiptPreview, settlementTotals, Sheet, sheetBalance, tripBalance } from './settlement';
 
-export interface CustomerDraft { id: string; customer: string; items: ItemInput[] }
+export interface CustomerDraft { id: string; customer: string; items: ItemInput[]; partyId?: string | null }
 export interface TripDraft { id: string; revision: number; customers: CustomerDraft[] }
 export interface CustomerOrder extends CustomerDraft { items: OrderLine[]; totalCents: number }
 export interface TripVersion {
@@ -18,7 +20,7 @@ export interface Trip {
   statuses: Record<string, DeliveryStatus>;
   statusRevision: number;
 }
-export interface TripState { schemaVersion: 2; draft: TripDraft; trips: Trip[] }
+export interface TripState { schemaVersion: 3; draft: TripDraft; trips: Trip[]; ledger: Ledger }
 export interface TripStorage { read(): unknown; write(state: TripState): void }
 export interface PickingLine { id: string; product: string; brand: string; specification: string; unit: string; quantity: number }
 export interface PickingChange extends Omit<PickingLine, 'quantity'> { before: number; after: number }
@@ -27,7 +29,21 @@ export interface Amendment {
   tripId: string;
   version: number;
   statusRevision: number;
+  accountBasis: string;
   customer: CustomerDraft;
+  replacementStatuses?: Partial<Record<string, 'pending' | 'delivered'>>;
+}
+export interface DeliveryChange extends Sheet {
+  version: number;
+  lineId: string | null;
+  status: 'pending' | 'delivered';
+}
+export interface DeliveryPreview {
+  change: DeliveryChange;
+  basis: string;
+  reviewed: boolean;
+  before: ReturnType<typeof sheetBalance>;
+  after: ReturnType<typeof sheetBalance>;
 }
 export interface LineChange {
   id: string;
@@ -80,7 +96,7 @@ export function previewTrip(draft: TripDraft): Pick<TripVersion, 'customers' | '
 
 const pickingFields = ['product', 'brand', 'specification', 'unit'] as const;
 
-function pickingKey(item: ItemInput): string {
+export function pickingKey(item: ItemInput): string {
   return JSON.stringify(pickingFields.map(field => item[field].trim()));
 }
 
@@ -118,7 +134,8 @@ function unique(ids: string[]): boolean {
 
 function isCustomers(value: unknown): value is CustomerDraft[] {
   if (!Array.isArray(value) || !value.length) return false;
-  const valid = value.every(customer => isObject(customer) && isDraft({ ...customer, revision: 0 }));
+  const valid = value.every(customer => isObject(customer) && isDraft({ ...customer, revision: 0 })
+    && (customer.partyId === undefined || customer.partyId === null || (typeof customer.partyId === 'string' && !!customer.partyId)));
   return valid && unique(value.map(customer => customer.id)) && unique(value.flatMap(customer => customer.items.map((item: ItemInput) => item.id)));
 }
 
@@ -148,15 +165,15 @@ function isTrip(value: unknown): value is Trip {
     || !value.versions.length || !value.versions.every(isVersion) || !isObject(value.statuses)
     || !Number.isSafeInteger(value.statusRevision) || Number(value.statusRevision) < 0) return false;
   if (value.origin !== 's1' && value.origin !== 's2') return false;
-  if (value.origin === 's1' && (value.versions.length !== 1 || value.statusRevision !== 0)) return false;
   const trip = value as unknown as Trip;
   const lines = latest(trip).customers.flatMap(customer => customer.items);
   return unique(trip.versions.slice(1).map(version => version.amendmentId!))
     && Object.keys(trip.statuses).length === lines.length
-    && lines.every(({ id }) => trip.origin === 's1' ? trip.statuses[id] === 'unrecorded' : ['pending', 'delivered'].includes(trip.statuses[id]));
+    && lines.every(({ id }) => trip.statuses[id] === 'pending' || trip.statuses[id] === 'delivered'
+      || (trip.origin === 's1' && trip.statuses[id] === 'unrecorded'));
 }
 
-function migrate(raw: unknown, id: () => string): TripState {
+function migrateS1(raw: unknown, id: () => string): TripState {
   const previous = readS1(raw, 'migration');
   const trips: Trip[] = previous.orders.map(order => {
     const { id, customer, items, totalCents, confirmedAt } = order;
@@ -169,7 +186,7 @@ function migrate(raw: unknown, id: () => string): TripState {
     id: previousDraft.id, revision: previousDraft.revision,
     customers: [{ id: id(), customer: previousDraft.customer, items: previousDraft.items }],
   };
-  return { schemaVersion: 2, draft, trips };
+  return { schemaVersion: 3, draft, trips, ledger: emptyLedger() };
 }
 
 export class TripService {
@@ -179,15 +196,18 @@ export class TripService {
     const raw = this.storage.read();
     if (raw === undefined || raw === null || raw === '') return this.reset();
     if (isObject(raw) && raw.schemaVersion === 1) {
-      const next = migrate(raw, this.id);
+      const next = migrateS1(raw, this.id);
       this.storage.write(next);
       return next;
     }
-    if (!isObject(raw) || raw.schemaVersion !== 2 || !isTripDraft(raw.draft)
+    if (!isObject(raw) || (raw.schemaVersion !== 2 && raw.schemaVersion !== 3) || !isTripDraft(raw.draft)
       || !Array.isArray(raw.trips) || !raw.trips.every(isTrip) || !unique(raw.trips.map(trip => trip.id))) {
       throw new Error('本地配送数据无法读取，请保留数据并联系开发者');
     }
-    return { schemaVersion: 2, draft: raw.draft, trips: raw.trips };
+    const ledger = raw.schemaVersion === 2 ? emptyLedger() : readLedger(raw.ledger, raw.trips);
+    const state: TripState = { schemaVersion: 3, draft: raw.draft, trips: raw.trips, ledger };
+    if (raw.schemaVersion === 2) this.storage.write(state);
+    return state;
   }
 
   saveDraft(draft: TripDraft): TripDraft {
@@ -206,10 +226,27 @@ export class TripService {
     if (existing) return existing;
     if (state.draft.id !== draftId || state.draft.revision !== revision) throw new Error('草稿已变化，请重新预览');
     const { customers, totalCents } = previewTrip(state.draft);
+    const choices = this.customerChoices(state);
     const trip: Trip = { id: draftId, origin: 's2', versions: [{ version: 1, customers, totalCents, savedAt: this.now() }],
       statuses: statusesFor(customers, 'pending'), statusRevision: 0 };
-    this.storage.write({ ...state, trips: [...state.trips, trip] });
+    const parties = [...state.ledger.parties];
+    const accounts = [...state.ledger.accounts];
+    choices.forEach((choice, index) => {
+      const customer = customers[index];
+      const party = choice ?? { id: this.id(), name: customer.customer };
+      if (!choice) parties.push(party);
+      accounts.push({ tripId: trip.id, sheetId: customer.id, partyId: party.id, reviewed: false });
+    });
+    this.write({ ...state, trips: [...state.trips, trip], ledger: { ...state.ledger, parties, accounts } });
     return trip;
+  }
+
+  previewDraft(draft: TripDraft) {
+    const state = this.load();
+    if (state.draft.id !== draft.id || state.draft.revision !== draft.revision) throw new Error('草稿已变化，请重新预览');
+    const result = previewTrip(state.draft);
+    const choices = this.customerChoices(state);
+    return { ...result, choices };
   }
 
   startNext(): TripDraft {
@@ -221,53 +258,161 @@ export class TripService {
   }
 
   reset(): TripState {
-    const state: TripState = { schemaVersion: 2, draft: emptyTrip(this.id), trips: [] };
+    const state: TripState = { schemaVersion: 3, draft: emptyTrip(this.id), trips: [], ledger: emptyLedger() };
     this.storage.write(state);
     return state;
   }
 
+  linkCustomer(sheet: Sheet, partyId: string | null): void {
+    const state = this.load();
+    const trip = this.requireTrip(state, sheet.tripId);
+    const customer = this.requireCustomer(trip, sheet.sheetId);
+    const prior = accountFor(state.ledger, sheet);
+    if (prior) {
+      if (prior.partyId === partyId || partyId === null) return;
+      throw new Error('客户归属已确认，请重新打开单据');
+    }
+    const existing = partyId === null ? null : this.requireParty(state, partyId);
+    if (state.ledger.accounts.some(account => account.tripId === trip.id && account.partyId === existing?.id)) {
+      throw new Error('本趟已有该客户的单据，请核对客户归属');
+    }
+    const party = existing ?? { id: this.id(), name: customer.customer };
+    const account: Account = { ...sheet, partyId: party.id, reviewed: false };
+    const parties = existing ? state.ledger.parties : [...state.ledger.parties, party];
+    this.write({ ...state, ledger: { ...state.ledger, parties, accounts: [...state.ledger.accounts, account] } });
+  }
+
+  reviewSheet(sheet: Sheet, version: number, statusRevision: number): void {
+    const state = this.load();
+    const trip = this.requireTrip(state, sheet.tripId);
+    const customer = this.requireCustomer(trip, sheet.sheetId);
+    const account = accountFor(state.ledger, sheet);
+    if (!account) throw new Error('请先确认这张单的客户归属');
+    if (latest(trip).version !== version || trip.statusRevision !== statusRevision) {
+      throw new Error('配送状态已变化，请重新核对');
+    }
+    if (customer.items.some(item => trip.statuses[item.id] === 'unrecorded')) throw new Error('请先标记所有未记录的明细');
+    if (account.reviewed) return;
+    const accounts = state.ledger.accounts.map(entry => entry === account ? { ...entry, reviewed: true } : entry);
+    this.write({ ...state, ledger: { ...state.ledger, accounts } });
+  }
+
+  previewOpening(sheet: Sheet, day: string, input: string, source: string): OpeningPreview {
+    const state = this.load();
+    const partyId = accountFor(state.ledger, sheet)?.partyId ?? '';
+    const entry = { sheet, id: this.id(), partyId, day, cents: parseAmount(input, '旧欠款金额'), source: source.trim() };
+    checkOpening(state, entry, localDay(new Date(this.now())));
+    return entry;
+  }
+
+  confirmOpening(preview: OpeningPreview): void {
+    const state = this.load();
+    const { sheet, ...entry } = preview;
+    const existing = state.ledger.opening.find(debt => debt.id === entry.id);
+    if (existing) {
+      if (existing.partyId !== entry.partyId || existing.day !== entry.day || existing.cents !== entry.cents || existing.source !== entry.source) {
+        throw new Error('这笔旧欠款已保存，请重新预览');
+      }
+      return;
+    }
+    checkOpening(state, preview, localDay(new Date(this.now())));
+    this.write({ ...state, ledger: { ...state.ledger, opening: [...state.ledger.opening, entry] } });
+  }
+
+  previewReceipt(sheet: Sheet, input: string): ReceiptPreview {
+    return planReceipt(this.load(), sheet, parseAmount(input, '收款金额'), this.id());
+  }
+
+  confirmReceipt(preview: ReceiptPreview): Receipt {
+    const state = this.load();
+    const { id, sheet, cents, partyId } = preview;
+    const allocations = preview.allocations.map(({ debtId, cents }) => ({ debtId, cents }));
+    const existing = state.ledger.receipts.find(receipt => receipt.id === id);
+    if (existing) {
+      if (existing.partyId !== partyId || existing.cents !== cents || JSON.stringify(existing.allocations) !== JSON.stringify(allocations)) {
+        throw new Error('这笔收款已保存，请重新预览');
+      }
+      return existing;
+    }
+    let current: ReceiptPreview;
+    try { current = planReceipt(state, sheet, cents, id); }
+    catch { throw new Error('客户账目已变化，请重新预览收款'); }
+    if (current.partyId !== partyId || current.basis !== preview.basis || JSON.stringify(current.allocations) !== JSON.stringify(preview.allocations)) {
+      throw new Error('客户账目已变化，请重新预览收款');
+    }
+    const receipt = { id, partyId, cents, allocations, savedAt: this.now() };
+    this.write({ ...state, ledger: { ...state.ledger, receipts: [...state.ledger.receipts, receipt] } });
+    return receipt;
+  }
+
   setDelivery(tripId: string, version: number, customerId: string, lineId: string | null, status: 'pending' | 'delivered'): void {
     const state = this.load();
-    const trip = this.requireCurrent(state, tripId);
-    if (latest(trip).version !== version) throw new Error('正式单已变化，请重新打开单据');
-    const customer = this.requireCustomer(trip, customerId);
-    const lines = lineId === null ? customer.items : customer.items.filter(item => item.id === lineId);
+    const result = this.evaluateDelivery(state, { tripId, version, sheetId: customerId, lineId, status });
+    if (result.preview.reviewed) throw new Error('请先核对配送和账目变化');
+    if (result.changed) this.saveTrip(state, result.trip);
+  }
+
+  previewDelivery(change: DeliveryChange): DeliveryPreview {
+    return this.evaluateDelivery(this.load(), change).preview;
+  }
+
+  confirmDelivery(preview: DeliveryPreview): void {
+    const state = this.load();
+    const result = this.evaluateDelivery(state, preview.change);
+    if (!result.changed) return;
+    if (result.preview.basis !== preview.basis) throw new Error('配送状态或账目已变化，请重新预览');
+    this.saveTrip(state, result.trip);
+  }
+
+  private evaluateDelivery(state: TripState, change: DeliveryChange) {
+    const trip = this.requireTrip(state, change.tripId);
+    if (latest(trip).version !== change.version) throw new Error('正式单已变化，请重新打开单据');
+    const customer = this.requireCustomer(trip, change.sheetId);
+    const lines = change.lineId === null ? customer.items : customer.items.filter(item => item.id === change.lineId);
     if (!lines.length) throw new Error('货品明细已变化，请重新打开单据');
-    if (lines.every(item => trip.statuses[item.id] === status)) return;
-    const statuses = { ...trip.statuses, ...Object.fromEntries(lines.map(item => [item.id, status])) };
-    this.saveTrip(state, { ...trip, statuses, statusRevision: trip.statusRevision + 1 });
+    const changed = lines.some(item => trip.statuses[item.id] !== change.status);
+    const statuses = { ...trip.statuses, ...Object.fromEntries(lines.map(item => [item.id, change.status])) };
+    const before = sheetBalance(state.ledger, trip, customer);
+    const after = sheetBalance(state.ledger, trip, customer, statuses);
+    const reviewed = accountFor(state.ledger, change)?.reviewed ?? false;
+    const basis = JSON.stringify([change.tripId, change.sheetId, change.version, change.lineId, change.status,
+      trip.statusRevision, this.accountBasis(state, trip, customer)]);
+    return { changed, trip: { ...trip, statuses, statusRevision: trip.statusRevision + 1 },
+      preview: { change, basis, reviewed, before, after } };
   }
 
   startAmendment(tripId: string, customerId: string): Amendment {
-    const trip = this.requireCurrent(this.load(), tripId);
+    const state = this.load();
+    const trip = this.requireTrip(state, tripId);
     const customer = this.requireCustomer(trip, customerId);
     return { id: this.id(), tripId, version: latest(trip).version, statusRevision: trip.statusRevision,
-      customer: { id: customer.id, customer: customer.customer, items: customer.items } };
+      accountBasis: this.accountBasis(state, trip, customer),
+      customer: { id: customer.id, customer: customer.customer, items: customer.items.map(item => ({ ...item })) } };
   }
 
   previewAmendment(amendment: Amendment) {
-    return this.evaluateAmendment(this.requireCurrent(this.load(), amendment.tripId), amendment);
+    const state = this.load();
+    return this.evaluateAmendment(state, this.requireTrip(state, amendment.tripId), amendment);
   }
 
   confirmAmendment(amendment: Amendment): TripVersion {
     const state = this.load();
     const existing = state.trips.find(trip => trip.id === amendment.tripId)?.versions.find(version => version.amendmentId === amendment.id);
     if (existing) return existing;
-    const trip = this.requireCurrent(state, amendment.tripId);
-    const { customers, changes, totalCents } = this.evaluateAmendment(trip, amendment);
+    const trip = this.requireTrip(state, amendment.tripId);
+    const { customers, statuses, totalCents } = this.evaluateAmendment(state, trip, amendment);
     const version = { version: amendment.version + 1, customers, totalCents, savedAt: this.now(), amendmentId: amendment.id };
-    const updated = new Map(changes.map(change => [change.id, change.afterStatus]));
-    const statuses = Object.fromEntries(customers.flatMap(customer => customer.items.map(({ id }) => [id, updated.get(id) ?? trip.statuses[id]])));
     this.saveTrip(state, { ...trip, versions: [...trip.versions, version], statuses });
     return version;
   }
 
-  private evaluateAmendment(trip: Trip, amendment: Amendment) {
+  private evaluateAmendment(state: TripState, trip: Trip, amendment: Amendment) {
     const previous = latest(trip);
     if (previous.version !== amendment.version || trip.statusRevision !== amendment.statusRevision) {
       throw new Error('正式单或配送状态已变化，请核对最新数据后重新预览');
     }
     const original = this.requireCustomer(trip, amendment.customer.id);
+    if (this.accountBasis(state, trip, original) !== amendment.accountBasis) throw new Error('客户账目已变化，请重新预览');
     const corrected = customerOrder({ ...amendment.customer, customer: original.customer });
     const customers = previous.customers.map(customer => customer.id === corrected.id ? corrected : customer);
     if (!isCustomers(customers)) throw new Error('更正后的明细标识重复或不完整');
@@ -279,19 +424,30 @@ export class TripService {
       const newLine = after.get(id);
       const beforeStatus = oldLine ? trip.statuses[id] : undefined;
       const sameProduct = oldLine && newLine && pickingKey(oldLine) === pickingKey(newLine);
-      if (beforeStatus === 'delivered' && !sameProduct) throw new Error('已送达明细暂不支持换货或移除');
       if (sameProduct && oldLine.quantity === newLine.quantity && oldLine.price === newLine.price) continue;
-      const afterStatus = newLine ? (sameProduct ? beforeStatus : 'pending') : undefined;
+      let afterStatus: DeliveryStatus | undefined;
+      if (newLine) {
+        afterStatus = sameProduct ? beforeStatus : 'pending';
+        if (!sameProduct && beforeStatus === 'delivered') {
+          const selected = amendment.replacementStatuses?.[id];
+          if (selected !== 'delivered' && selected !== 'pending') throw new Error('请确认替换货品的配送状态');
+          afterStatus = selected;
+        }
+      }
       changes.push({ id, before: oldLine, after: newLine, beforeStatus, afterStatus });
     }
     if (!changes.length) throw new Error('请先修改明细');
-    return { customers, customer: corrected, original, changes, totalCents: sumOrders(customers),
+    const updated = new Map(changes.map(change => [change.id, change.afterStatus]));
+    const statuses = Object.fromEntries(customers.flatMap(customer => customer.items.map(({ id }) => [id, updated.get(id) ?? trip.statuses[id]])));
+    return { customers, customer: corrected, original, changes, statuses, totalCents: sumOrders(customers),
+      before: sheetBalance(state.ledger, trip, original), after: sheetBalance(state.ledger, trip, corrected, statuses),
+      unchecked: corrected.items.filter(item => statuses[item.id] !== 'delivered'),
       picking: pickingChanges(previous.customers, customers) };
   }
 
-  private requireCurrent(state: TripState, id: string): Trip {
-    const trip = currentTrip(state);
-    if (!trip || trip.id !== id) throw new Error('此单已不在当前配送趟，请打开当前单据');
+  private requireTrip(state: TripState, id: string): Trip {
+    const trip = state.trips.find(entry => entry.id === id);
+    if (!trip) throw new Error('未找到该配送趟，请重新打开');
     return trip;
   }
 
@@ -301,7 +457,37 @@ export class TripService {
     return customer;
   }
 
+  private requireParty(state: TripState, id: string): Party {
+    const party = state.ledger.parties.find(entry => entry.id === id);
+    if (!party) throw new Error('未找到所选客户，请重新选择');
+    return party;
+  }
+
+  private customerChoices(state: TripState): (Party | null)[] {
+    const selected = new Set<string>();
+    return state.draft.customers.map((customer, index) => {
+      if (customer.partyId === undefined) throw new Error(`请为第 ${index + 1} 位客户选择已有客户或新建`);
+      if (customer.partyId === null) return null;
+      const party = this.requireParty(state, customer.partyId);
+      if (selected.has(party.id)) throw new Error('本趟已选择该客户，请回到该客户单添加货品');
+      if (party.name !== customer.customer.trim()) throw new Error('客户名称已变化，请重新选择客户');
+      selected.add(party.id);
+      return party;
+    });
+  }
+
+  private accountBasis(state: TripState, trip: Trip, customer: CustomerOrder): string {
+    const account = accountFor(state.ledger, { tripId: trip.id, sheetId: customer.id });
+    return JSON.stringify([account?.partyId, account?.reviewed, sheetBalance(state.ledger, trip, customer).paid]);
+  }
+
+  private write(state: TripState): void {
+    const totals = settlementTotals(state);
+    for (const trip of state.trips) tripBalance(state, trip, totals);
+    this.storage.write(state);
+  }
+
   private saveTrip(state: TripState, trip: Trip): void {
-    this.storage.write({ ...state, trips: state.trips.map(existing => existing.id === trip.id ? trip : existing) });
+    this.write({ ...state, trips: state.trips.map(existing => existing.id === trip.id ? trip : existing) });
   }
 }

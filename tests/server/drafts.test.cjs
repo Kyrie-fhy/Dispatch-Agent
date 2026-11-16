@@ -369,9 +369,18 @@ async function formalExample(api, token) {
 
 function sheetEndpoint(api, token, tripId, sheetId) {
   const path = `/v1/trips/${tripId}/sheets/${encodeURIComponent(sheetId)}`;
-  return (action, body) => action
-    ? api.request(`${path}/${action}`, { token, method: 'POST', body })
-    : api.request(path, { token });
+  return (action, body) => api.request(action ? `${path}/${action}` : path, {
+    token, method: body === undefined ? 'GET' : 'POST', body,
+  });
+}
+
+async function deliverAndReview(sheet, requestPrefix, statusRevision = 0) {
+  const basis = { version: 1, statusRevision };
+  const marked = await sheet('delivery', { ...basis, requestId: `${requestPrefix}-delivery`, lineId: null, status: 'delivered' });
+  assert.equal(marked.status, 200, JSON.stringify(marked.data));
+  const checked = await sheet('review', { ...basis, requestId: `${requestPrefix}-review`, statusRevision: marked.data.sheet.statusRevision });
+  assert.equal(checked.status, 200, JSON.stringify(checked.data));
+  return checked.data.sheet;
 }
 
 test('delivery and review exclude the three undelivered bags without changing the formal order', { timeout: 20_000 }, async t => {
@@ -482,4 +491,114 @@ test('reviewed delivery changes require a fresh and scoped preview and commit on
   assert.equal(confirmed.data.sheet.statusRevision, 3);
   assert.equal(confirmed.data.sheet.amounts.due, 24000);
   assert.deepEqual(await sheetB('delivery/confirm', confirmBody), confirmed);
+});
+
+test('opening debt and receipt allocations persist atomically and follow the verified amounts', { timeout: 20_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  let api = await start(db);
+  const a = await login(api, 'a');
+  const b = await login(api, 'b');
+  const { trip: { id } } = await formalExample(api, a);
+  const sheet = sheetEndpoint(api, a, id, 'sheet-a');
+  const foreign = sheetEndpoint(api, b, id, 'sheet-a');
+  const otherSheet = sheetEndpoint(api, a, id, 'sheet-b');
+  assert.equal((await foreign('ledger')).status, 404);
+  assert.equal((await sheet('receipt/preview', { requestId: 'not-reviewed', amount: '100' })).data.error, 'sheet_not_reviewed');
+  const checked = await deliverAndReview(sheet, 'order-a');
+
+  const opening = { requestId: 'preview-opening', amount: '60', day: '2026-10-31', source: '前次送货' };
+  assert.equal((await sheet('opening/preview', { ...opening, day: '2026-02-30' })).status, 409);
+  const openingPreview = await sheet('opening/preview', opening);
+  assert.equal(openingPreview.status, 200);
+  assert.equal((await sheet('ledger')).data.ledger.remainingCents, 16400);
+  const openingConfirm = { previewId: openingPreview.data.preview.id, requestId: 'confirm-opening' };
+  const old = await sheet('opening/confirm', openingConfirm);
+  assert.equal(old.status, 200);
+  assert.deepEqual(await sheet('opening/confirm', openingConfirm), old);
+  assert.equal((await sheet('opening/preview', { ...opening, requestId: 'same-opening-different-preview' })).data.error, 'opening_rejected');
+  const debtId = 'opening:' + old.data.opening.id;
+  const orderId = 'order:' + JSON.stringify([id, 'sheet-a']);
+
+  const delivery = await sheet('delivery/preview', { requestId: 'undo-before-payment', version: 1,
+    statusRevision: checked.statusRevision, lineId: 'line-a', status: 'pending' });
+  assert.equal(delivery.status, 200);
+  assert.equal((await sheet('receipt/preview', { requestId: 'invalid-price', amount: '12.001' })).status, 400);
+  assert.equal((await sheet('receipt/preview', { requestId: 'too-much', amount: '225' })).data.error, 'receipt_rejected');
+  const pay = await sheet('receipt/preview', { requestId: 'preview-100', amount: '100' });
+  assert.equal(pay.status, 200);
+  assert.deepEqual(pay.data.preview.allocations.map(({ debtId, cents, remaining }) => [debtId, cents, remaining]),
+    [[debtId, 6000, 0], [orderId, 4000, 12400]]);
+  assert.deepEqual((await sheet('ledger')).data.ledger.receipts, []);
+  const concurrentPreview = await sheet('receipt/preview', { requestId: 'other-preview', amount: '100' });
+  assert.equal(concurrentPreview.status, 200);
+  const confirmation = { requestId: 'pay-100', previewId: pay.data.preview.id };
+  assert.equal((await foreign('receipt/confirm', confirmation)).status, 404);
+  assert.equal((await otherSheet('receipt/confirm', confirmation)).status, 404);
+
+  await db.admin.query('ALTER TABLE dispatch.receipt_allocations ADD CONSTRAINT test_split_failed CHECK (cents <> 4000)');
+  assert.equal((await sheet('receipt/confirm', confirmation)).status, 500);
+  assert.equal((await db.admin.query('SELECT count(*)::int AS count FROM dispatch.receipts')).rows[0].count, 0);
+  assert.equal((await db.admin.query('SELECT count(*)::int AS count FROM dispatch.receipt_allocations')).rows[0].count, 0);
+  assert.equal((await sheet()).data.sheet.amounts.paid, 0);
+  await db.admin.query('ALTER TABLE dispatch.receipt_allocations DROP CONSTRAINT test_split_failed');
+  const paid = await sheet('receipt/confirm', confirmation);
+  assert.equal(paid.status, 200, JSON.stringify(paid.data));
+  assert.deepEqual(await sheet('receipt/confirm', confirmation), paid);
+  assert.deepEqual(await sheet('receipt/confirm', { ...confirmation, requestId: 'same-preview-fresh-request' }), paid);
+  const stale = await sheet('receipt/confirm', { requestId: 'stale-payment', previewId: concurrentPreview.data.preview.id });
+  assert.equal(stale.status, 409);
+  assert.equal(stale.data.error, 'ledger_changed');
+  const staleDelivery = await sheet('delivery/confirm', { requestId: 'stale-delivery', previewId: delivery.data.preview.previewId });
+  assert.equal(staleDelivery.status, 409);
+  assert.equal(staleDelivery.data.error, 'delivery_changed');
+
+  const partial = await sheet();
+  assert.deepEqual(partial.data.sheet.amounts, { due: 16400, paid: 4000, remaining: 12400, excess: 0 });
+  const rest = await sheet('receipt/preview', { requestId: 'preview-rest', amount: '124' });
+  assert.equal(rest.status, 200);
+  const last = await sheet('receipt/confirm', { requestId: 'pay-rest', previewId: rest.data.preview.id });
+  assert.equal(last.status, 200);
+  assert.deepEqual(last.data.receipt.allocations, [{ debtId: orderId, cents: 12400 }]);
+
+  await api.stop();
+  api = await start(db);
+  const resumed = sheetEndpoint(api, await login(api, 'a'), id, 'sheet-a');
+  const ledger = (await resumed('ledger')).data.ledger;
+  assert.equal(ledger.remainingCents, 0);
+  assert.equal(ledger.otherRemainingCents, 0);
+  assert.deepEqual(ledger.receipts, [paid.data.receipt, last.data.receipt]);
+  assert.deepEqual((await resumed()).data.sheet.amounts, { due: 16400, paid: 16400, remaining: 0, excess: 0 });
+});
+
+test('a receipt opened from a newer sheet pays earlier reviewed sheets of that party first', { timeout: 20_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const api = await start(db);
+  const a = await login(api, 'a');
+  const formal = await formalExample(api, a);
+  const id = formal.trip.id;
+  const older = sheetEndpoint(api, a, id, 'sheet-a');
+  const oldest = await deliverAndReview(older, 'older');
+  const newDraft = await tripCommand(api, a, 'next-draft', { requestId: 'next', draftId: id });
+  assert.equal(newDraft.status, 200);
+  const [customer] = exampleCustomers();
+  const draft = await putCustomers(api, a, newDraft.data.draft, 'save-next', [{ ...customer, partyId: oldest.partyId }]);
+  const review = await preview(api, a, draft, 'preview-next');
+  assert.equal(review.status, 200);
+  assert.equal((await confirm(api, a, review.data.preview.previewId, 'confirm-next')).status, 200);
+  const newer = sheetEndpoint(api, a, draft.id, 'sheet-a');
+  await deliverAndReview(newer, 'newer');
+
+  const ledger = (await newer('ledger')).data.ledger;
+  assert.equal(ledger.otherRemainingCents, 16400);
+  const payment = await newer('receipt/preview', { requestId: 'preview-both', amount: '200' });
+  assert.equal(payment.status, 200);
+  assert.deepEqual(payment.data.preview.allocations.map(({ debtId, cents }) => [JSON.parse(debtId.slice(6)), cents]),
+    [[[id, 'sheet-a'], 16400], [[draft.id, 'sheet-a'], 3600]]);
+  const confirmations = await Promise.all(['first', 'duplicate'].map(requestId =>
+    newer('receipt/confirm', { requestId, previewId: payment.data.preview.id })));
+  assert.equal(confirmations[0].status, 200);
+  assert.deepEqual(confirmations[0], confirmations[1]);
+  assert.equal((await older()).data.sheet.amounts.remaining, 0);
+  assert.equal((await newer()).data.sheet.amounts.remaining, 12800);
+  assert.equal((await newer('ledger')).data.ledger.otherRemainingCents, 0);
 });

@@ -1,4 +1,5 @@
 import { isObject } from '../miniprogram/core/orders';
+import { parseAmount } from '../miniprogram/core/settlement';
 import { HttpError } from './http-error';
 
 export const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -62,4 +63,30 @@ export function readDeliveryInput(value: unknown) {
     throw new HttpError(400, 'invalid_delivery', '请选择要更新的货品和配送状态');
   }
   return { ...basis, lineId, status } as const;
+}
+
+function readLedgerAmount(value: unknown, label: string) {
+  const body = readCommand(value);
+  if (typeof body.amount !== 'string' || body.amount.length > 40) {
+    throw new HttpError(400, 'invalid_amount', `请输入有效的${label}`);
+  }
+  try {
+    return { requestId: body.requestId, cents: parseAmount(body.amount, label) };
+  } catch (error) {
+    throw new HttpError(400, 'invalid_amount', (error as Error).message);
+  }
+}
+
+export function readReceiptInput(value: unknown) {
+  return readLedgerAmount(value, '收款金额');
+}
+
+export function readOpeningInput(value: unknown) {
+  const amount = readLedgerAmount(value, '旧欠款金额');
+  const { day, source = '' } = value as Record<string, unknown>;
+  if (typeof day !== 'string' || !/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(day) || day.startsWith('0000')
+    || typeof source !== 'string' || source.length > 200 || source.includes('\0') || Buffer.from(source).toString() !== source) {
+    throw new HttpError(400, 'invalid_opening', '请输入有效的欠款日期和来源');
+  }
+  return { ...amount, day, source: source.trim() };
 }

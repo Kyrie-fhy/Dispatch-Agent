@@ -67,7 +67,7 @@ export function orderDebtId({ tripId, sheetId }: Sheet): string {
   return 'order:' + JSON.stringify([tripId, sheetId]);
 }
 
-function openingDebtId(id: string): string { return 'opening:' + id; }
+export function openingDebtId(id: string): string { return 'opening:' + id; }
 
 export function accountFor(ledger: Ledger, { tripId, sheetId }: Sheet): Account | undefined {
   return ledger.accounts.find(account => account.tripId === tripId && account.sheetId === sheetId);
@@ -104,7 +104,7 @@ function compareText(left: string, right: string): number {
   return left === right ? 0 : left < right ? -1 : 1;
 }
 
-export function customerDebts(state: TripState, partyId: string) {
+export function customerDebts(state: Pick<TripState, 'ledger' | 'trips'>, partyId: string, dayFor = localDay) {
   const paid = allocatedAmounts(state.ledger);
   const trips = new Map(state.trips.map(trip => [trip.id, trip]));
   const debts: Debt[] = state.ledger.opening.filter(entry => entry.partyId === partyId)
@@ -116,7 +116,7 @@ export function customerDebts(state: TripState, partyId: string) {
     const version = trip.versions[trip.versions.length - 1];
     const order = version.customers.find(entry => entry.id === account.sheetId)!;
     const time = Date.parse(trip.versions[0].savedAt);
-    const day = localDay(new Date(time));
+    const day = dayFor(new Date(time));
     debts.push({ id: orderDebtId(account), day, time, cents: deliveredAmount(order, trip.statuses),
       label: `${day} ${order.customer} · ${order.id}`, sheet: { tripId: account.tripId, sheetId: account.sheetId },
       revision: `${version.version}:${trip.statusRevision}` });
@@ -172,11 +172,11 @@ export function requireAccount(ledger: Ledger, sheet: Sheet): Account {
   return account;
 }
 
-export function planReceipt(state: TripState, sheet: Sheet, cents: number, id: string): ReceiptPreview {
+export function planReceipt(state: Pick<TripState, 'ledger' | 'trips'>, sheet: Sheet, cents: number, id: string, dayFor = localDay): ReceiptPreview {
   const account = requireAccount(state.ledger, sheet);
   if (!account.reviewed) throw new Error('请先确认对账');
   if (!positiveCents(cents)) throw new Error('收款金额须大于零且在可计算范围内');
-  const debts = customerDebts(state, account.partyId);
+  const debts = customerDebts(state, account.partyId, dayFor);
   const available = sumCents(debts.map(debt => debt.remaining));
   if (cents > available) throw new Error(`当前最多可抵扣 ¥${money(available)}，请核对收款金额`);
   let left = cents;
@@ -192,7 +192,7 @@ export function planReceipt(state: TripState, sheet: Sheet, cents: number, id: s
   return { id, sheet, partyId: account.partyId, cents, basis, allocations };
 }
 
-export function checkOpening(state: TripState, entry: OpeningPreview, today: string): void {
+export function checkOpening(state: Pick<TripState, 'ledger'>, entry: OpeningPreview, today: string): void {
   const account = requireAccount(state.ledger, entry.sheet);
   if (account.partyId !== entry.partyId) throw new Error('客户归属已变化，请重新预览');
   if (!validDay(entry.day) || entry.day > today) throw new Error('请选择有效的欠款发生日期，日期不能晚于今天');

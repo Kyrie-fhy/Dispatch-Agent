@@ -8,8 +8,8 @@ import { readConfirmInput, readDeliveryInput, readReviewInput, validRevision } f
 
 type ReviewBasis = Omit<ReturnType<typeof readReviewInput>, 'requestId'>;
 type DeliveryChange = Omit<ReturnType<typeof readDeliveryInput>, 'requestId'>;
-type SheetRow = Account & ReviewBasis & { statuses: Trip['statuses']; customers: CustomerOrder[] };
-type SheetState = Omit<SheetRow, 'customers'> & { customer: CustomerOrder };
+type SheetRow = Account & ReviewBasis & { statuses: Trip['statuses']; customers: CustomerOrder[]; paid: string };
+type SheetState = Omit<SheetRow, 'customers' | 'paid'> & { customer: CustomerOrder; paid: number };
 
 interface DeliveryPreview {
   previewId: string;
@@ -19,8 +19,7 @@ interface DeliveryPreview {
 }
 
 function amounts(state: SheetState, statuses = state.statuses) {
-  // S5 receipt allocations are not persisted yet.
-  return deliveredBalance(state.customer, statuses, 0);
+  return deliveredBalance(state.customer, statuses, state.paid);
 }
 
 function sheetDetails(state: SheetState) {
@@ -91,6 +90,9 @@ export class DeliveryStore {
       `, [accountId, previewId, tripId, sheetId]);
       if (!stored) throw new HttpError(404, 'preview_not_found', '未找到本客户的配送预览，请重新生成');
       const state = await this.readSheet(client, accountId, tripId, sheetId);
+      if (state.paid !== stored.preview.before.paid) {
+        throw new HttpError(409, 'delivery_changed', '本单实收已变化，请重新预览配送与账目变化');
+      }
       return this.applyDelivery(client, accountId, state, planDelivery(state, stored.preview.change));
     });
   }
@@ -114,7 +116,9 @@ export class DeliveryStore {
   private async readSheet(client: PoolClient, accountId: string, tripId: string, sheetId: string): Promise<SheetState> {
     const { rows: [row] } = await client.query<SheetRow>(`
       SELECT s.trip_id AS "tripId", s.id AS "sheetId", s.party_id AS "partyId", s.reviewed,
-             t.statuses, t.status_revision AS "statusRevision", v.version, v.customers
+             t.statuses, t.status_revision AS "statusRevision", v.version, v.customers,
+             COALESCE((SELECT sum(cents) FROM dispatch.receipt_allocations
+               WHERE account_id = s.account_id AND trip_id = s.trip_id AND sheet_id = s.id), 0)::text AS paid
       FROM dispatch.sheets s
       JOIN dispatch.trips t ON t.account_id = s.account_id AND t.id = s.trip_id
       JOIN LATERAL (
@@ -124,10 +128,10 @@ export class DeliveryStore {
       WHERE s.account_id = $1 AND s.trip_id = $2 AND s.id = $3
     `, [accountId, tripId, sheetId]);
     if (!row) throw new HttpError(404, 'sheet_not_found', '未找到客户单');
-    const { customers, ...state } = row;
+    const { customers, paid, ...state } = row;
     const customer = customers.find(entry => entry.id === sheetId);
     if (!customer) throw new Error('正式版本缺少客户明细');
-    return { ...state, customer };
+    return { ...state, customer, paid: Number(paid) };
   }
 
   private async applyDelivery(client: PoolClient, accountId: string, state: SheetState, plan: ReturnType<typeof planDelivery>) {

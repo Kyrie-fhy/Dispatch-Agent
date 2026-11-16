@@ -1,0 +1,11 @@
+dispatch-api.example.com {
+	handle /v1/* {
+		reverse_proxy 127.0.0.1:8787 {
+			header_up Host {upstream_hostport}
+		}
+	}
+
+	handle {
+		respond 404
+	}
+}

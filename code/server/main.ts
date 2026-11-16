@@ -1,6 +1,6 @@
 import { createServer, IncomingMessage, Server, ServerResponse } from 'node:http';
 import { Pool } from 'pg';
-import { localDatabaseUrl, requireApplicationRole } from './database';
+import { databaseOptions, requireApplicationRole, trialMode } from './database';
 import { readAmendmentInput, readSaveDraft } from './draft-input';
 import { AmendmentStore } from './amendments';
 import { DraftStore } from './drafts';
@@ -52,7 +52,7 @@ function resourceId(path: string, collection: 'drafts' | 'trips'): string | null
   return uuidPattern.test(id) ? id : null;
 }
 
-async function handle(store: DraftStore, trips: TripStore, delivery: DeliveryStore, ledger: LedgerStore, amendments: AmendmentStore,
+async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery: DeliveryStore, ledger: LedgerStore, amendments: AmendmentStore,
   request: IncomingMessage, response: ServerResponse, wechat?: WechatLogin): Promise<void> {
   const host = request.headers.host ?? '';
   if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host)) {
@@ -60,6 +60,13 @@ async function handle(store: DraftStore, trips: TripStore, delivery: DeliverySto
   }
   const method = request.method;
   const path = request.url?.split('?')[0] ?? '';
+
+  if (method === 'GET' && path === '/healthz') {
+    try { await pool.query('SELECT 1 FROM dispatch.workspaces LIMIT 0'); }
+    catch { throw new HttpError(503, 'database_unavailable', '数据库暂不可用'); }
+    sendJson(response, 200, { status: 'ready' });
+    return;
+  }
   const draftId = resourceId(path, 'drafts');
   const tripId = resourceId(path, 'trips');
 
@@ -178,7 +185,7 @@ export async function startLocalServer(pool: Pool, port: number, wechat?: Wechat
   const ledger = new LedgerStore(pool);
   const amendments = new AmendmentStore(pool);
   const server = createServer({ requestTimeout: 15_000 }, (request, response) => {
-    void handle(store, trips, delivery, ledger, amendments, request, response, wechat).catch(error => {
+    void handle(pool, store, trips, delivery, ledger, amendments, request, response, wechat).catch(error => {
       if (response.destroyed) return;
       if (error instanceof HttpError) {
         sendJson(response, error.status, { error: error.code, message: error.message });
@@ -201,8 +208,10 @@ export async function startLocalServer(pool: Pool, port: number, wechat?: Wechat
 async function main(): Promise<void> {
   const port = Number(process.env.DISPATCH_API_PORT ?? 8787);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('本地 API 端口不正确');
+  const trial = trialMode();
   const wechat = configuredWechatLogin(process.env);
-  const pool = new Pool({ connectionString: localDatabaseUrl('DISPATCH_DB_URL'), connectionTimeoutMillis: 5000 });
+  if (trial && !wechat) throw new Error('试用环境必须配置微信登录');
+  const pool = new Pool(databaseOptions('DISPATCH_DB_URL'));
   pool.on('error', () => console.error('PostgreSQL 空闲连接已断开，后续请求会重新连接'));
   try {
     const server = await startLocalServer(pool, port, wechat);
@@ -212,7 +221,7 @@ async function main(): Promise<void> {
     };
     process.once('SIGINT', stop);
     process.once('SIGTERM', stop);
-    console.log(`S5 本地草稿服务已启动 http://127.0.0.1:${port}（${wechat ? '微信会话' : '开发会话'}）`);
+    console.log(`S5 ${trial ? '试用' : '本地'} API 已启动 http://127.0.0.1:${port}（${wechat ? '微信会话' : '开发会话'}）`);
   } catch (error) {
     await pool.end();
     throw error;

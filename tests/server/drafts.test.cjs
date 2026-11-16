@@ -123,6 +123,7 @@ test('PostgreSQL persists each account draft across server restart and blocks cr
   let api = await start(db);
   await assert.rejects(startLocalServer(db.admin, 0), /非管理员数据库账号/);
 
+  assert.deepEqual(await api.request('/healthz'), { status: 200, data: { status: 'ready' } });
   assert.equal((await api.request('/v1/workspace')).status, 401);
   assert.equal((await api.request('/v1/session/development', { method: 'POST', body: { account: 'c' } })).status, 400);
   const a = await login(api, 'a');

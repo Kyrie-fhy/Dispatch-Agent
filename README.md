@@ -14,6 +14,7 @@
 - [S4 操作验收](docs/S4验收.md)
 - [S5 本地服务联调](docs/S5本地联调.md)
 - [S5 微信试用与登录验收](docs/S5微信试用.md)
+- [S5 HTTPS 试用部署](docs/S5试用部署.md)
 - [开发里程碑](docs/Dispatch%20Agent%20开发里程碑.md)
 - [需求分析](docs/需求分析文档.md)
 - [项目级 Agent 约定](AGENTS.md)

@@ -1,7 +1,7 @@
 import { readFile, readdir } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { Pool } from 'pg';
-import { localDatabaseUrl, transaction } from './database';
+import { databaseOptions, transaction } from './database';
 
 export async function migrate(pool: Pool): Promise<void> {
   const directory = resolve(__dirname, '../../server/migrations');
@@ -24,7 +24,7 @@ export async function migrate(pool: Pool): Promise<void> {
 }
 
 async function main() {
-  const pool = new Pool({ connectionString: localDatabaseUrl('DISPATCH_DB_ADMIN_URL') });
+  const pool = new Pool(databaseOptions('DISPATCH_DB_ADMIN_URL'));
   try {
     await migrate(pool);
     console.log('PostgreSQL 迁移已完成');

@@ -22,7 +22,7 @@ npm ci
 npm run check
 ```
 
-使用 npm 和仓库内 package-lock.json。已核验本地 Node 18.15.0、npm 9.5.0，GitHub Actions 配置使用 Node 22，工作流位于 .github/workflows/check.yml，在推送和 PR 更新时执行同一套检查。远端启用和运行结果见开发任务记录。
+依赖版本由 `package-lock.json` 锁定。本地和 GitHub Actions 使用同一套检查。工具链和工作流配置见[技术方案](docs/技术方案.md)。
 
 ## 微信预览
 
@@ -30,9 +30,9 @@ npm run check
 npm run build
 ```
 
-用微信开发者工具导入本项目根目录，运行目录由 project.config.json 指向 code/dist。修改源码后重新执行构建。预览可以用自己的微信小程序测试号，将 AppID 填入本地 project.private.config.json，仓库配置中的 touristappid 是占位值。
+用微信开发者工具导入项目根目录，运行目录为 `code/dist`。修改源码后重新构建。用自己的微信小程序测试号预览，将 AppID 填入本地 `project.private.config.json`。仓库配置中的 `touristappid` 用于占位。
 
-S1 已通过模拟器录单和 iQOO Z11 退出恢复验收。S2 已通过模拟器主流程和导图检查，安卓真机待验收。[S1 验收记录](docs/S1验收.md) · [S2 验收记录](docs/S2验收.md)
+使用开发者工具 CLI 或自动化时，在项目窗口的 macOS 菜单栏进入「设置 → 安全设置」，开启「服务端口」。也可按 `⌘ + ,` 打开设置后切到「安全」。当前验收和分支状态见[开发任务](docs/开发任务.md)。
 
 ## 目录
 

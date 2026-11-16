@@ -1,8 +1,9 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { Pool, PoolClient } from 'pg';
+import { Pool } from 'pg';
 import { emptyTrip, TripDraft } from '../miniprogram/core/trips';
 import { setAccount, transaction } from './database';
 import { SaveDraftInput } from './draft-input';
+import { missingDraft, readAccount, readParties, readWorkspace, workspaceDraft, writeAccount } from './account-workspace';
 import { HttpError } from './http-error';
 
 const developmentAccounts = new Set(['a', 'b']);
@@ -11,13 +12,6 @@ const sessionLifetimeSeconds = 60 * 60 * 8;
 function digest(value: string): Buffer {
   return createHash('sha256').update(value).digest();
 }
-
-export function missingDraft(): HttpError {
-  return new HttpError(404, 'draft_not_found', '未找到草稿');
-}
-
-type WorkspaceRow = { id: string; revision: number; customers: TripDraft['customers'] };
-const draftColumns = 'draft_id AS id, draft_revision AS revision, draft_customers AS customers';
 
 export class DraftStore {
   constructor(private readonly pool: Pool) {}
@@ -57,49 +51,35 @@ export class DraftStore {
     await this.pool.query('DELETE FROM dispatch.sessions WHERE token_digest = $1', [digest(token)]);
   }
 
-  async workspace(accountId: string): Promise<TripDraft> {
-    return transaction(this.pool, async client => {
-      await setAccount(client, accountId);
-      return this.readWorkspace(client, accountId);
+  async draft(accountId: string, draftId: string): Promise<TripDraft> {
+    return readAccount(this.pool, accountId, async client => {
+      const workspace = await readWorkspace(client, accountId);
+      if (workspace.id !== draftId) throw missingDraft();
+      return workspaceDraft(workspace);
     });
   }
 
   async save(accountId: string, input: SaveDraftInput): Promise<TripDraft> {
     const { draft, requestId } = input;
-    const inputDigest = digest(JSON.stringify({ action: 'save-draft', draft }));
-    return transaction(this.pool, async client => {
-      await setAccount(client, accountId);
-      const current = await this.readWorkspace(client, accountId, true);
+    return writeAccount(this.pool, accountId, requestId, { action: 'save-draft', draft }, async (client, current) => {
       if (current.id !== draft.id) throw missingDraft();
-
-      const { rows: [previous] } = await client.query<{ input_digest: Buffer; result: TripDraft }>(
-        'SELECT input_digest, result FROM dispatch.request_results WHERE account_id = $1 AND request_id = $2',
-        [accountId, requestId]);
-      if (previous) {
-        if (!previous.input_digest.equals(inputDigest)) {
-          throw new HttpError(409, 'request_conflict', '同一请求编号已用于不同的保存');
-        }
-        return previous.result;
+      if (current.currentTripId === draft.id) {
+        throw new HttpError(409, 'draft_confirmed', '本趟已确认，请开始下一趟');
       }
-
       if (current.revision !== draft.revision) {
         throw new HttpError(409, 'draft_changed', '草稿已更新，请核对最新版本后再保存');
+      }
+      const existingIds = draft.customers.flatMap(customer => customer.partyId ? [customer.partyId] : []);
+      if (existingIds.length) {
+        const parties = new Set((await readParties(client, accountId)).map(party => party.id));
+        if (existingIds.some(partyId => !parties.has(partyId))) {
+          throw new HttpError(400, 'invalid_customer', '未找到所选客户，请重新选择');
+        }
       }
       const saved = { ...draft, revision: current.revision + 1 };
       await client.query(`UPDATE dispatch.workspaces SET draft_revision = $2, draft_customers = $3
         WHERE account_id = $1`, [accountId, saved.revision, JSON.stringify(saved.customers)]);
-      await client.query(`INSERT INTO dispatch.request_results (account_id, request_id, input_digest, result)
-        VALUES ($1, $2, $3, $4)`, [accountId, requestId, inputDigest, JSON.stringify(saved)]);
       return saved;
     });
-  }
-
-  private async readWorkspace(client: PoolClient, accountId: string, lock = false): Promise<TripDraft> {
-    const { rows: [draft] } = await client.query<WorkspaceRow>(`
-      SELECT ${draftColumns} FROM dispatch.workspaces
-      WHERE account_id = $1 ${lock ? 'FOR UPDATE' : ''}
-    `, [accountId]);
-    if (!draft) throw missingDraft();
-    return draft;
   }
 }

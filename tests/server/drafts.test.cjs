@@ -1,11 +1,13 @@
 const assert = require('node:assert/strict');
-const { randomBytes } = require('node:crypto');
+const { randomBytes, randomUUID } = require('node:crypto');
+const { readFile } = require('node:fs/promises');
+const { resolve } = require('node:path');
 const { test } = require('node:test');
 const { Pool } = require('pg');
 const { migrate } = require('../../code/server-dist/server/migrate');
 const { startLocalServer } = require('../../code/server-dist/server/main');
 
-async function isolatedDatabase(t) {
+async function isolatedDatabase(t, beforeMigrate) {
   const url = new URL(process.env.DISPATCH_TEST_ADMIN_URL);
   assert.ok(['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname), 'The test cluster must be local');
   const name = `dispatch_test_${randomBytes(8).toString('hex')}`;
@@ -26,6 +28,7 @@ async function isolatedDatabase(t) {
   await admin.query(`CREATE DATABASE ${name}`);
   url.pathname = `/${name}`;
   migrationPool = new Pool({ connectionString: url.href });
+  if (beforeMigrate) await beforeMigrate(migrationPool);
   await migrate(migrationPool);
   await migrate(migrationPool);
   await admin.query(`CREATE ROLE ${name} LOGIN PASSWORD '${password}'`);
@@ -171,4 +174,186 @@ test('draft saves retry once, reject stale revisions and roll back when the resu
   assert.equal(retried.status, 200);
   assert.equal(retried.data.draft.revision, 2);
   assert.equal(retried.data.draft.customers[0].customer, '恢复后的编辑');
+});
+
+function line(id, brand, unit, quantity, price) {
+  return { id, product: '水饺', brand, specification: '500g', unit, quantity, price };
+}
+
+function exampleCustomers(price = '82') {
+  return [
+    { id: 'sheet-a', customer: '客户 A', partyId: null, items: [line('line-a', '安井', '箱', '2', price)] },
+    { id: 'sheet-b', customer: '客户 B', partyId: null, items: [
+      line('line-b-box', '安井', '箱', '3', '80'), line('line-b-bag', '安井', '袋', '3', '20'),
+    ] },
+    { id: 'sheet-c', customer: '客户 C', partyId: null, items: [line('line-c', '三全', '箱', '1', '75')] },
+  ];
+}
+
+async function putCustomers(api, token, draft, requestId, customers) {
+  const result = await api.request(`/v1/drafts/${draft.id}`, {
+    method: 'PUT', token, body: { requestId, revision: draft.revision, customers },
+  });
+  assert.equal(result.status, 200, JSON.stringify(result.data));
+  return result.data.draft;
+}
+
+function tripCommand(api, token, action, body) {
+  return api.request(`/v1/trips/${action}`, { method: 'POST', token, body });
+}
+
+function preview(api, token, draft, requestId) {
+  return tripCommand(api, token, 'preview', { draftId: draft.id, revision: draft.revision, requestId });
+}
+
+function confirm(api, token, previewId, requestId) {
+  return tripCommand(api, token, 'confirm', { previewId, requestId });
+}
+
+test('upgraded drafts preview the saved revision and concurrent confirms create one formal trip', { timeout: 20_000 }, async t => {
+  const existingDraft = { id: randomUUID(), revision: 4, customers: exampleCustomers('78') };
+  const db = await isolatedDatabase(t, async admin => {
+    await admin.query(`CREATE SCHEMA dispatch;
+      CREATE TABLE dispatch.schema_migrations (name text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())`);
+    const path = resolve(__dirname, '../../code/server/migrations/001_drafts.sql');
+    await admin.query(await readFile(path, 'utf8'));
+    await admin.query("INSERT INTO dispatch.schema_migrations (name) VALUES ('001_drafts.sql')");
+    const account = randomUUID();
+    await admin.query("INSERT INTO dispatch.accounts VALUES ($1, 'development', 'a')", [account]);
+    await admin.query('INSERT INTO dispatch.workspaces (account_id, draft_id, draft_revision, draft_customers) VALUES ($1, $2, $3, $4)',
+      [account, existingDraft.id, existingDraft.revision, JSON.stringify(existingDraft.customers)]);
+  });
+
+  let api = await start(db);
+  const a = await login(api, 'a');
+  const b = await login(api, 'b');
+  const original = await read(api, a);
+  assert.deepEqual(original, existingDraft);
+  const old = await preview(api, a, original, 'old-preview');
+  assert.equal(old.status, 200);
+  assert.equal(old.data.preview.totalCents, 53100);
+  assert.deepEqual(old.data.preview.choices, [null, null, null]);
+  assert.equal((await api.request(`/v1/trips/${original.id}`, { token: a })).status, 404);
+  const unconfirmed = (await api.request('/v1/workspace', { token: a })).data;
+  assert.equal(unconfirmed.currentTrip, null);
+  assert.equal(unconfirmed.draftConfirmed, false);
+  assert.deepEqual(unconfirmed.parties, []);
+  assert.equal((await db.admin.query('SELECT 1 FROM dispatch.sheets')).rowCount, 0);
+
+  const updated = await putCustomers(api, a, original, 'update-price', exampleCustomers());
+  const stale = await confirm(api, a, old.data.preview.previewId, 'stale-confirm');
+  assert.equal(stale.status, 409);
+  assert.equal(stale.data.error, 'draft_changed');
+  const next = await preview(api, a, updated, 'new-preview');
+  assert.equal(next.status, 200);
+  assert.equal(next.data.preview.totalCents, 53900);
+  const currentPreview = next.data.preview.previewId;
+  assert.equal((await preview(api, a, updated, 'same-version')).data.preview.previewId, currentPreview);
+  assert.equal((await confirm(api, b, currentPreview, 'wrong-account')).status, 404);
+
+  const results = await Promise.all([
+    confirm(api, a, currentPreview, 'confirm-trip-a'),
+    confirm(api, a, currentPreview, 'confirm-trip-a'),
+    confirm(api, a, currentPreview, 'confirm-trip-b'),
+  ]);
+  for (const result of results) {
+    assert.equal(result.status, 200, JSON.stringify(result.data));
+    assert.deepEqual(result.data, results[0].data);
+  }
+  const firstTrip = results[0].data;
+  assert.equal(firstTrip.trip.id, updated.id);
+  assert.equal(firstTrip.trip.versions.length, 1);
+  assert.equal(firstTrip.trip.versions[0].totalCents, 53900);
+  assert.deepEqual(firstTrip.trip.statuses, {
+    'line-a': 'pending', 'line-b-box': 'pending', 'line-b-bag': 'pending', 'line-c': 'pending',
+  });
+  assert.deepEqual(firstTrip.picking.map(({ brand, unit, quantity }) => [brand, unit, quantity]),
+    [['安井', '箱', 5], ['安井', '袋', 3], ['三全', '箱', 1]]);
+  assert.equal((await db.admin.query('SELECT 1 FROM dispatch.trips')).rowCount, 1);
+  assert.equal((await db.admin.query('SELECT 1 FROM dispatch.trip_versions')).rowCount, 1);
+  assert.equal((await db.admin.query('SELECT 1 FROM dispatch.parties')).rowCount, 3);
+  assert.equal((await api.request(`/v1/trips/${original.id}`, { token: b })).status, 404);
+  assert.equal((await confirm(api, a, old.data.preview.previewId, 'old-after-confirm')).status, 409);
+  const locked = await save(api, a, updated, 'write-confirmed', '误改草稿');
+  assert.equal(locked.status, 409);
+  assert.equal(locked.data.error, 'draft_confirmed');
+
+  await api.stop();
+  api = await start(db);
+  assert.deepEqual((await api.request(`/v1/trips/${updated.id}`, { token: a })).data, firstTrip);
+  const workspace = (await api.request('/v1/workspace', { token: a })).data;
+  assert.equal(workspace.draftConfirmed, true);
+  assert.deepEqual(workspace.currentTrip, { id: updated.id, version: 1, totalCents: 53900 });
+
+  const body = { draftId: updated.id, requestId: 'next-trip' };
+  const fresh = await tripCommand(api, a, 'next-draft', body);
+  assert.equal(fresh.status, 200);
+  assert.notEqual(fresh.data.draft.id, updated.id);
+  assert.equal(fresh.data.draft.revision, 0);
+  assert.deepEqual(await tripCommand(api, a, 'next-draft', body), fresh);
+  assert.equal((await api.request('/v1/workspace', { token: a })).data.currentTrip.id, updated.id);
+  assert.deepEqual((await confirm(api, a, currentPreview, 'confirm-after-next')).data, firstTrip);
+  const priorPartyId = firstTrip.sheets.find(sheet => sheet.sheetId === 'sheet-a').partyId;
+
+  const bDraft = await read(api, b);
+  const unauthorizedCustomer = await api.request(`/v1/drafts/${bDraft.id}`, {
+    method: 'PUT', token: b, body: { revision: bDraft.revision, requestId: 'wrong-party',
+      customers: [{ ...exampleCustomers()[0], partyId: priorPartyId }] },
+  });
+  assert.equal(unauthorizedCustomer.status, 400);
+  assert.equal(unauthorizedCustomer.data.error, 'invalid_customer');
+  assert.deepEqual((await api.request('/v1/workspace', { token: b })).data.parties, []);
+
+  const [customerA] = exampleCustomers();
+  const linked = await putCustomers(api, a, fresh.data.draft, 'write-next', [
+    { ...customerA, partyId: priorPartyId },
+    { ...customerA, id: 'same-name', items: [line('same-name-line', '安井', '箱', '1', '82')] },
+  ]);
+  const linkedPreview = await preview(api, a, linked, 'preview-linked');
+  assert.equal(linkedPreview.status, 200);
+  assert.equal(linkedPreview.data.preview.choices[0].id, priorPartyId);
+  const linkedTrip = await confirm(api, a, linkedPreview.data.preview.previewId, 'confirmed-linked');
+  assert.equal(linkedTrip.status, 200);
+  assert.equal(linkedTrip.data.sheets.find(sheet => sheet.sheetId === 'sheet-a').partyId, priorPartyId);
+  assert.notEqual(linkedTrip.data.sheets.find(sheet => sheet.sheetId === 'same-name').partyId, priorPartyId);
+  assert.equal((await db.admin.query("SELECT 1 FROM dispatch.parties WHERE name = '客户 A'")).rowCount, 2);
+});
+
+test('a failed formal commit leaves the draft editable and no official snapshot, customer or sheet', { timeout: 20_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const api = await start(db);
+  const a = await login(api, 'a');
+  const original = await read(api, a);
+  assert.equal((await preview(api, a, original, 'empty-draft')).status, 400);
+
+  const customers = exampleCustomers();
+  const [first, ...remaining] = customers;
+  const noChoice = await putCustomers(api, a, original, 'no-choice', [
+    { id: first.id, customer: first.customer, items: first.items }, ...remaining,
+  ]);
+  const rejected = await preview(api, a, noChoice, 'requires-identity');
+  assert.equal(rejected.status, 400);
+  assert.match(rejected.data.message, /选择已有客户或新建/);
+  const saved = await putCustomers(api, a, noChoice, 'save-trip', customers);
+  const review = await preview(api, a, saved, 'preview-valid');
+  assert.equal(review.status, 200);
+  const previewId = review.data.preview.previewId;
+  await db.admin.query("ALTER TABLE dispatch.request_results ADD CONSTRAINT test_confirm_failure CHECK (request_id <> 'retry-formal')");
+  const failed = await confirm(api, a, previewId, 'retry-formal');
+  assert.equal(failed.status, 500);
+  assert.equal((await api.request(`/v1/trips/${saved.id}`, { token: a })).status, 404);
+  const workspace = (await api.request('/v1/workspace', { token: a })).data;
+  assert.equal(workspace.draftConfirmed, false);
+  assert.equal(workspace.currentTrip, null);
+  assert.deepEqual(workspace.draft, saved);
+  assert.deepEqual(workspace.parties, []);
+  for (const table of ['trips', 'trip_versions', 'parties', 'sheets']) {
+    assert.equal((await db.admin.query(`SELECT 1 FROM dispatch.${table}`)).rowCount, 0);
+  }
+
+  await db.admin.query('ALTER TABLE dispatch.request_results DROP CONSTRAINT test_confirm_failure');
+  const retried = await confirm(api, a, previewId, 'retry-formal');
+  assert.equal(retried.status, 200, JSON.stringify(retried.data));
+  assert.equal(retried.data.trip.versions[0].totalCents, 53900);
+  assert.deepEqual(await confirm(api, a, previewId, 'retry-formal'), retried);
 });

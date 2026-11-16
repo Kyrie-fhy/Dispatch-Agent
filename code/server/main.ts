@@ -2,11 +2,12 @@ import { createServer, IncomingMessage, Server, ServerResponse } from 'node:http
 import { Pool } from 'pg';
 import { localDatabaseUrl, requireApplicationRole } from './database';
 import { readSaveDraft } from './draft-input';
-import { DraftStore, missingDraft } from './drafts';
+import { DraftStore } from './drafts';
+import { TripStore } from './trips';
+import { readConfirmInput, readNextInput, readPreviewInput, uuidPattern } from './request-input';
 import { HttpError } from './http-error';
 import { isObject } from '../miniprogram/core/orders';
 
-const draftPath = /^\/v1\/drafts\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
 const bodyLimit = 512 * 1024;
 
 async function readJson(request: IncomingMessage, response: ServerResponse): Promise<unknown> {
@@ -39,15 +40,22 @@ function sendJson(response: ServerResponse, status: number, payload: unknown) {
   response.end(JSON.stringify(payload));
 }
 
-async function handle(store: DraftStore, request: IncomingMessage, response: ServerResponse): Promise<void> {
+function resourceId(path: string, collection: 'drafts' | 'trips'): string | null {
+  const prefix = `/v1/${collection}/`;
+  if (!path.startsWith(prefix)) return null;
+  const id = path.slice(prefix.length);
+  return uuidPattern.test(id) ? id : null;
+}
+
+async function handle(store: DraftStore, trips: TripStore, request: IncomingMessage, response: ServerResponse): Promise<void> {
   const host = request.headers.host ?? '';
   if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host)) {
     throw new HttpError(400, 'invalid_host', '请通过本机地址访问草稿服务');
   }
   const method = request.method;
   const path = request.url?.split('?')[0] ?? '';
-  const match = draftPath.exec(path);
-  const draftId = match?.[1];
+  const draftId = resourceId(path, 'drafts');
+  const tripId = resourceId(path, 'trips');
 
   if (method === 'POST' && path === '/v1/session/development') {
     const body = await readJson(request, response);
@@ -69,16 +77,36 @@ async function handle(store: DraftStore, request: IncomingMessage, response: Ser
     return;
   }
 
-  if (method === 'GET' && (path === '/v1/workspace' || draftId)) {
-    const draft = await store.workspace(account);
-    if (draftId && draftId !== draft.id) throw missingDraft();
-    sendJson(response, 200, { draft });
+  if (method === 'GET' && path === '/v1/workspace') {
+    sendJson(response, 200, await trips.workspace(account));
     return;
   }
-
+  if (method === 'GET' && draftId) {
+    sendJson(response, 200, { draft: await store.draft(account, draftId) });
+    return;
+  }
   if (method === 'PUT' && draftId) {
     const input = readSaveDraft(draftId, await readJson(request, response));
     sendJson(response, 200, { draft: await store.save(account, input) });
+    return;
+  }
+  if (method === 'POST' && path === '/v1/trips/preview') {
+    const input = readPreviewInput(await readJson(request, response));
+    sendJson(response, 200, { preview: await trips.preview(account, input) });
+    return;
+  }
+  if (method === 'POST' && path === '/v1/trips/confirm') {
+    const input = readConfirmInput(await readJson(request, response));
+    sendJson(response, 200, await trips.confirm(account, input));
+    return;
+  }
+  if (method === 'POST' && path === '/v1/trips/next-draft') {
+    const input = readNextInput(await readJson(request, response));
+    sendJson(response, 200, { draft: await trips.nextDraft(account, input) });
+    return;
+  }
+  if (method === 'GET' && tripId) {
+    sendJson(response, 200, await trips.trip(account, tripId));
     return;
   }
 
@@ -88,8 +116,9 @@ async function handle(store: DraftStore, request: IncomingMessage, response: Ser
 export async function startLocalServer(pool: Pool, port: number): Promise<Server> {
   await requireApplicationRole(pool);
   const store = new DraftStore(pool);
+  const trips = new TripStore(pool);
   const server = createServer({ requestTimeout: 15_000 }, (request, response) => {
-    void handle(store, request, response).catch(error => {
+    void handle(store, trips, request, response).catch(error => {
       if (response.destroyed) return;
       if (error instanceof HttpError) {
         sendJson(response, error.status, { error: error.code, message: error.message });

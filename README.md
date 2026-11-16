@@ -32,7 +32,7 @@ npm run build
 
 用微信开发者工具导入本项目根目录，运行目录由 project.config.json 指向 code/dist。修改源码后重新执行构建。预览可以用自己的微信小程序测试号，将 AppID 填入本地 project.private.config.json，仓库配置中的 touristappid 是占位值。
 
-S1 已通过模拟器录单和 iQOO Z11 退出恢复验收。S2 当前已通过自动检查和页面资源编译。[S1 验收记录](docs/S1验收.md) · [S2 验收记录](docs/S2验收.md)
+S1 已通过模拟器录单和 iQOO Z11 退出恢复验收。S2 已通过模拟器主流程和导图检查，安卓真机待验收。[S1 验收记录](docs/S1验收.md) · [S2 验收记录](docs/S2验收.md)
 
 ## 目录
 

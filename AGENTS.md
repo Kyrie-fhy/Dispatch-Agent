@@ -2,7 +2,6 @@
 
 ## 项目依据
 
-- 用户当前明确指令优先。面向用户默认使用简体中文。
 - [开发 PRD](docs/PRD.md)是当前开发入口，原访谈的已确认业务规则优先于分析推断。
 - [技术方案](docs/技术方案.md)记录实际实现与后续技术选择。
 - [开发里程碑](docs/Dispatch%20Agent%20开发里程碑.md)规定阶段目标。
@@ -10,7 +9,7 @@
 
 ## 当前工程
 
-微信原生小程序 + TypeScript。源码在 code/miniprogram，业务规则在 core，平台存取在 services，页面在 pages。code/dist 是构建产物，由 npm run build 生成。依赖版本锁定在 package-lock.json。
+小程序源码在 `code/miniprogram`，共用业务规则在其 `core` 目录。S5 的 TypeScript 服务和 PostgreSQL 迁移在 `code/server`。启动与检查见 [README](README.md)。`code/dist` 和 `code/server-dist` 均为构建产物。
 
 ## 实现与验证
 
@@ -19,8 +18,8 @@
 - 保存失败必须向用户说明，不能显示已成功；读取异常保留原数据，重置需用户明确操作。
 - 收款规则、账号隔离、真实模型与识别按相应阶段接入，未决定规则不得自行写成已确认需求。
 - 对用户页面的操作变化，从正常入口验证；业务自动检查覆盖金额、确认、重试等具体风险。
-- 提交前运行 npm run check。更改行为或出现新失败时补充相应检查。
-- 分别报告 TypeScript 编译、页面事件模拟、微信开发者工具运行和真机结果，不能互相替代。
+- 提交前运行 `npm run check`。改动服务端接口、数据库迁移或事务时，追加 `npm run test:server`。用隔离的 PostgreSQL 实例，配置见 [S5 本地联调](docs/S5本地联调.md#5-运行集成检查)。
+- 分别报告 TypeScript 编译、页面事件模拟、数据库集成、微信开发者工具和真机结果。
 
 ## Git 与交付
 

@@ -357,3 +357,129 @@ test('a failed formal commit leaves the draft editable and no official snapshot,
   assert.equal(retried.data.trip.versions[0].totalCents, 53900);
   assert.deepEqual(await confirm(api, a, previewId, 'retry-formal'), retried);
 });
+
+async function formalExample(api, token) {
+  const draft = await putCustomers(api, token, await read(api, token), 'save-example', exampleCustomers());
+  const reviewed = await preview(api, token, draft, 'example-preview');
+  assert.equal(reviewed.status, 200);
+  const formal = await confirm(api, token, reviewed.data.preview.previewId, 'confirm-example');
+  assert.equal(formal.status, 200);
+  return formal.data;
+}
+
+function sheetEndpoint(api, token, tripId, sheetId) {
+  const path = `/v1/trips/${tripId}/sheets/${encodeURIComponent(sheetId)}`;
+  return (action, body) => action
+    ? api.request(`${path}/${action}`, { token, method: 'POST', body })
+    : api.request(path, { token });
+}
+
+test('delivery and review exclude the three undelivered bags without changing the formal order', { timeout: 20_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  let api = await start(db);
+  const a = await login(api, 'a');
+  const b = await login(api, 'b');
+  const formal = await formalExample(api, a);
+  const tripId = formal.trip.id;
+  const sheetB = sheetEndpoint(api, a, tripId, 'sheet-b');
+  const initial = await sheetB();
+  assert.equal(initial.status, 200);
+  assert.equal(initial.data.sheet.orderCents, 30000);
+  assert.equal(initial.data.sheet.amounts.due, 0);
+  assert.equal(initial.data.sheet.reviewed, false);
+
+  const boxes = { requestId: 'deliver-boxes', version: 1, statusRevision: 0, lineId: 'line-b-box', status: 'delivered' };
+  const otherAccount = sheetEndpoint(api, b, tripId, 'sheet-b');
+  assert.equal((await otherAccount()).status, 404);
+  assert.equal((await otherAccount('delivery', boxes)).status, 404);
+  const wrongLine = await sheetB('delivery', { ...boxes, lineId: 'line-a' });
+  assert.equal(wrongLine.status, 404);
+  const delivered = await sheetB('delivery', boxes);
+  assert.equal(delivered.status, 200);
+  assert.equal(delivered.data.sheet.statusRevision, 1);
+  assert.equal(delivered.data.sheet.reviewed, false);
+  assert.deepEqual(await sheetB('delivery', boxes), delivered);
+  assert.equal((await sheetB('delivery', { ...boxes, lineId: 'line-b-bag' })).data.error, 'request_conflict');
+  const stale = await sheetB('review', { requestId: 'review-b', version: 1, statusRevision: 0 });
+  assert.equal(stale.status, 409);
+  assert.equal(stale.data.error, 'delivery_changed');
+
+  const review = { requestId: 'review-b', version: 1, statusRevision: 1 };
+  assert.equal((await otherAccount('review', review)).status, 404);
+  await db.admin.query("ALTER TABLE dispatch.request_results ADD CONSTRAINT test_review_failure CHECK (request_id <> 'review-b')");
+  assert.equal((await sheetB('review', review)).status, 500);
+  assert.equal((await sheetB()).data.sheet.reviewed, false);
+  await db.admin.query('ALTER TABLE dispatch.request_results DROP CONSTRAINT test_review_failure');
+  const reviewed = await sheetB('review', review);
+  assert.equal(reviewed.status, 200);
+  assert.equal(reviewed.data.sheet.reviewed, true);
+  assert.deepEqual(reviewed.data.sheet.lines.map(line => [line.id, line.status]), [
+    ['line-b-box', 'delivered'], ['line-b-bag', 'pending'],
+  ]);
+  assert.deepEqual(reviewed.data.sheet.amounts, { due: 24000, paid: 0, remaining: 24000, excess: 0 });
+  assert.deepEqual(await sheetB('review', review), reviewed);
+
+  await api.stop();
+  api = await start(db);
+  const resumed = await login(api, 'a');
+  assert.deepEqual(await sheetEndpoint(api, resumed, tripId, 'sheet-b')(), reviewed);
+  const after = (await api.request(`/v1/trips/${tripId}`, { token: resumed })).data;
+  assert.deepEqual(after.trip.versions, formal.trip.versions);
+  assert.deepEqual(after.picking, formal.picking);
+  assert.deepEqual(after.trip.statuses, { ...formal.trip.statuses, 'line-b-box': 'delivered' });
+  assert.deepEqual(after.sheets.filter(sheet => sheet.reviewed).map(sheet => sheet.sheetId), ['sheet-b']);
+});
+
+test('reviewed delivery changes require a fresh and scoped preview and commit once', { timeout: 20_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const api = await start(db);
+  const a = await login(api, 'a');
+  const b = await login(api, 'b');
+  const { trip: { id } } = await formalExample(api, a);
+  const sheetA = sheetEndpoint(api, a, id, 'sheet-a');
+  const sheetB = sheetEndpoint(api, a, id, 'sheet-b');
+  const all = { requestId: 'deliver-b', version: 1, statusRevision: 0, lineId: null, status: 'delivered' };
+  const delivered = await sheetB('delivery', all);
+  assert.equal(delivered.status, 200);
+  assert.equal(delivered.data.sheet.amounts.due, 30000);
+  assert.ok(delivered.data.sheet.lines.every(line => line.status === 'delivered'));
+  assert.equal((await sheetA()).data.sheet.lines[0].status, 'pending');
+  assert.equal((await sheetB('review', { requestId: 'review-b', version: 1, statusRevision: 1 })).status, 200);
+
+  const undo = { requestId: 'preview-undo-bags', version: 1, statusRevision: 1, lineId: 'line-b-bag', status: 'pending' };
+  const rejected = await sheetB('delivery', undo);
+  assert.equal(rejected.status, 409);
+  assert.equal(rejected.data.error, 'delivery_preview_required');
+  const planned = await sheetB('delivery/preview', undo);
+  assert.equal(planned.status, 200);
+  assert.equal(planned.data.preview.before.due, 30000);
+  assert.equal(planned.data.preview.after.due, 24000);
+  assert.equal((await sheetB()).data.sheet.amounts.due, 30000);
+  const attempt = { requestId: 'confirm-undo', previewId: planned.data.preview.previewId };
+  assert.equal((await sheetA('delivery/confirm', attempt)).status, 404);
+  assert.equal((await sheetEndpoint(api, b, id, 'sheet-b')('delivery/confirm', attempt)).status, 404);
+
+  const candidates = await Promise.all([
+    sheetA('delivery', { ...all, requestId: 'concurrent-a', statusRevision: 1 }),
+    sheetA('delivery', { ...all, requestId: 'concurrent-a-line', statusRevision: 1, lineId: 'line-a' }),
+  ]);
+  assert.deepEqual(candidates.map(result => result.status).sort(), [200, 409]);
+  const outdated = await sheetB('delivery/confirm', attempt);
+  assert.equal(outdated.status, 409);
+  assert.equal(outdated.data.error, 'delivery_changed');
+  const current = await sheetB('delivery/preview', { ...undo, requestId: 'refresh-undo-bags', statusRevision: 2 });
+  assert.equal(current.status, 200);
+  const confirmBody = { ...attempt, previewId: current.data.preview.previewId };
+
+  await db.admin.query("ALTER TABLE dispatch.request_results ADD CONSTRAINT test_delivery_failure CHECK (request_id <> 'confirm-undo')");
+  assert.equal((await sheetB('delivery/confirm', confirmBody)).status, 500);
+  assert.equal((await sheetB()).data.sheet.amounts.due, 30000);
+  assert.equal((await sheetB()).data.sheet.statusRevision, 2);
+  await db.admin.query('ALTER TABLE dispatch.request_results DROP CONSTRAINT test_delivery_failure');
+  const confirmed = await sheetB('delivery/confirm', confirmBody);
+  assert.equal(confirmed.status, 200);
+  assert.equal(confirmed.data.sheet.reviewed, true);
+  assert.equal(confirmed.data.sheet.statusRevision, 3);
+  assert.equal(confirmed.data.sheet.amounts.due, 24000);
+  assert.deepEqual(await sheetB('delivery/confirm', confirmBody), confirmed);
+});

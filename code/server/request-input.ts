@@ -40,3 +40,26 @@ export function readNextInput(value: unknown) {
   const body = readCommand(value);
   return { requestId: body.requestId, draftId: readId(body.draftId, '草稿编号') };
 }
+
+export function validSheetKey(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= 200
+    && !value.includes('\0') && Buffer.from(value).toString() === value;
+}
+
+export function readReviewInput(value: unknown) {
+  const { requestId, version, statusRevision } = readCommand(value);
+  if (!validRevision(version) || version === 0 || !validRevision(statusRevision)) {
+    throw new HttpError(400, 'invalid_version', '请提供有效的正式单版本和配送修订号');
+  }
+  return { requestId, version, statusRevision };
+}
+
+export function readDeliveryInput(value: unknown) {
+  const basis = readReviewInput(value);
+  const { lineId, status } = value as Record<string, unknown>;
+  if ((lineId !== null && !validSheetKey(lineId)) || (status !== 'pending' && status !== 'delivered')
+    || (lineId === null && status !== 'delivered')) {
+    throw new HttpError(400, 'invalid_delivery', '请选择要更新的货品和配送状态');
+  }
+  return { ...basis, lineId, status } as const;
+}

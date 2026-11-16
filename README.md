@@ -2,7 +2,7 @@
 
 帮助速冻食品配送员完成录单、取货、送货与对账的微信原生 TypeScript 小程序。
 
-微信测试号预览可用模拟材料走完录单、取货、送货和对账。S5 的 PostgreSQL 服务已支持草稿、预览、正式出单和取货查询，供本地联调。最新进度、交付范围和下一步统一查[开发任务](docs/开发任务.md)。
+微信测试号预览可用模拟材料走完录单、取货、送货和对账。S5 的 PostgreSQL 服务支持草稿、预览、正式出单、取货查询、按明细送达和客户单核对，供本地联调。最新进度、交付范围和下一步统一查[开发任务](docs/开发任务.md)。
 
 ## 文档入口
 
@@ -12,7 +12,7 @@
 - [S2 操作验收](docs/S2验收.md)
 - [S3 操作验收](docs/S3验收.md)
 - [S4 操作验收](docs/S4验收.md)
-- [S5 本地草稿与正式出单联调](docs/S5本地联调.md)
+- [S5 本地服务联调](docs/S5本地联调.md)
 - [开发里程碑](docs/Dispatch%20Agent%20开发里程碑.md)
 - [需求分析](docs/需求分析文档.md)
 - [项目级 Agent 约定](AGENTS.md)
@@ -24,7 +24,7 @@ npm ci
 npm run check
 ```
 
-依赖版本由 `package-lock.json` 锁定。GitHub Actions 还会在 PostgreSQL 18 上运行 `npm run test:server`，验证账号隔离、草稿保存和正式出单。服务启动及本地集成检查见 [S5 本地联调](docs/S5本地联调.md)。
+依赖版本由 `package-lock.json` 锁定。GitHub Actions 还会在 PostgreSQL 18 上运行 `npm run test:server`，验证账号隔离、草稿保存、正式出单、配送和对账。服务启动及本地集成检查见 [S5 本地联调](docs/S5本地联调.md)。
 
 ## 微信预览
 

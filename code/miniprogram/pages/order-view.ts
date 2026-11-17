@@ -26,7 +26,7 @@ export function lineView(line: OrderLine) {
   return { ...line, amount: money(line.amountCents) };
 }
 
-export function customerView(customer: CustomerOrder) {
+function customerView(customer: CustomerOrder) {
   return { ...customer, items: customer.items.map(lineView), total: money(customer.totalCents) };
 }
 

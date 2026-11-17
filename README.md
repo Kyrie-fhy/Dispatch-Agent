@@ -1,12 +1,12 @@
 # Dispatch Agent
 
-帮助速冻食品配送员完成录单、取货、送货与对账的微信原生 TypeScript 小程序。
+面向速冻食品配送员的微信原生 TypeScript 小程序。当前 MVP 聚焦录单、取货、按客户送货和本次应收。
 
 接手请先读[开发任务](docs/开发任务.md)，确认应使用的分支、验收范围和下一步。S4 使用本地演示数据，S5 微信工作区通过 API 读写 PostgreSQL 数据。
 
 ## 文档入口
 
-- 产品与阶段见[开发 PRD](docs/PRD.md)、[开发里程碑](docs/Dispatch%20Agent%20开发里程碑.md)和[需求分析](docs/需求分析文档.md)。
+- 当前交付范围见 [MVP 实施顺序](docs/Dispatch%20Agent%20开发里程碑.md#mvp-实施顺序)。历史业务规则与原型规划见[开发 PRD](docs/PRD.md)和[需求分析](docs/需求分析文档.md)。
 - 工程结构和本地规则见[技术方案](docs/技术方案.md)及[项目约定](AGENTS.md)。
 - S5 按用途查[本地 API 联调](docs/S5本地联调.md)、[微信真机验收](docs/S5微信试用.md#手机验收)或[异地 HTTPS 部署](docs/S5试用部署.md)。
 - 历史操作验收见 [S1](docs/S1验收.md)、[S2](docs/S2验收.md)、[S3](docs/S3验收.md)和 [S4](docs/S4验收.md)。

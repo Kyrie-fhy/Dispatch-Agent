@@ -176,6 +176,73 @@ test('S5 materials keep the original local file for resume and clear another acc
   assertIdle();
 });
 
+test('S5 reselects the original photo and resumes from the server offset without local cache', async () => {
+  const { page, take, login, assertIdle } = setup();
+  const workspace = data('重选原图');
+  const image = new Uint8Array(2 * materialChunkBytes + 5);
+  image.set([1, 2, 3, 4, 5], 2 * materialChunkBytes);
+  const material = {
+    id: 'saved-photo', requestId: 'order-1-2-photo', draftId: workspace.draft.id, revision: workspace.draft.revision,
+    name: '相册图片.jpg', size: image.byteLength, digest: 'a'.repeat(64),
+    received: materialChunkBytes, draftCurrent: true, status: 'uploading',
+  };
+  let selectedDigest = 'b'.repeat(64);
+  let manifest = '';
+  let stagedPath;
+  Object.assign(global.wx, {
+    env: { USER_DATA_PATH: 'wxfile://clean' },
+    getStorageSync: () => manifest,
+    setStorageSync: (key, entries) => { manifest = entries; },
+    chooseMedia: ({ sizeType, success }) => {
+      assert.deepEqual(sizeType, ['original']);
+      success({ tempFiles: [{ tempFilePath: 'temp.jpg' }] });
+    },
+    getFileSystemManager: () => ({
+      getFileInfo: ({ filePath, digestAlgorithm, success }) => {
+        assert.equal(filePath, 'temp.jpg');
+        assert.equal(digestAlgorithm, 'sha256');
+        success({ size: image.byteLength, digest: selectedDigest });
+      },
+      copyFile: ({ destPath, success }) => { stagedPath = destPath; success(); },
+      readFile: ({ filePath, position, length, success }) => {
+        assert.ok(stagedPath);
+        assert.equal(filePath, stagedPath);
+        success({ data: image.slice(position, position + length).buffer });
+      },
+      unlink: ({ filePath }) => { assert.equal(filePath, stagedPath); stagedPath = undefined; },
+    }),
+  });
+
+  await login('same-account-on-clean-client', tokenA, workspace);
+  let done = page.selectSection(tap({ section: 'materials' }));
+  (await take('GET', '/materials', tokenA)).respond(200, { materials: [material] });
+  await done;
+  assert.equal(page.data.materialRows[0].local, false);
+
+  const reselect = tap({ key: material.requestId, album: 'yes' });
+  await page.selectMaterial(reselect);
+  assert.match(page.data.error, /与原材料不匹配/);
+  assert.equal(manifest, '');
+  assert.equal(stagedPath, undefined);
+  assertIdle();
+
+  selectedDigest = material.digest;
+  done = page.selectMaterial(reselect);
+  (await take('GET', '/materials/saved-photo', tokenA)).respond(200, {
+    material: { ...material, received: 2 * materialChunkBytes },
+  });
+  const last = await take('PUT', '/materials/saved-photo/chunks', tokenA);
+  assert.equal(last.header['X-Material-Offset'], String(2 * materialChunkBytes));
+  assert.deepEqual([...new Uint8Array(last.data)], [1, 2, 3, 4, 5]);
+  last.respond(200, { material: { ...material, received: image.byteLength, status: 'ready' } });
+  await done;
+  assert.equal(page.data.materialRows[0].label, '已上传');
+  assert.equal(page.data.materialRows[0].progress, 100);
+  assert.deepEqual(manifest, []);
+  assert.equal(stagedPath, undefined);
+  assertIdle();
+});
+
 test('S5 customer sheet retains write identity on timeout and requires a new preview after a concurrent change', async () => {
   const { page, take, login, assertIdle } = setup();
   const workspace = data('客户甲', 1);

@@ -8,7 +8,7 @@
 
 ## 当前工程
 
-小程序源码在 `code/miniprogram`，共用业务规则在其 `core` 目录。S5 的 TypeScript 服务和 PostgreSQL 迁移在 `code/server`。启动与检查见 [README](README.md)。`code/dist` 和 `code/server-dist` 均为构建产物。
+小程序源码在 `code/miniprogram`，共用业务规则在其 `core` 目录。工作区 TypeScript 服务和 PostgreSQL 迁移在 `code/server`。启动与检查见 [README](README.md)。`code/dist` 和 `code/server-dist` 均为构建产物。
 
 ## 实现与验证
 

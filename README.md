@@ -39,7 +39,7 @@ README.md             使用入口
 project.config.json   微信项目配置
 code/miniprogram/     TypeScript、WXML、WXSS 源码
 code/dist/            小程序构建结果，忽略提交
-code/server/          S5 本地服务及 PostgreSQL 迁移
+code/server/          工作区 API、DeepSeek 接入和 PostgreSQL 迁移
 docs/                 需求、方案、里程碑和验收
 tests/                业务、页面事件和 PostgreSQL 集成检查
 scripts/              构建和文档链接检查

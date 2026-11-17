@@ -65,6 +65,35 @@ export class TripStore {
     return readAccount(this.pool, accountId, client => this.readTrip(client, accountId, tripId));
   }
 
+  async history(accountId: string, cursor: string | null) {
+    return readAccount(this.pool, accountId, async client => {
+      const pageSize = 20;
+      const { currentTripId } = await readWorkspace(client, accountId);
+      const { rows } = await client.query<{
+        id: string; issuedAt: Date; version: number; totalCents: string; customers: string[];
+      }>(`
+        SELECT issued.trip_id AS id, issued.saved_at AS "issuedAt", latest.version, latest.total_cents AS "totalCents",
+          ARRAY(SELECT item->>'customer' FROM jsonb_array_elements(latest.customers) AS item) AS customers
+        FROM dispatch.trip_versions issued
+        JOIN LATERAL (
+          SELECT version, total_cents, customers FROM dispatch.trip_versions
+          WHERE account_id = issued.account_id AND trip_id = issued.trip_id ORDER BY version DESC LIMIT 1
+        ) latest ON true
+        WHERE issued.account_id = $1 AND issued.version = 1 AND issued.trip_id IS DISTINCT FROM $2::uuid
+          AND ($3::uuid IS NULL OR (issued.saved_at, issued.trip_id) < (
+            SELECT saved_at, trip_id FROM dispatch.trip_versions
+            WHERE account_id = $1 AND trip_id = $3 AND version = 1
+          ))
+        ORDER BY issued.saved_at DESC, issued.trip_id DESC LIMIT $4
+      `, [accountId, currentTripId, cursor, pageSize + 1]);
+      const page = rows.slice(0, pageSize);
+      return {
+        trips: page.map(row => ({ ...row, issuedAt: row.issuedAt.toISOString(), totalCents: Number(row.totalCents) })),
+        nextCursor: rows.length > pageSize ? page[page.length - 1].id : null,
+      };
+    });
+  }
+
   async preview(accountId: string, { requestId, draftId, revision }: ReturnType<typeof readPreviewInput>): Promise<TripPreview> {
     return writeAccount(this.pool, accountId, requestId, { action: 'preview-trip', draftId, revision }, async (client, workspace) => {
       if (workspace.id !== draftId || workspace.revision !== revision) throw draftChanged();
@@ -136,8 +165,8 @@ export class TripStore {
       VALUES ($1, $2, $3, $4)
     `, [accountId, draftId, previewId, JSON.stringify(statuses)]);
     await client.query(`
-      INSERT INTO dispatch.trip_versions (account_id, trip_id, version, customers, total_cents)
-      VALUES ($1, $2, 1, $3, $4)
+      INSERT INTO dispatch.trip_versions (account_id, trip_id, version, customers, total_cents, saved_at)
+      VALUES ($1, $2, 1, $3, $4, clock_timestamp())
     `, [accountId, draftId, JSON.stringify(customers), totalCents]);
 
     const newParties: Party[] = [];

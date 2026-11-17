@@ -629,7 +629,7 @@ test('opening debt and receipt allocations persist atomically and follow the ver
     statusRevision: checked.statusRevision, lineId: 'line-a', status: 'pending' });
   assert.equal(delivery.status, 200);
   assert.equal((await sheet('receipt/preview', { requestId: 'invalid-price', amount: '12.001' })).status, 400);
-  assert.equal((await sheet('receipt/preview', { requestId: 'too-much', amount: '225' })).data.error, 'receipt_rejected');
+  assert.equal((await sheet('receipt/preview', { requestId: 'too-much', amount: '225' })).data.preview.pendingCents, 100);
   const pay = await sheet('receipt/preview', { requestId: 'preview-100', amount: '100' });
   assert.equal(pay.status, 200);
   assert.deepEqual(pay.data.preview.allocations.map(({ debtId, cents, remaining }) => [debtId, cents, remaining]),
@@ -707,6 +707,105 @@ test('a receipt opened from a newer sheet pays earlier reviewed sheets of that p
   assert.equal((await older()).data.sheet.amounts.remaining, 0);
   assert.equal((await newer()).data.sheet.amounts.remaining, 12800);
   assert.equal((await newer('ledger')).data.ledger.otherRemainingCents, 0);
+});
+
+test('S5 keeps pending excess and corrects receipts atomically without rewriting later distributions', { timeout: 20_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const api = await start(db);
+  const a = await login(api, 'a');
+  const b = await login(api, 'b');
+  const [first, second] = await Promise.all([formalExample(api, a), formalExample(api, b)]);
+  const sheet = sheetEndpoint(api, a, first.trip.id, 'sheet-a');
+  const other = sheetEndpoint(api, b, second.trip.id, 'sheet-a');
+  await deliverAndReview(sheet, 'correct');
+  await deliverAndReview(other, 'excess');
+  const debt = await sheet('opening/preview', { requestId: 'old-preview', amount: '60', day: '2020-01-01' });
+  assert.equal((await sheet('opening/confirm', { requestId: 'old-confirm', previewId: debt.data.preview.id })).status, 200);
+
+  async function receive(target, amount, key) {
+    const result = await target('receipt/preview', { requestId: `preview-${key}`, amount });
+    assert.equal(result.status, 200, JSON.stringify(result.data));
+    const saved = await target('receipt/confirm', { requestId: `confirm-${key}`, previewId: result.data.preview.id });
+    assert.equal(saved.status, 200, JSON.stringify(saved.data));
+    return saved.data.receipt;
+  }
+  const excess = await receive(other, '170', 'excess');
+  assert.deepEqual(excess.allocations.map(row => row.cents), [16400]);
+  assert.equal(excess.pendingCents, 600);
+  const whollyPending = await receive(other, '1', 'pending');
+  assert.deepEqual(whollyPending.allocations, []);
+  assert.equal((await other('ledger')).data.ledger.pendingCents, 700);
+
+  const original = await receive(sheet, '100', 'original');
+  const correction = (receiptId, amount, requestId) => sheet('receipt-correction/preview', { receiptId, amount, requestId });
+  assert.equal((await correction(excess.id, '90', 'foreign')).status, 404);
+  const before = await sheet('ledger');
+  const change = await correction(original.id, '90', 'correction');
+  assert.equal(change.status, 200, JSON.stringify(change.data));
+  const plan = change.data.preview;
+  assert.equal(plan.canConfirm, true);
+  assert.deepEqual(plan.allocations.map(row => row.cents), [6000, 3000]);
+  assert.deepEqual(await sheet('ledger'), before);
+  const write = { requestId: 'replace', previewId: plan.id };
+  assert.equal((await other('receipt-correction/confirm', write)).status, 404);
+  await db.admin.query('ALTER TABLE dispatch.receipt_reversals ADD CONSTRAINT test_failed_reversal CHECK (false)');
+  assert.equal((await sheet('receipt-correction/confirm', write)).status, 500);
+  assert.deepEqual(await sheet('ledger'), before);
+  await db.admin.query('ALTER TABLE dispatch.receipt_reversals DROP CONSTRAINT test_failed_reversal');
+  const confirmed = await Promise.all([sheet('receipt-correction/confirm', write), sheet('receipt-correction/confirm', write)]);
+  assert.equal(confirmed[0].status, 200, JSON.stringify(confirmed[0].data));
+  assert.deepEqual(confirmed[0], confirmed[1]);
+  const replacement = confirmed[0].data.receipt;
+  assert.equal(replacement.replaces, original.id);
+  assert.equal((await sheet()).data.sheet.amounts.remaining, 13400);
+  assert.deepEqual((await sheet('ledger')).data.ledger.receipts, [{ ...original, reversedBy: replacement.id }, replacement]);
+
+  const stale = await correction(replacement.id, '85', 'before-later');
+  const later = await receive(sheet, '20', 'later');
+  const rejected = await sheet('receipt-correction/confirm', { requestId: 'stale', previewId: stale.data.preview.id });
+  assert.equal(rejected.data.error, 'ledger_changed');
+  const permitted = (await correction(replacement.id, '85', 'unchanged-later')).data.preview;
+  assert.equal(permitted.canConfirm, true);
+  const updated = await sheet('receipt-correction/confirm', { requestId: 'allowed', previewId: permitted.id });
+  assert.equal(updated.status, 200);
+  assert.equal((await sheet()).data.sheet.amounts.remaining, 11900);
+  assert.deepEqual((await sheet('ledger')).data.ledger.receipts.find(receipt => receipt.id === later.id), later);
+  const blocked = (await correction(updated.data.receipt.id, '50', 'moves-later')).data.preview;
+  assert.equal(blocked.canConfirm, false);
+  assert.deepEqual(blocked.laterChanges[0].after.allocations.map(row => row.cents), [1000, 1000]);
+  const unchanged = await sheet('ledger');
+  assert.equal((await sheet('receipt-correction/confirm', { requestId: 'blocked', previewId: blocked.id })).data.error, 'later_receipt_change');
+  assert.deepEqual(await sheet('ledger'), unchanged);
+});
+
+test('S5 history paginates formal trips within the account by their first issue time', { timeout: 20_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const api = await start(db);
+  const a = await login(api, 'a');
+  const b = await login(api, 'b');
+  const ids = [];
+  let draft = await read(api, a);
+  for (let index = 0; index < 22; index++) {
+    draft = await putCustomers(api, a, draft, `save-${index}`, exampleCustomers());
+    const planned = await preview(api, a, draft, `preview-${index}`);
+    assert.equal(planned.status, 200);
+    const issued = await confirm(api, a, planned.data.preview.previewId, `issue-${index}`);
+    assert.equal(issued.status, 200);
+    ids.push(draft.id);
+    const next = await tripCommand(api, a, 'next-draft', { requestId: `next-${index}`, draftId: draft.id });
+    assert.equal(next.status, 200);
+    draft = next.data.draft;
+  }
+  const first = await api.request('/v1/trips', { token: a });
+  assert.equal(first.status, 200);
+  assert.deepEqual(first.data.trips.map(trip => trip.id), ids.slice(1, -1).reverse());
+  assert.equal(first.data.nextCursor, ids[1]);
+  const second = await api.request('/v1/trips?cursor=' + first.data.nextCursor, { token: a });
+  assert.deepEqual(second.data.trips.map(trip => trip.id), [ids[0]]);
+  assert.equal(second.data.nextCursor, null);
+  assert.deepEqual((await api.request('/v1/trips?cursor=' + first.data.nextCursor, { token: b })).data,
+    { trips: [], nextCursor: null });
+  assert.equal((await api.request('/v1/trips/' + ids[0], { token: b })).status, 404);
 });
 
 test('amending a settled historical sheet preserves allocations and leaves current picking on the current trip', { timeout: 20_000 }, async t => {
@@ -904,6 +1003,21 @@ test('a logical backup restores the S5 ledger, account policies and confirmation
   assert.equal(before.b.lines.find(line => line.id === 'line-b-bag').status, 'pending');
   assert.deepEqual(before.trip.trip.versions, [formal.trip.versions[0], amendment.data.version]);
   assert.deepEqual(before.ledger.receipts, [first.result.data.receipt, second.result.data.receipt]);
+  const fix = await sheet('receipt-correction/preview', {
+    requestId: 'backup-fix-preview', receiptId: second.result.data.receipt.id, amount: '120',
+  });
+  assert.equal(fix.status, 200);
+  const fixBody = { requestId: 'backup-fix-confirm', previewId: fix.data.preview.id };
+  const fixed = await sheet('receipt-correction/confirm', fixBody);
+  assert.equal(fixed.status, 200);
+  const extra = await receive('66', 'extra');
+  const beforeBackup = await snapshot(api, a);
+  assert.equal(beforeBackup.a.amounts.remaining, 0);
+  assert.equal(beforeBackup.ledger.pendingCents, 600);
+  assert.deepEqual(beforeBackup.ledger.receipts, [
+    first.result.data.receipt, { ...second.result.data.receipt, reversedBy: fixed.data.receipt.id },
+    fixed.data.receipt, extra.result.data.receipt,
+  ]);
 
   await api.stop();
   const archive = runPostgresClient('pg_dump', source.name, ['--format=custom', '--schema=dispatch']);
@@ -922,7 +1036,7 @@ test('a logical backup restores the S5 ledger, account policies and confirmation
   });
   assert.equal((await recoveryApi.request(materialPath, { token: recoveredB })).status, 404);
   assert.deepEqual((await restored.admin.query('SELECT content FROM dispatch.material_chunks')).rows, [{ content: bytes }]);
-  assert.deepEqual(await snapshot(recoveryApi, recoveredA), before);
+  assert.deepEqual(await snapshot(recoveryApi, recoveredA), beforeBackup);
   const restoredB = await recoveryApi.request(`/v1/trips/${ownB.trip.id}`, { token: recoveredB });
   assert.deepEqual(restoredB, { status: 200, data: ownB });
   const foreign = sheetEndpoint(recoveryApi, recoveredB, tripId, 'sheet-a');
@@ -933,9 +1047,10 @@ test('a logical backup restores the S5 ledger, account policies and confirmation
   const recoveredSheet = sheetEndpoint(recoveryApi, recoveredA, tripId, 'sheet-a');
   assert.deepEqual(await recoveredSheet('receipt/confirm', first.body), first.result);
   assert.deepEqual(await recoveredSheet('receipt/confirm', { ...first.body, requestId: 'receipt-after-recovery' }), first.result);
+  assert.deepEqual(await recoveredSheet('receipt-correction/confirm', fixBody), fixed);
   assert.deepEqual(await recoveredSheet('amendment/confirm', amendmentBody), amendment);
   assert.deepEqual(await recoveredSheet('amendment/confirm', { ...amendmentBody, requestId: 'amendment-after-recovery' }), amendment);
-  assert.deepEqual(await snapshot(recoveryApi, recoveredA), before);
+  assert.deepEqual(await snapshot(recoveryApi, recoveredA), beforeBackup);
 
   const { rows: [accountB] } = await restored.admin.query("SELECT id FROM dispatch.accounts WHERE identity_subject = 'b'");
   const restricted = restored.pool();
@@ -946,6 +1061,7 @@ test('a logical backup restores the S5 ledger, account policies and confirmation
       await connection.query("SELECT set_config('dispatch.account_id', $1, true)", [accountB.id]);
       assert.deepEqual((await connection.query('SELECT id FROM dispatch.trips')).rows, [{ id: ownB.trip.id }]);
       assert.equal((await connection.query('SELECT 1 FROM dispatch.receipt_allocations')).rowCount, 0);
+      assert.equal((await connection.query('SELECT 1 FROM dispatch.receipt_reversals')).rowCount, 0);
       const update = await connection.query('UPDATE dispatch.trips SET status_revision = 999 WHERE id = $1', [tripId]);
       assert.equal(update.rowCount, 0);
       await connection.query('COMMIT');

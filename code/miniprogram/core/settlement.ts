@@ -23,6 +23,29 @@ export interface ReceiptPreview {
   allocations: (Allocation & { label: string; remaining: number })[];
 }
 
+export interface ServerReceipt extends Receipt {
+  pendingCents?: number;
+  reversedBy?: string;
+  replaces?: string;
+}
+
+export interface ServerReceiptPreview extends ReceiptPreview {
+  pendingCents?: number;
+}
+
+export interface ReceiptCorrectionPreview extends ServerReceiptPreview {
+  originalReceiptId: string;
+  originalCents: number;
+  canConfirm: boolean;
+  impacts: { debtId: string; label: string; beforePaid: number; afterPaid: number; beforeRemaining: number; afterRemaining: number }[];
+  laterChanges: { id: string; savedAt: string; cents: number; before: ReceiptDistribution; after: ReceiptDistribution }[];
+}
+
+export interface ReceiptDistribution {
+  allocations: (Allocation & { label: string })[];
+  pendingCents: number;
+}
+
 interface Debt {
   id: string;
   day: string;
@@ -172,13 +195,20 @@ export function requireAccount(ledger: Ledger, sheet: Sheet): Account {
   return account;
 }
 
-export function planReceipt(state: Pick<TripState, 'ledger' | 'trips'>, sheet: Sheet, cents: number, id: string, dayFor = localDay): ReceiptPreview {
+export function planReceipt(state: Pick<TripState, 'ledger' | 'trips'>, sheet: Sheet, cents: number, id: string,
+  dayFor = localDay, allowPending = false): ServerReceiptPreview {
   const account = requireAccount(state.ledger, sheet);
   if (!account.reviewed) throw new Error('请先确认对账');
   if (!positiveCents(cents)) throw new Error('收款金额须大于零且在可计算范围内');
   const debts = customerDebts(state, account.partyId, dayFor);
   const available = sumCents(debts.map(debt => debt.remaining));
-  if (cents > available) throw new Error(`当前最多可抵扣 ¥${money(available)}，请核对收款金额`);
+  if (!allowPending && cents > available) throw new Error(`当前最多可抵扣 ¥${money(available)}，请核对收款金额`);
+  const { allocations, pendingCents } = allocateReceipt(debts, cents);
+  const basis = JSON.stringify(debts.map(debt => [debt.id, debt.time, debt.day, debt.revision, debt.cents, debt.paid]));
+  return { id, sheet, partyId: account.partyId, cents, basis, allocations, ...(pendingCents ? { pendingCents } : {}) };
+}
+
+export function allocateReceipt(debts: Pick<ReturnType<typeof customerDebts>[number], 'id' | 'label' | 'remaining'>[], cents: number) {
   let left = cents;
   const allocations: ReceiptPreview['allocations'] = [];
   for (const debt of debts) {
@@ -188,8 +218,7 @@ export function planReceipt(state: Pick<TripState, 'ledger' | 'trips'>, sheet: S
     allocations.push({ debtId: debt.id, label: debt.label, cents: applied, remaining: debt.remaining - applied });
     left -= applied;
   }
-  const basis = JSON.stringify(debts.map(debt => [debt.id, debt.time, debt.day, debt.revision, debt.cents, debt.paid]));
-  return { id, sheet, partyId: account.partyId, cents, basis, allocations };
+  return { allocations, pendingCents: left };
 }
 
 export function checkOpening(state: Pick<TripState, 'ledger'>, entry: OpeningPreview, today: string): void {

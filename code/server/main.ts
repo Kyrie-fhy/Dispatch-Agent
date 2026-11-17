@@ -8,7 +8,7 @@ import { DeliveryStore } from './delivery';
 import { LedgerStore } from './ledger';
 import { MaterialStore, readMaterialInput } from './materials';
 import { TripStore } from './trips';
-import { readConfirmInput, readDeliveryInput, readNextInput, readOpeningInput, readPreviewInput, readReceiptInput,
+import { readConfirmInput, readDeliveryInput, readId, readNextInput, readOpeningInput, readPreviewInput, readReceiptCorrectionInput, readReceiptInput,
   readReviewInput, uuidPattern, validSheetKey } from './request-input';
 import { HttpError } from './http-error';
 import { configuredWechatLogin, readWechatCode, WechatLogin } from './wechat-login';
@@ -165,12 +165,17 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
     sendJson(response, 200, { draft: await trips.nextDraft(account, input) });
     return;
   }
+  if (method === 'GET' && path === '/v1/trips') {
+    const cursor = new URLSearchParams(request.url?.split('?')[1]).get('cursor');
+    sendJson(response, 200, await trips.history(account, cursor === null ? null : readId(cursor, '历史分页位置')));
+    return;
+  }
   if (method === 'GET' && tripId) {
     sendJson(response, 200, await trips.trip(account, tripId));
     return;
   }
 
-  const sheetRoute = /^\/v1\/trips\/([^/]+)\/sheets\/([^/]+)(?:\/(delivery(?:\/(?:preview|confirm))?|review|ledger|(?:opening|receipt|amendment)\/(?:preview|confirm)))?$/.exec(path);
+  const sheetRoute = /^\/v1\/trips\/([^/]+)\/sheets\/([^/]+)(?:\/(delivery(?:\/(?:preview|confirm))?|review|ledger|(?:opening|receipt|receipt-correction|amendment)\/(?:preview|confirm)))?$/.exec(path);
   if (sheetRoute && uuidPattern.test(sheetRoute[1])) {
     const [, sheetTripId, key, action] = sheetRoute;
     let sheetId: string;
@@ -196,6 +201,10 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
         sendJson(response, 200, { preview: await ledger.previewReceipt(account, sheetKey, readReceiptInput(body)) });
       } else if (action === 'receipt/confirm') {
         sendJson(response, 200, { receipt: await ledger.confirmReceipt(account, sheetKey, readConfirmInput(body)) });
+      } else if (action === 'receipt-correction/preview') {
+        sendJson(response, 200, { preview: await ledger.previewCorrection(account, sheetKey, readReceiptCorrectionInput(body)) });
+      } else if (action === 'receipt-correction/confirm') {
+        sendJson(response, 200, { receipt: await ledger.confirmCorrection(account, sheetKey, readConfirmInput(body)) });
       } else if (action === 'amendment/preview') {
         sendJson(response, 200, { preview: await amendments.preview(account, sheetKey, readAmendmentInput(body)) });
       } else if (action === 'amendment/confirm') {

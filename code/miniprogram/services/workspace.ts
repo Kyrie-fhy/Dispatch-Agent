@@ -15,6 +15,11 @@ export interface FormalTrip {
   picking: PickingLine[];
 }
 
+export interface TripHistory {
+  trips: { id: string; issuedAt: string; version: number; totalCents: number; customers: string[] }[];
+  nextCursor: string | null;
+}
+
 export type TripPreview = Pick<TripVersion, 'customers' | 'totalCents'> & {
   previewId: string;
   draftId: string;

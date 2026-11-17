@@ -1,10 +1,10 @@
 import { emptyItem, ItemInput, money } from '../../core/orders';
 import { Material, materialImagePattern, MaterialSource } from '../../core/materials';
-import { localDay, OpeningPreview, ReceiptPreview, Sheet } from '../../core/settlement';
+import { localDay, OpeningPreview, ReceiptCorrectionPreview, ServerReceiptPreview, Sheet } from '../../core/settlement';
 import { CustomerDraft, emptyCustomer, isTripDraft, latest, PickingChange, PickingLine, pickingChanges, pickingKey, TripDraft } from '../../core/trips';
 import { newId } from '../../services/ids';
 import { chooseMaterial, forgetStaged, materialInfo, readChunk, sameMaterial, stagedMaterials, stageMaterial, uploadChunk } from '../../services/materials';
-import { FormalTrip, revokeSession, TripPreview, wechatCode, Workspace, WorkspaceError, workspaceRequest } from '../../services/workspace';
+import { FormalTrip, revokeSession, TripHistory, TripPreview, wechatCode, Workspace, WorkspaceError, workspaceRequest } from '../../services/workspace';
 import { deliveryLabel, editLines, errorMessage, formLines, lineView, tripView } from '../order-view';
 import { AmendmentPreview, balanceChange, DeliveryMark, DeliveryPreview, ServerLedger, ServerSheet, settlementPreview,
   SheetAction, sheetPath, sheetView } from './sheet-view';
@@ -32,6 +32,7 @@ function sheetEditor() {
     },
     paymentPreview: null as ReturnType<typeof settlementPreview> | null,
     payment: { amount: '', day: '', source: '' },
+    correctionReceipt: null as { id: string; total: string } | null,
     amendment: [] as ItemInput[],
     amendmentForm: [] as ReturnType<typeof formLines>,
     replacements: {} as Record<string, DeliveryMark>,
@@ -55,6 +56,9 @@ function initialData() {
     form: [] as ReturnType<typeof formLines>, parties: [] as { id: string; name: string; label: string }[],
     partyLabel: '', dirty: false, preview: null as PreviewView | null, formal: null as FormalView | null,
     conflict: null as Workspace | null,
+    historyOpen: false, historyLoaded: false, historyCursor: null as string | null,
+    historyRows: [] as { id: string; date: string; version: number; total: string; customers: string }[],
+    historyTrip: null as FormalView | null,
     ...sheetEditor(), sheetTarget: null as Sheet | null, sheet: null as ReturnType<typeof sheetView> | null,
     sheetNeedsRefresh: false, sheetRetry: false,
     materialRows: [] as (MaterialSource & { id: string; label: string; draftCurrent: boolean;
@@ -207,7 +211,54 @@ Page({
     const section = event.currentTarget.dataset.section;
     if (!this.data.draft || this.data.busy || this.data.sheetTarget || !['draft', 'picking', 'delivery', 'materials'].includes(section)) return;
     this.setData({ section, error: '' });
+    if (section !== 'delivery' && this.data.historyOpen) this.closeHistory();
     if (section === 'materials') return this.refreshMaterials();
+  },
+
+  openHistory() {
+    if (!this.token || this.data.busy) return;
+    this.setData({ historyOpen: true });
+    return this.loadHistory();
+  },
+
+  closeHistory() {
+    if (this.data.busy) return;
+    this.setData({ historyOpen: false, historyLoaded: false, historyCursor: null, historyRows: [], historyTrip: null, error: '' });
+  },
+
+  loadHistory() {
+    const { historyOpen, historyLoaded, historyCursor, historyRows } = this.data;
+    if (!this.token || !historyOpen || (historyLoaded && !historyCursor)) return;
+    return this.run(async generation => {
+      const query = historyCursor ? '?cursor=' + encodeURIComponent(historyCursor) : '';
+      const result = await workspaceRequest<TripHistory>('GET', '/trips' + query, this.token);
+      if (generation !== this.generation) return;
+      const rows = result.trips.map(trip => ({
+        id: trip.id, date: localDay(new Date(trip.issuedAt)), version: trip.version, total: money(trip.totalCents),
+        customers: trip.customers.join('、'),
+      }));
+      this.setData({ historyLoaded: true, historyCursor: result.nextCursor, historyRows: [...historyRows, ...rows] });
+    });
+  },
+
+  openHistoryTrip(event: WechatMiniprogram.TouchEvent) {
+    const { id } = event.currentTarget.dataset;
+    if (!this.token || !this.data.historyOpen || !this.data.historyRows.some(row => row.id === id)) return;
+    return this.run(async generation => {
+      const result = await workspaceRequest<FormalTrip>('GET', '/trips/' + encodeURIComponent(id), this.token);
+      if (generation === this.generation) this.showHistoryTrip(result);
+    });
+  },
+
+  showHistoryTrip(result: FormalTrip) {
+    const historyTrip = this.formalView(result);
+    const historyRows = this.data.historyRows.map(row => row.id === historyTrip.id
+      ? { ...row, version: historyTrip.version, total: historyTrip.total } : row);
+    this.setData({ historyTrip, historyRows });
+  },
+
+  closeHistoryTrip() {
+    if (!this.data.busy) this.setData({ historyTrip: null, error: '' });
   },
 
   showDraft(draft: TripDraft, id?: string) {
@@ -402,12 +453,14 @@ Page({
     const close = () => {
       this.setData({ ...sheetEditor(), sheetTarget: null, sheet: null, sheetNeedsRefresh: false, error: '' });
     };
-    const { sheetTarget, sheetNeedsRefresh, formal } = this.data;
-    if (sheetNeedsRefresh && formal && sheetTarget?.tripId === formal.id) {
+    const { sheetTarget, sheetNeedsRefresh, formal, historyTrip } = this.data;
+    const visible = sheetTarget && [formal?.id, historyTrip?.id].includes(sheetTarget.tripId);
+    if (sheetNeedsRefresh && sheetTarget && visible) {
       return this.run(async generation => {
-        const latest = await workspaceRequest<FormalTrip>('GET', `/trips/${formal.id}`, this.token);
+        const latest = await workspaceRequest<FormalTrip>('GET', `/trips/${sheetTarget.tripId}`, this.token);
         if (generation !== this.generation) return;
-        this.setData({ formal: this.formalView(latest) });
+        if (sheetTarget.tripId === formal?.id) this.setData({ formal: this.formalView(latest) });
+        else this.showHistoryTrip(latest);
         close();
       });
     }
@@ -416,15 +469,17 @@ Page({
 
   async readSheet(generation: number, token: string, target: Sheet, refreshTrip: boolean) {
     const path = sheetPath(target);
-    const [details, account, formal] = await Promise.all([
+    const current = target.tripId === this.data.formal?.id;
+    const [details, account, trip] = await Promise.all([
       workspaceRequest<{ sheet: ServerSheet }>('GET', path, token),
       workspaceRequest<{ ledger: ServerLedger }>('GET', path + '/ledger', token),
-      refreshTrip && target.tripId === this.data.formal?.id
+      refreshTrip && (current || target.tripId === this.data.historyTrip?.id)
         ? workspaceRequest<FormalTrip>('GET', `/trips/${target.tripId}`, token) : null,
     ]);
     if (generation !== this.generation) return;
     this.setData({ sheet: sheetView(details.sheet, account.ledger), sheetNeedsRefresh: false,
-      ...(formal ? { formal: this.formalView(formal) } : {}) });
+      ...(trip && current ? { formal: this.formalView(trip) } : {}) });
+    if (trip && !current) this.showHistoryTrip(trip);
   },
 
   refreshSheet() {
@@ -443,11 +498,11 @@ Page({
     catch (error) {
       if (generation === this.generation && error instanceof WorkspaceError &&
           ['delivery_changed', 'amendment_changed', 'ledger_changed', 'delivery_preview_required',
-            'sheet_not_reviewed', 'line_not_found', 'preview_not_found', 'unrecorded_delivery'].includes(error.code)) {
+            'sheet_not_reviewed', 'line_not_found', 'preview_not_found', 'receipt_reversed', 'unrecorded_delivery'].includes(error.code)) {
         const staleAmendment = this.data.sheetAction === 'amendment';
         this.pending = null;
         this.setData({
-          ...(staleAmendment ? sheetEditor() : { changePreview: null, paymentPreview: null }),
+          ...(staleAmendment || error.code === 'receipt_reversed' ? sheetEditor() : { changePreview: null, paymentPreview: null }),
           sheetNeedsRefresh: true,
         });
       }
@@ -514,7 +569,7 @@ Page({
     if (!sheet || !this.sheetReady() || this.data.sheetAction) return;
     if (action === 'review' && !sheet.reviewed) this.setData({ sheetAction: 'review' });
     if (action === 'opening' || action === 'receipt') {
-      if (!sheet.reviewed || (action === 'receipt' && !sheet.canReceive)) return;
+      if (!sheet.reviewed) return;
       this.setData({ sheetAction: action, payment: { amount: '', day: localDay(new Date()), source: '' } });
     }
     if (action === 'amendment') {
@@ -522,6 +577,14 @@ Page({
       this.updateAmendment(sheet.lines.map(({ id, product, brand, specification, unit, quantity, price }) =>
         ({ id, product, brand, specification, unit, quantity, price })));
     }
+  },
+
+  beginReceiptCorrection(event: WechatMiniprogram.TouchEvent) {
+    const { sheet, sheetAction } = this.data;
+    if (!sheet?.reviewed || sheetAction || !this.sheetReady()) return;
+    const receipt = sheet.receipts.find(row => row.id === event.currentTarget.dataset.id && !row.reversed);
+    if (!receipt) return;
+    this.setData({ sheetAction: 'receipt-correction', correctionReceipt: { id: receipt.id, total: receipt.total }, error: '' });
   },
 
   confirmReview() {
@@ -538,11 +601,13 @@ Page({
   },
 
   previewPayment() {
-    const { sheet, sheetAction, payment } = this.data;
-    if (!sheet || !this.sheetReady() || (sheetAction !== 'opening' && sheetAction !== 'receipt')) return;
+    const { sheet, sheetAction, payment, correctionReceipt } = this.data;
+    if (!sheet || !this.sheetReady() || !['opening', 'receipt', 'receipt-correction'].includes(sheetAction)) return;
+    const input = sheetAction === 'opening' ? payment
+      : { amount: payment.amount, ...(correctionReceipt ? { receiptId: correctionReceipt.id } : {}) };
     return this.run(async generation => {
-      const { preview } = await this.sheetCommand<{ preview: OpeningPreview | ReceiptPreview }>(
-        `/${sheetAction}/preview`, sheetAction === 'opening' ? payment : { amount: payment.amount }, this.token, sheet);
+      const { preview } = await this.sheetCommand<{ preview: OpeningPreview | ServerReceiptPreview | ReceiptCorrectionPreview }>(
+        `/${sheetAction}/preview`, input, this.token, sheet);
       if (generation === this.generation) this.setData({ paymentPreview: settlementPreview(preview) });
     });
   },
@@ -586,7 +651,7 @@ Page({
   confirmSheetPreview() {
     const { sheetAction, changePreview, paymentPreview } = this.data;
     const previewId = changePreview?.id ?? paymentPreview?.id;
-    if (previewId && this.sheetReady() && sheetAction && sheetAction !== 'review') {
+    if (previewId && this.sheetReady() && sheetAction && sheetAction !== 'review' && paymentPreview?.correction?.canConfirm !== false) {
       return this.writeSheet(`/${sheetAction}/confirm`, { previewId });
     }
   },

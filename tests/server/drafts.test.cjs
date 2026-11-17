@@ -1205,6 +1205,12 @@ test('S7a organizes a private image once, retries failures and protects newer dr
   const nextImage = Buffer.concat([png, Buffer.from('next')]);
   const originalFetch = global.fetch;
   const calls = [];
+  const longOrder = [
+    fixtureLine('', '安井', '箱', '2'),
+    fixtureLine('', '安井', '袋', '3'),
+    ...Array.from({ length: 37 }, (_, index) => ({ action: 'add', product: `手写货品 ${index + 1}`, quantity: '1', unit: '斤' })),
+    { action: 'add', quantity: '2', unit: '件' },
+  ];
   let notifyStarted;
   let release;
   const started = new Promise(resolve => { notifyStarted = resolve; });
@@ -1221,7 +1227,7 @@ test('S7a organizes a private image once, retries failures and protects newer dr
     }
     const extracted = { operations: calls.length === 2
       ? [fixtureLine('老王', '安井', '箱', '2')]
-      : [fixtureLine('', '安井', '箱', '2'), fixtureLine('', '安井', '袋', '3')] };
+      : longOrder };
     return Response.json({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(extracted) } }] });
   };
   const api = await start(db, undefined, undefined, configuredImageModel({ DISPATCH_TEXT_MODEL_KEY: 'fixture' }));
@@ -1265,6 +1271,7 @@ test('S7a organizes a private image once, retries failures and protects newer dr
   assert.equal((await organize(a, recognized, duplicate.id, 'duplicate-image')).data.error, 'duplicate_order_image');
   assert.equal(calls.length, 2);
   assert.equal(calls[1].model, 'deepseek-flash');
+  assert.equal(calls[1].max_tokens, 5000);
   assert.equal(calls[1].response_format.type, 'json_object');
   assert.equal(calls[1].messages[1].content[1].image_url.url, `data:image/png;base64,${png.toString('base64')}`);
   const listed = (await api.request('/v1/materials', { token: a })).data.materials;
@@ -1280,5 +1287,9 @@ test('S7a organizes a private image once, retries failures and protects newer dr
   const continued = await organize(a, saved.data.draft, another.id, 'retry-after-edit');
   assert.equal(continued.status, 200);
   assert.deepEqual(continued.data.draft.customers.map(customer => customer.customer), ['手工修改', '']);
-  assert.deepEqual(continued.data.draft.customers[1].items.map(item => item.unit), ['箱', '袋']);
+  const items = continued.data.draft.customers[1].items;
+  assert.equal(items.length, 40);
+  assert.deepEqual(items.slice(0, 2).map(item => item.unit), ['箱', '袋']);
+  assert.deepEqual([items[39].product, items[39].quantity, items[39].unit, items[39].price], ['', '2', '件', '']);
+  assert.equal((await preview(api, a, continued.data.draft, 'handwritten-needs-review')).status, 400);
 });

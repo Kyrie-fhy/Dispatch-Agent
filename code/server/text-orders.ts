@@ -78,8 +78,10 @@ function mergeOrder(draft: TripDraft, output: unknown, partyNames: Set<string>, 
   function needsReview(message: string): never {
     throw new HttpError(422, image ? 'image_needs_review' : 'text_needs_review', message);
   }
-  if (!isObject(output) || !Array.isArray(output.operations) || output.operations.length > 24
+  if (!isObject(output) || !Array.isArray(output.operations)
       || !readable(output.question ?? '', 250)) invalidModel();
+  if (image && output.operations.length > 64) needsReview('这张图片的明细超过 64 行，请分成几张图片再识别。');
+  if (!image && output.operations.length > 24) invalidModel();
   const question = typeof output.question === 'string' ? output.question.trim() : '';
   if (question) needsReview(question);
   if (!output.operations.length) needsReview('没有找到可录入的明细。请补充客户和货品，或直接手动填写。');
@@ -134,7 +136,9 @@ function mergeOrder(draft: TripDraft, output: unknown, partyNames: Set<string>, 
       }
     } else {
       if (op.target !== undefined && op.target !== null) invalidModel();
-      if (!fields.product) needsReview(image ? '图片中的货品无法确认，请直接手动填写。' : '请说明要添加的货品名称，或直接手动填写。');
+      const product = fields.product;
+      if (!product && (!image || !fields.quantity)) needsReview(image
+        ? '图片中的货品和数量都无法确认，请直接手动填写。' : '请说明要添加的货品名称，或直接手动填写。');
       const matches = customer ? next.customers.filter(entry => normalized(entry.customer) === normalized(customer)) : [];
       if (matches.length > 1) needsReview('草稿有多个同名客户，请手动选择对应客户后添加明细。');
       let owner: CustomerDraft | undefined = matches[0] ?? (image && !customer ? unnamedImageCustomer : undefined);
@@ -148,7 +152,7 @@ function mergeOrder(draft: TripDraft, output: unknown, partyNames: Set<string>, 
         owner.partyId = !customer || partyNames.has(normalized(customer)) ? undefined : null;
       }
       if (image && !customer) unnamedImageCustomer = owner;
-      if (owner.items.some(item => normalized(item.product) === normalized(fields.product!) &&
+      if (product && owner.items.some(item => normalized(item.product) === normalized(product) &&
           productFields.every(field => !item[field].trim() || !fields[field] || normalized(item[field]) === normalized(fields[field])))) {
         needsReview('草稿里有同款或相似货品，请补充规格和单位，或直接修改现有明细。');
       }

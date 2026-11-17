@@ -2,6 +2,7 @@
   <view class="section-title">上传材料</view>
   <view wx:if="{{dirty}}" class="hint">请先回「录单」保存草稿。</view>
   <view wx:elif="{{draftConfirmed}}" class="hint">本趟已确认。开始下一趟后可上传新材料。</view>
+  <view wx:elif="{{deliveryMvp}}" class="hint">每张图片不超过 10 MB。上传后点「识别到草稿」，一次整理一张。</view>
   <view wx:else class="hint">每张图片不超过 10 MB。上传后可手动录入货品。</view>
   <view class="workspace-actions">
     <button size="mini" bindtap="selectMaterial" disabled="{{busy || dirty || draftConfirmed}}">从聊天选图</button>
@@ -11,6 +12,7 @@
     <view>正在上传 {{uploading}}</view>
     <button bindtap="pauseMaterial">暂停上传</button>
   </view>
+  <view wx:if="{{organizingImage}}" class="hint" role="status">正在识别 {{organizingImage}}…</view>
   <view wx:if="{{materialNotice}}" class="hint" role="status">{{materialNotice}}</view>
 </view>
 
@@ -23,6 +25,8 @@
     <view>{{item.label}} · {{item.progress}}%</view>
     <progress wx:if="{{!item.ready}}" percent="{{item.progress}}" stroke-width="4" activeColor="#245849" />
     <view wx:if="{{!item.draftCurrent}}" class="hint">关联原草稿 · 修订 {{item.revision}}</view>
+    <button wx:if="{{deliveryMvp && item.canOrganize}}" size="mini" data-id="{{item.id}}"
+      bindtap="organizeImage" disabled="{{busy || dirty || conflict || preview}}">识别到草稿</button>
     <view wx:if="{{!item.ready}}" class="workspace-actions">
       <button wx:if="{{item.local && (item.id || item.draftCurrent)}}" size="mini" data-key="{{item.requestId}}"
         bindtap="resumeMaterial" disabled="{{busy}}">继续上传</button>

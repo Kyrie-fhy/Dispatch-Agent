@@ -14,8 +14,8 @@ import { HttpError } from './http-error';
 import { configuredWechatLogin, readWechatCode, WechatLogin } from './wechat-login';
 import { isObject } from '../miniprogram/core/orders';
 import { materialChunkBytes } from '../miniprogram/core/materials';
-import { configuredTextModel, TextModel } from './text-model';
-import { readTextOrder, TextOrders } from './text-orders';
+import { configuredImageModel, configuredTextModel, ImageModel, TextModel } from './text-model';
+import { readImageOrder, readTextOrder, TextOrders } from './text-orders';
 
 const bodyLimit = 512 * 1024;
 
@@ -111,8 +111,9 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
     sendJson(response, 200, await trips.workspace(account));
     return;
   }
-  if (method === 'POST' && path === '/v1/text-orders') {
-    const input = readTextOrder(await readJson(request, response));
+  if (method === 'POST' && (path === '/v1/text-orders' || path === '/v1/image-orders')) {
+    const body = await readJson(request, response);
+    const input = path === '/v1/text-orders' ? readTextOrder(body) : readImageOrder(body);
     sendJson(response, 200, await textOrders.apply(account, input, () => store.accountFor(token, wechat?.appId)));
     return;
   }
@@ -223,7 +224,8 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
   throw new HttpError(404, 'not_found', '未找到此接口');
 }
 
-export async function startLocalServer(pool: Pool, port: number, wechat?: WechatLogin, textModel?: TextModel): Promise<Server> {
+export async function startLocalServer(pool: Pool, port: number, wechat?: WechatLogin, textModel?: TextModel,
+  imageModel?: ImageModel): Promise<Server> {
   await requireApplicationRole(pool);
   const store = new DraftStore(pool);
   const trips = new TripStore(pool);
@@ -231,7 +233,7 @@ export async function startLocalServer(pool: Pool, port: number, wechat?: Wechat
   const ledger = new LedgerStore(pool);
   const amendments = new AmendmentStore(pool);
   const materials = new MaterialStore(pool);
-  const textOrders = new TextOrders(pool, textModel);
+  const textOrders = new TextOrders(pool, textModel, imageModel);
   const server = createServer({ requestTimeout: 15_000 }, (request, response) => {
     void handle(pool, store, trips, delivery, ledger, amendments, materials, textOrders, request, response, wechat).catch(error => {
       if (response.destroyed) return;
@@ -262,7 +264,7 @@ async function main(): Promise<void> {
   const pool = new Pool(databaseOptions('DISPATCH_DB_URL'));
   pool.on('error', () => console.error('PostgreSQL 空闲连接已断开，后续请求会重新连接'));
   try {
-    const server = await startLocalServer(pool, port, wechat, configuredTextModel(process.env));
+    const server = await startLocalServer(pool, port, wechat, configuredTextModel(process.env), configuredImageModel(process.env));
     const stop = () => {
       server.close(() => { void pool.end(); });
       server.closeIdleConnections();

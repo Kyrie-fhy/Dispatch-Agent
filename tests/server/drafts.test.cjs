@@ -9,7 +9,7 @@ const { Pool } = require('pg');
 const { migrate } = require('../../code/server-dist/server/migrate');
 const { startLocalServer } = require('../../code/server-dist/server/main');
 const { configuredWechatLogin } = require('../../code/server-dist/server/wechat-login');
-const { configuredTextModel, textPromptVersion } = require('../../code/server-dist/server/text-model');
+const { configuredImageModel, configuredTextModel, textPromptVersion } = require('../../code/server-dist/server/text-model');
 const { HttpError } = require('../../code/server-dist/server/http-error');
 const s6 = require('../fixtures/s6-text-cases.cjs');
 const { materialChunkBytes } = require('../../code/server-dist/miniprogram/core/materials');
@@ -71,11 +71,11 @@ function runPostgresClient(tool, database, args, input) {
   return result.stdout;
 }
 
-async function start(db, wechat, textModel) {
+async function start(db, wechat, textModel, imageModel) {
   const pool = db.pool();
   let server;
   try {
-    server = await startLocalServer(pool, 0, wechat, textModel);
+    server = await startLocalServer(pool, 0, wechat, textModel, imageModel);
   } catch (error) {
     await pool.end();
     throw error;
@@ -1197,4 +1197,88 @@ test('S6 rejects invalid results, cross-account drafts, revoked sessions and lat
   assert.equal(two.status, 200);
   assert.equal((await sendText(api, b, two.data.draft, 'ambiguous-fill', '有歧义的补价')).status, 422);
   assert.deepEqual(await read(api, b), two.data.draft);
+});
+
+test('S7a organizes a private image once, retries failures and protects newer drafts', { timeout: 20_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+lRJ0AAAAASUVORK5CYII=', 'base64');
+  const nextImage = Buffer.concat([png, Buffer.from('next')]);
+  const originalFetch = global.fetch;
+  const calls = [];
+  let notifyStarted;
+  let release;
+  const started = new Promise(resolve => { notifyStarted = resolve; });
+  const finish = new Promise(resolve => { release = resolve; });
+  t.after(() => { release(); global.fetch = originalFetch; });
+  global.fetch = async (url, options) => {
+    if (url !== 'https://api.deepseek.com/chat/completions') return originalFetch(url, options);
+    const body = JSON.parse(options.body);
+    calls.push(body);
+    if (calls.length === 1) return new Response('{}', { status: 503 });
+    if (calls.length === 3) {
+      notifyStarted();
+      await finish;
+    }
+    const extracted = { operations: calls.length === 2
+      ? [fixtureLine('老王', '安井', '箱', '2')]
+      : [fixtureLine('', '安井', '箱', '2'), fixtureLine('', '安井', '袋', '3')] };
+    return Response.json({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(extracted) } }] });
+  };
+  const api = await start(db, undefined, undefined, configuredImageModel({ DISPATCH_TEXT_MODEL_KEY: 'fixture' }));
+  const a = await login(api, 'a');
+  const b = await login(api, 'b');
+  const draft = await read(api, a);
+  const other = await read(api, b);
+  const post = (path, token, body) => api.request(path, { method: 'POST', token, body });
+  const organize = (token, basis, materialId, requestId) => post('/v1/image-orders', token,
+    { draftId: basis.id, revision: basis.revision, materialId, requestId });
+  const register = async (bytes, key) => {
+    const result = await post('/v1/materials', a, materialInput(draft, bytes, key));
+    assert.equal(result.status, 201);
+    return result.data.material;
+  };
+  const upload = (material, bytes) => api.request(`/v1/materials/${material.id}/chunks`,
+    { method: 'PUT', token: a, chunk: bytes, offset: 0 });
+  const original = await register(png, 'image-register');
+  assert.equal((await organize(b, other, original.id, 'cross-account-image')).status, 404);
+  assert.equal((await organize(a, draft, original.id, 'upload-pending')).data.error, 'material_incomplete');
+  assert.equal((await upload(original, png)).data.material.organized, false);
+  const duplicate = await register(png, 'duplicate-image-register');
+  await upload(duplicate, png);
+  const another = await register(nextImage, 'next-image-register');
+  await upload(another, nextImage);
+  const unreadable = Buffer.from('not an image');
+  const invalid = await register(unreadable, 'invalid-image-register');
+  await upload(invalid, unreadable);
+  assert.equal((await organize(a, draft, invalid.id, 'invalid-image')).data.error, 'unsupported_order_image');
+  assert.equal(calls.length, 0);
+  assert.equal((await organize(a, draft, original.id, 'image-order')).data.error, 'image_model_failed');
+  assert.deepEqual(await read(api, a), draft);
+  const applied = await organize(a, draft, original.id, 'image-order');
+  assert.equal(applied.status, 200);
+  const { draft: recognized } = applied.data;
+  assert.equal(recognized.revision, draft.revision + 1);
+  assert.equal(recognized.customers[0].customer, '老王');
+  assert.equal(recognized.customers[0].items[0].price, '');
+  assert.equal((await api.request(`/v1/trips/${draft.id}`, { token: a })).status, 404);
+  assert.deepEqual(await organize(a, draft, original.id, 'image-order'), applied);
+  assert.equal((await organize(a, recognized, duplicate.id, 'duplicate-image')).data.error, 'duplicate_order_image');
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].model, 'deepseek-flash');
+  assert.equal(calls[1].response_format.type, 'json_object');
+  assert.equal(calls[1].messages[1].content[1].image_url.url, `data:image/png;base64,${png.toString('base64')}`);
+  const listed = (await api.request('/v1/materials', { token: a })).data.materials;
+  assert.deepEqual(listed.filter(row => row.organized).map(row => row.id).sort(), [original.id, duplicate.id].sort());
+
+  const late = organize(a, recognized, another.id, 'late-image');
+  await started;
+  const saved = await save(api, a, recognized, 'manual-draft-first', '手工修改').finally(release);
+  assert.equal(saved.status, 200);
+  assert.equal((await late).data.error, 'draft_changed');
+  assert.deepEqual(await read(api, a), saved.data.draft);
+  assert.equal((await api.request(`/v1/materials/${another.id}`, { token: a })).data.material.organized, false);
+  const continued = await organize(a, saved.data.draft, another.id, 'retry-after-edit');
+  assert.equal(continued.status, 200);
+  assert.deepEqual(continued.data.draft.customers.map(customer => customer.customer), ['手工修改', '']);
+  assert.deepEqual(continued.data.draft.customers[1].items.map(item => item.unit), ['箱', '袋']);
 });

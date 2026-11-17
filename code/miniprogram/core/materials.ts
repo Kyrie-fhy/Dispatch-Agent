@@ -17,4 +17,5 @@ export interface Material extends MaterialSource {
   received: number;
   status: 'uploading' | 'ready';
   draftCurrent: boolean;
+  organized: boolean;
 }

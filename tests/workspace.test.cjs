@@ -500,3 +500,41 @@ test('S6 workspace keeps failed text for retry and confirms only after draft rev
   assert.equal(page.data.sheet.balance.due, '0.00');
   assertIdle();
 });
+
+test('S7a image action keeps uploads on failure and returns to the editable draft on retry', async () => {
+  const { page, take, login, assertIdle } = setup(true);
+  wx.getStorageSync = () => [];
+  const start = data('', 2);
+  await login('s7-code', tokenA, start);
+  const photo = { id: 'photo', requestId: 'upload', draftId: tripId, revision: 0, name: '订单.png',
+    digest: 'a'.repeat(64), size: 60, received: 60, status: 'ready', draftCurrent: false, organized: false };
+  const materials = [
+    photo, { ...photo, id: 'previous-trip', requestId: 'old-upload', draftId: 'old-draft' },
+    { ...photo, id: 'organized', requestId: 'done-upload', organized: true },
+  ];
+  const enter = page.selectSection(tap({ section: 'materials' }));
+  (await take('GET', '/materials', tokenA)).respond(200, { materials });
+  await enter;
+  assert.deepEqual(page.data.materialRows.map(row => row.canOrganize), [true, false, false]);
+  const event = tap({ id: photo.id });
+  const failed = page.organizeImage(event);
+  const request = await take('POST', '/image-orders', tokenA);
+  assert.equal(request.data.revision, 2);
+  assert.equal(request.data.materialId, photo.id);
+  request.timeout();
+  await failed;
+  assert.equal(page.data.section, 'materials');
+  assert.equal(page.data.materialRows[0].canOrganize, true);
+  assert.deepEqual(page.data.draft, start.draft);
+
+  const after = data('老王', 3).draft;
+  after.customers[0].items[0].price = '';
+  const retry = page.organizeImage(event);
+  (await take('POST', '/image-orders', tokenA, request.data)).respond(200, { draft: after });
+  await retry;
+  assert.equal(page.data.section, 'draft');
+  assert.match(page.data.textQuestions[0].issues[0], /单价/);
+  assert.deepEqual(page.data.draft, after);
+  assert.equal(page.data.formal, null);
+  assertIdle();
+});

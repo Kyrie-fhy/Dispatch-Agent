@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { emptyTrip } = require('../code/dist/core/trips');
+const { materialChunkBytes } = require('../code/dist/core/materials');
 
 const tokenA = 'a'.repeat(43);
 const tokenB = 'b'.repeat(43);
@@ -53,7 +54,7 @@ function setup() {
     assert.equal(request.header.Authorization, token ? `Bearer ${token}` : undefined);
     if (input !== undefined) assert.deepEqual(request.data, input);
     return {
-      data: request.data,
+      data: request.data, header: request.header,
       respond: (statusCode, data) => request.success({ statusCode, data }),
       timeout: () => request.fail({ errMsg: 'request:fail timeout' }),
     };
@@ -81,6 +82,92 @@ function setup() {
 
   return { page, take, beginLogin, login, editName, assertIdle: () => assert.deepEqual(queue, []) };
 }
+
+test('S5 materials keep the original local file for resume and clear another account’s records', async () => {
+  const { page, take, login, assertIdle } = setup();
+  const cache = new Map();
+  const files = new Map([['temp', new ArrayBuffer(materialChunkBytes + 5)]]);
+  const reads = [];
+  const digest = 'f'.repeat(64);
+  Object.assign(global.wx, {
+    env: { USER_DATA_PATH: 'wxfile://private' },
+    getStorageSync(key) {
+      assert.equal(key, 'dispatch-s5-material-outbox');
+      return structuredClone(cache.get(key) ?? '');
+    },
+    setStorageSync(key, value) {
+      assert.equal(key, 'dispatch-s5-material-outbox');
+      cache.set(key, structuredClone(value));
+    },
+    chooseMessageFile: ({ success }) => success({ tempFiles: [{ path: 'temp', name: '材料.png' }] }),
+    getFileSystemManager: () => ({
+      getFileInfo: ({ filePath, success }) => success({ size: files.get(filePath).byteLength, digest }),
+      copyFile: ({ srcPath, destPath, success }) => { files.set(destPath, files.get(srcPath)); success(); },
+      unlink: ({ filePath }) => files.delete(filePath),
+      readFile: ({ filePath, position, length, success }) => {
+        reads.push(position);
+        success({ data: files.get(filePath).slice(position, position + length) });
+      },
+    }),
+  });
+
+  const workspace = data('上传材料');
+  await login('account-a-1', tokenA, workspace);
+  async function enter(token, materials) {
+    const done = page.selectSection(tap({ section: 'materials' }));
+    (await take('GET', '/materials', token)).respond(200, { materials });
+    await done;
+  }
+  await enter(tokenA, []);
+  let done = page.selectMaterial(tap({}));
+  const begin = await take('POST', '/materials', tokenA);
+  assert.equal(begin.data.draftId, workspace.draft.id);
+  assert.equal(begin.data.digest, digest);
+  const material = { ...begin.data, id: 'saved-file', received: 0, draftCurrent: true, status: 'uploading' };
+  begin.respond(201, { material });
+  const first = await take('PUT', '/materials/saved-file/chunks', tokenA);
+  assert.equal(first.header['X-Material-Offset'], '0');
+  assert.equal(first.header['Content-Type'], 'application/octet-stream');
+  assert.equal(first.data.byteLength, materialChunkBytes);
+  const uploaded = { ...material, received: materialChunkBytes };
+  first.respond(200, { material: uploaded });
+  (await take('PUT', '/materials/saved-file/chunks', tokenA)).timeout();
+  await done;
+  assert.equal(page.data.materialRows[0].progress, 99);
+  assert.equal(page.data.materialRows[0].local, true);
+
+  async function leave(token) {
+    const done = page.logout();
+    assert.deepEqual(page.data.materialRows, []);
+    (await take('DELETE', '/session', token)).respond(204);
+    await done;
+  }
+  await leave(tokenA);
+  const other = data('另一个账号');
+  other.draft.id = 'other-account-draft';
+  await login('account-b', tokenB, other);
+  await enter(tokenB, []);
+  assert.deepEqual(page.data.materialRows, []);
+  await enter(tokenB, [{ ...material, id: 'other-account-file', draftId: other.draft.id, status: 'ready', received: material.size }]);
+  assert.equal(page.data.materialRows[0].local, false);
+  assert.equal(cache.get('dispatch-s5-material-outbox').length, 1);
+  await leave(tokenB);
+
+  await login('account-a-2', tokenA, workspace);
+  await enter(tokenA, [uploaded]);
+  done = page.resumeMaterial(tap({ key: uploaded.requestId }));
+  (await take('GET', '/materials/saved-file', tokenA)).respond(200, { material: uploaded });
+  const finalChunk = await take('PUT', '/materials/saved-file/chunks', tokenA);
+  assert.equal(finalChunk.header['X-Material-Offset'], String(materialChunkBytes));
+  assert.equal(finalChunk.data.byteLength, 5);
+  finalChunk.respond(200, { material: { ...material, received: material.size, status: 'ready' } });
+  await done;
+  assert.equal(page.data.materialRows[0].ready, true);
+  assert.equal(page.data.materialRows[0].progress, 100);
+  assert.deepEqual(cache.get('dispatch-s5-material-outbox'), []);
+  assert.deepEqual(reads, [0, materialChunkBytes, materialChunkBytes]);
+  assertIdle();
+});
 
 test('S5 customer sheet retains write identity on timeout and requires a new preview after a concurrent change', async () => {
   const { page, take, login, assertIdle } = setup();

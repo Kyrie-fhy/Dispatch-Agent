@@ -1,0 +1,37 @@
+<view class="card">
+  <view class="section-title">上传材料</view>
+  <view wx:if="{{dirty}}" class="hint">请先回「录单」保存草稿。</view>
+  <view wx:elif="{{draftConfirmed}}" class="hint">本趟已确认。开始下一趟后可上传新材料。</view>
+  <view wx:else class="hint">图片或音频，单个文件不超过 10 MB。上传后可手动录入货品。</view>
+  <view class="workspace-actions">
+    <button size="mini" bindtap="selectMaterial" disabled="{{busy || dirty || draftConfirmed}}">从聊天选文件</button>
+    <button size="mini" bindtap="selectMaterial" data-album="yes" disabled="{{busy || dirty || draftConfirmed}}">从相册选图</button>
+  </view>
+  <view wx:if="{{uploading}}" class="line">
+    <view>正在上传 {{uploading}}</view>
+    <button bindtap="pauseMaterial">暂停上传</button>
+  </view>
+  <view wx:if="{{materialNotice}}" class="hint" role="status">{{materialNotice}}</view>
+</view>
+
+<view class="card">
+  <view class="section-title">上传记录</view>
+  <view wx:if="{{busy && !materialLoaded && !uploading}}" class="hint">正在读取上传记录…</view>
+  <view wx:elif="{{materialLoaded && !materialRows.length}}" class="hint">还没有上传记录。</view>
+  <view class="line" wx:for="{{materialRows}}" wx:key="requestId">
+    <view class="product">{{item.name}}</view>
+    <view>{{item.label}} · {{item.progress}}%</view>
+    <progress wx:if="{{!item.ready}}" percent="{{item.progress}}" stroke-width="4" activeColor="#245849" />
+    <view wx:if="{{!item.draftCurrent}}" class="hint">关联原草稿 · 修订 {{item.revision}}</view>
+    <view wx:if="{{!item.ready}}" class="workspace-actions">
+      <button wx:if="{{item.local && (item.id || item.draftCurrent)}}" size="mini" data-key="{{item.requestId}}"
+        bindtap="resumeMaterial" disabled="{{busy}}">继续上传</button>
+      <button wx:if="{{item.id}}" size="mini" data-key="{{item.requestId}}" bindtap="selectMaterial" disabled="{{busy}}">从聊天选原文件</button>
+      <button wx:if="{{item.id}}" size="mini" data-key="{{item.requestId}}" data-album="yes"
+        bindtap="selectMaterial" disabled="{{busy}}">从相册选原图</button>
+      <button wx:if="{{!item.id}}" size="mini" data-key="{{item.requestId}}"
+        bindtap="discardLocalMaterial" disabled="{{busy}}">移除本机文件</button>
+    </view>
+  </view>
+  <button bindtap="refreshMaterials" disabled="{{busy}}">刷新上传记录</button>
+</view>

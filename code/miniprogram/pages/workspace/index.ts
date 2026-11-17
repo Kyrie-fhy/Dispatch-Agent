@@ -1,13 +1,15 @@
 import { emptyItem, ItemInput, money } from '../../core/orders';
+import { Material, MaterialSource } from '../../core/materials';
 import { localDay, OpeningPreview, ReceiptPreview, Sheet } from '../../core/settlement';
 import { CustomerDraft, emptyCustomer, isTripDraft, latest, PickingChange, PickingLine, pickingChanges, pickingKey, TripDraft } from '../../core/trips';
 import { newId } from '../../services/ids';
+import { chooseMaterial, forgetStaged, materialInfo, readChunk, sameMaterial, stagedMaterials, stageMaterial, uploadChunk } from '../../services/materials';
 import { FormalTrip, revokeSession, TripPreview, wechatCode, Workspace, WorkspaceError, workspaceRequest } from '../../services/workspace';
 import { deliveryLabel, editLines, errorMessage, formLines, lineView, tripView } from '../order-view';
 import { AmendmentPreview, balanceChange, DeliveryMark, DeliveryPreview, ServerLedger, ServerSheet, settlementPreview,
   SheetAction, sheetPath, sheetView } from './sheet-view';
 
-type Section = 'draft' | 'picking' | 'delivery';
+type Section = 'draft' | 'picking' | 'delivery' | 'materials';
 type PreviewView = ReturnType<typeof tripView> & { previewId: string; identities: string[] };
 type FormalView = ReturnType<typeof tripView> & {
   id: string;
@@ -55,6 +57,9 @@ function initialData() {
     conflict: null as Workspace | null,
     ...sheetEditor(), sheetTarget: null as Sheet | null, sheet: null as ReturnType<typeof sheetView> | null,
     sheetNeedsRefresh: false, sheetRetry: false,
+    materialRows: [] as (MaterialSource & { id: string; label: string; draftCurrent: boolean;
+      ready: boolean; local: boolean; progress: number })[],
+    materialLoaded: false, uploading: '', materialNotice: '',
   };
 }
 
@@ -65,6 +70,8 @@ Page({
   retiredTokens: [] as string[],
   pending: null as { key: string; requestId: string } | null,
   unresolvedSheetWrite: null as { route: string; input: object } | null,
+  materials: [] as Material[],
+  materialTransfer: null as { paused: boolean } | null,
 
   async run(action: (generation: number) => Promise<void>) {
     if (this.data.busy) return;
@@ -89,6 +96,8 @@ Page({
     this.token = '';
     this.pending = null;
     this.unresolvedSheetWrite = null;
+    this.materialTransfer = null;
+    this.materials = [];
     this.setData({ ...initialData(), error, revokeFailed: this.retiredTokens.length > 0 });
     return token;
   },
@@ -100,7 +109,13 @@ Page({
     this.retiredTokens = [];
     this.pending = null;
     this.unresolvedSheetWrite = null;
+    this.materialTransfer = null;
+    this.materials = [];
     for (const token of tokens) void revokeSession(token).catch(() => {});
+  },
+
+  onHide() {
+    this.pauseMaterial();
   },
 
   login() {
@@ -177,6 +192,7 @@ Page({
       dirty: false, conflict: null, preview: null,
     });
     this.showDraft(workspace.draft, current);
+    if (this.data.section === 'materials') await this.loadMaterials(generation, token);
   },
 
   formalView({ trip, picking }: FormalTrip): FormalView {
@@ -189,7 +205,9 @@ Page({
 
   selectSection(event: WechatMiniprogram.TouchEvent) {
     const section = event.currentTarget.dataset.section;
-    if (this.data.draft && !this.data.sheetTarget && ['draft', 'picking', 'delivery'].includes(section)) this.setData({ section });
+    if (!this.data.draft || this.data.busy || this.data.sheetTarget || !['draft', 'picking', 'delivery', 'materials'].includes(section)) return;
+    this.setData({ section, error: '' });
+    if (section === 'materials') return this.refreshMaterials();
   },
 
   showDraft(draft: TripDraft, id?: string) {
@@ -585,6 +603,117 @@ Page({
     if (!this.data.busy && !this.data.sheetRetry) {
       this.pending = null;
       this.setData({ ...sheetEditor(), error: '' });
+    }
+  },
+
+  showMaterials() {
+    const local = stagedMaterials();
+    const { draft, draftConfirmed } = this.data;
+    const rows = this.materials.map(material => ({
+      ...material, label: material.status === 'ready' ? '已上传' : '待续传',
+      ready: material.status === 'ready', local: local.some(source => sameMaterial(source, material)),
+      progress: Math.floor(material.received * 100 / material.size),
+    }));
+    const pending = local.filter(source => source.draftId === draft?.id &&
+      !this.materials.some(material => sameMaterial(material, source))).map(source => ({
+      ...source, id: '', label: '待登记', ready: false, local: true, progress: 0,
+      draftCurrent: !draftConfirmed && source.revision === draft?.revision,
+    }));
+    this.setData({ materialRows: [...pending, ...rows] });
+  },
+
+  async loadMaterials(generation: number, token: string) {
+    const { materials } = await workspaceRequest<{ materials: Material[] }>('GET', '/materials', token);
+    if (generation !== this.generation) return;
+    this.materials = materials;
+    forgetStaged(materials.filter(material => material.status === 'ready'));
+    this.showMaterials();
+    this.setData({ materialLoaded: true });
+  },
+
+  refreshMaterials() {
+    if (!this.token) return;
+    return this.run(generation => this.loadMaterials(generation, this.token));
+  },
+
+  selectMaterial(event: WechatMiniprogram.TouchEvent) {
+    const { draft, dirty, draftConfirmed } = this.data;
+    const { album, key } = event.currentTarget.dataset;
+    const original = key ? this.materials.find(material => material.requestId === key && material.status === 'uploading') : undefined;
+    if (!this.token || (key && !original) || (!original && (!draft || dirty || draftConfirmed))) return;
+    return this.run(async generation => {
+      const token = this.token;
+      const selected = await chooseMaterial(album === 'yes');
+      if (!selected || generation !== this.generation) return;
+      const { size, digest } = await materialInfo(selected.path);
+      if (generation !== this.generation) return;
+      if (original && (original.size !== size || original.digest !== digest)) {
+        throw new Error('选择的文件与原材料不匹配，请重新选择原文件');
+      }
+      const source: MaterialSource = original ?? {
+        requestId: newId(), draftId: draft!.id, revision: draft!.revision, name: selected.name, size, digest,
+      };
+      await stageMaterial(source, selected.path);
+      if (generation !== this.generation) return;
+      this.showMaterials();
+      await this.transferMaterial(generation, token, source, original?.id);
+    });
+  },
+
+  resumeMaterial(event: WechatMiniprogram.TouchEvent) {
+    const row = this.data.materialRows.find(item => item.requestId === event.currentTarget.dataset.key);
+    if (!this.token || !row || row.ready || !row.local || (!row.id && !row.draftCurrent)) return;
+    return this.run(generation => this.transferMaterial(generation, this.token, row, row.id));
+  },
+
+  discardLocalMaterial(event: WechatMiniprogram.TouchEvent) {
+    const row = this.data.materialRows.find(item => item.requestId === event.currentTarget.dataset.key);
+    if (!this.token || !row || row.id || this.data.busy) return;
+    return this.run(async () => {
+      forgetStaged([row]);
+      this.showMaterials();
+    });
+  },
+
+  pauseMaterial() {
+    if (this.materialTransfer) {
+      this.materialTransfer.paused = true;
+      this.setData({ materialNotice: '正在暂停，已收到的分块会保留。' });
+    }
+  },
+
+  async transferMaterial(generation: number, token: string, source: MaterialSource, id?: string) {
+    const transfer = { paused: false };
+    this.materialTransfer = transfer;
+    this.setData({ uploading: source.name, materialNotice: '' });
+    try {
+      const { requestId, draftId, revision, name, size, digest } = source;
+      let { material } = id
+        ? await workspaceRequest<{ material: Material }>('GET', `/materials/${id}`, token)
+        : await workspaceRequest<{ material: Material }>('POST', '/materials', token, { requestId, draftId, revision, name, size, digest });
+      while (generation === this.generation) {
+        const saved = this.materials.some(item => item.id === material.id);
+        this.materials = saved ? this.materials.map(item => item.id === material.id ? material : item) : [material, ...this.materials];
+        if (material.status === 'ready') {
+          forgetStaged([material]);
+          this.showMaterials();
+          this.setData({ materialNotice: '材料已上传。' });
+          return;
+        }
+        this.showMaterials();
+        if (transfer.paused) break;
+        const content = await readChunk(material);
+        if (generation !== this.generation || transfer.paused) break;
+        const next = (await uploadChunk(material, content, token)).material;
+        if (next.received <= material.received) throw new Error('上传进度未更新，请重试续传');
+        material = next;
+      }
+      if (generation === this.generation) this.setData({ materialNotice: '已暂停，可从已上传位置继续。' });
+    } finally {
+      if (generation === this.generation) {
+        this.materialTransfer = null;
+        this.setData({ uploading: '' });
+      }
     }
   },
 });

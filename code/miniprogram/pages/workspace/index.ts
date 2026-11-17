@@ -1,17 +1,50 @@
-import { emptyItem } from '../../core/orders';
-import { CustomerDraft, emptyCustomer, isTripDraft, latest, PickingChange, PickingLine, pickingChanges, TripDraft } from '../../core/trips';
+import { emptyItem, ItemInput, money } from '../../core/orders';
+import { localDay, OpeningPreview, ReceiptPreview, Sheet } from '../../core/settlement';
+import { CustomerDraft, emptyCustomer, isTripDraft, latest, PickingChange, PickingLine, pickingChanges, pickingKey, TripDraft } from '../../core/trips';
 import { newId } from '../../services/ids';
 import { FormalTrip, revokeSession, TripPreview, wechatCode, Workspace, WorkspaceError, workspaceRequest } from '../../services/workspace';
-import { deliveryLabel, editLines, errorMessage, formLines, tripView } from '../order-view';
+import { deliveryLabel, editLines, errorMessage, formLines, lineView, tripView } from '../order-view';
+import { AmendmentPreview, balanceChange, DeliveryMark, DeliveryPreview, ServerLedger, ServerSheet, settlementPreview,
+  SheetAction, sheetPath, sheetView } from './sheet-view';
 
 type Section = 'draft' | 'picking' | 'delivery';
 type PreviewView = ReturnType<typeof tripView> & { previewId: string; identities: string[] };
 type FormalView = ReturnType<typeof tripView> & {
+  id: string;
   version: number;
   statuses: Record<string, string>;
   picking: PickingLine[];
   changes: PickingChange[];
 };
+
+function sheetEditor() {
+  return {
+    sheetAction: '' as SheetAction | '',
+    changePreview: null as null | {
+      id: string;
+      title: string;
+      rows: ReturnType<typeof balanceChange>;
+      changes?: ReturnType<typeof amendmentChanges>;
+      picking?: PickingChange[];
+      unchecked?: ReturnType<typeof lineView>[];
+    },
+    paymentPreview: null as ReturnType<typeof settlementPreview> | null,
+    payment: { amount: '', day: '', source: '' },
+    amendment: [] as ItemInput[],
+    amendmentForm: [] as ReturnType<typeof formLines>,
+    replacements: {} as Record<string, DeliveryMark>,
+    replacementLines: [] as { id: string; label: string; status: DeliveryMark | '' }[],
+  };
+}
+
+function amendmentChanges(result: AmendmentPreview) {
+  return result.changes.map(change => ({
+    id: change.id, before: change.before ? lineView(change.before) : null,
+    after: change.after ? lineView(change.after) : null,
+    beforeStatus: change.beforeStatus ? deliveryLabel[change.beforeStatus] : '',
+    afterStatus: change.afterStatus ? deliveryLabel[change.afterStatus] : '',
+  }));
+}
 
 function initialData() {
   return {
@@ -20,6 +53,8 @@ function initialData() {
     form: [] as ReturnType<typeof formLines>, parties: [] as { id: string; name: string; label: string }[],
     partyLabel: '', dirty: false, preview: null as PreviewView | null, formal: null as FormalView | null,
     conflict: null as Workspace | null,
+    ...sheetEditor(), sheetTarget: null as Sheet | null, sheet: null as ReturnType<typeof sheetView> | null,
+    sheetNeedsRefresh: false, sheetRetry: false,
   };
 }
 
@@ -29,6 +64,7 @@ Page({
   token: '',
   retiredTokens: [] as string[],
   pending: null as { key: string; requestId: string } | null,
+  unresolvedSheetWrite: null as { route: string; input: object } | null,
 
   async run(action: (generation: number) => Promise<void>) {
     if (this.data.busy) return;
@@ -52,6 +88,7 @@ Page({
     this.generation += 1;
     this.token = '';
     this.pending = null;
+    this.unresolvedSheetWrite = null;
     this.setData({ ...initialData(), error, revokeFailed: this.retiredTokens.length > 0 });
     return token;
   },
@@ -62,6 +99,7 @@ Page({
     this.token = '';
     this.retiredTokens = [];
     this.pending = null;
+    this.unresolvedSheetWrite = null;
     for (const token of tokens) void revokeSession(token).catch(() => {});
   },
 
@@ -112,7 +150,7 @@ Page({
   },
 
   reload() {
-    if (!this.token || this.data.dirty) return;
+    if (!this.token || this.data.dirty || this.data.sheetTarget) return;
     return this.run(generation => this.restore(generation, this.token));
   },
 
@@ -145,13 +183,13 @@ Page({
     const version = latest(trip);
     const previous = trip.versions[trip.versions.length - 2];
     const statuses = Object.fromEntries(Object.entries(trip.statuses).map(([id, status]) => [id, deliveryLabel[status]]));
-    return { ...tripView(version), version: version.version, picking, statuses,
+    return { ...tripView(version), id: trip.id, version: version.version, picking, statuses,
       changes: previous ? pickingChanges(previous.customers, version.customers) : [] };
   },
 
   selectSection(event: WechatMiniprogram.TouchEvent) {
     const section = event.currentTarget.dataset.section;
-    if (this.data.draft && ['draft', 'picking', 'delivery'].includes(section)) this.setData({ section });
+    if (this.data.draft && !this.data.sheetTarget && ['draft', 'picking', 'delivery'].includes(section)) this.setData({ section });
   },
 
   showDraft(draft: TripDraft, id?: string) {
@@ -214,18 +252,31 @@ Page({
   editItem(event: WechatMiniprogram.Input) {
     const active = this.data.active;
     const { id, field } = event.currentTarget.dataset;
+    if (this.data.sheetAction === 'amendment') {
+      this.updateAmendment(editLines(this.data.amendment, id, field, event.detail.value));
+      return;
+    }
     if (active && active.items.some(item => item.id === id)) {
       this.editActive({ ...active, items: editLines(active.items, id, field, event.detail.value) });
     }
   },
 
   addItem() {
+    if (this.data.sheetAction === 'amendment') {
+      this.updateAmendment([...this.data.amendment, emptyItem(newId())]);
+      return;
+    }
     const active = this.data.active;
     if (active) this.editActive({ ...active, items: [...active.items, emptyItem(newId())] });
   },
 
   removeItem(event: WechatMiniprogram.TouchEvent) {
     const active = this.data.active;
+    if (this.data.sheetAction === 'amendment') {
+      const { amendment } = this.data;
+      if (amendment.length > 1) this.updateAmendment(amendment.filter(item => item.id !== event.currentTarget.dataset.id));
+      return;
+    }
     if (active && active.items.length > 1) {
       this.editActive({ ...active, items: active.items.filter(item => item.id !== event.currentTarget.dataset.id) });
     }
@@ -319,5 +370,221 @@ Page({
       await this.command('POST', '/trips/next-draft', token, { draftId: draft.id });
       if (generation === this.generation) await this.restore(generation, token);
     });
+  },
+
+  openSheet(event: WechatMiniprogram.TouchEvent) {
+    const { tripId, sheetId } = event.currentTarget.dataset;
+    if (!this.token || this.data.busy || this.data.sheetRetry || !tripId || !sheetId) return;
+    this.setData({ ...sheetEditor(), sheetTarget: { tripId, sheetId }, sheet: null, sheetNeedsRefresh: false });
+    return this.refreshSheet();
+  },
+
+  closeSheet() {
+    if (this.data.busy || this.data.sheetRetry) return;
+    const close = () => {
+      this.setData({ ...sheetEditor(), sheetTarget: null, sheet: null, sheetNeedsRefresh: false, error: '' });
+    };
+    const { sheetTarget, sheetNeedsRefresh, formal } = this.data;
+    if (sheetNeedsRefresh && formal && sheetTarget?.tripId === formal.id) {
+      return this.run(async generation => {
+        const latest = await workspaceRequest<FormalTrip>('GET', `/trips/${formal.id}`, this.token);
+        if (generation !== this.generation) return;
+        this.setData({ formal: this.formalView(latest) });
+        close();
+      });
+    }
+    close();
+  },
+
+  async readSheet(generation: number, token: string, target: Sheet, refreshTrip: boolean) {
+    const path = sheetPath(target);
+    const [details, account, formal] = await Promise.all([
+      workspaceRequest<{ sheet: ServerSheet }>('GET', path, token),
+      workspaceRequest<{ ledger: ServerLedger }>('GET', path + '/ledger', token),
+      refreshTrip && target.tripId === this.data.formal?.id
+        ? workspaceRequest<FormalTrip>('GET', `/trips/${target.tripId}`, token) : null,
+    ]);
+    if (generation !== this.generation) return;
+    this.setData({ sheet: sheetView(details.sheet, account.ledger), sheetNeedsRefresh: false,
+      ...(formal ? { formal: this.formalView(formal) } : {}) });
+  },
+
+  refreshSheet() {
+    const { sheetTarget, sheetNeedsRefresh } = this.data;
+    if (!sheetTarget || !this.token || this.data.sheetRetry) return;
+    return this.run(generation => this.readSheet(generation, this.token, sheetTarget, sheetNeedsRefresh));
+  },
+
+  sheetReady() {
+    return this.token && this.data.sheet && !this.data.sheetRetry && !this.data.sheetNeedsRefresh && !this.data.busy;
+  },
+
+  async sheetCommand<T>(route: string, input: object, token: string, target: Sheet) {
+    const generation = this.generation;
+    try { return await this.command<T>('POST', sheetPath(target) + route, token, input); }
+    catch (error) {
+      if (generation === this.generation && error instanceof WorkspaceError &&
+          ['delivery_changed', 'amendment_changed', 'ledger_changed', 'delivery_preview_required',
+            'sheet_not_reviewed', 'line_not_found', 'preview_not_found', 'unrecorded_delivery'].includes(error.code)) {
+        const staleAmendment = this.data.sheetAction === 'amendment';
+        this.pending = null;
+        this.setData({
+          ...(staleAmendment ? sheetEditor() : { changePreview: null, paymentPreview: null }),
+          sheetNeedsRefresh: true,
+        });
+      }
+      throw error;
+    }
+  },
+
+  writeSheet(route: string, input: object) {
+    const target = this.data.sheetTarget;
+    if (!target || !this.token) return;
+    return this.run(async generation => {
+      const token = this.token;
+      try { await this.sheetCommand(route, input, token, target); }
+      catch (error) {
+        if (generation === this.generation && !(error instanceof WorkspaceError && error.status >= 400 && error.status < 500)) {
+          this.unresolvedSheetWrite = { route, input };
+          this.setData({ sheetRetry: true });
+          throw new Error('暂未收到保存结果，请重试这次提交');
+        }
+        if (generation === this.generation) {
+          this.unresolvedSheetWrite = null;
+          this.setData({ sheetRetry: false });
+        }
+        throw error;
+      }
+      if (generation !== this.generation) return;
+      this.pending = null;
+      this.unresolvedSheetWrite = null;
+      this.setData({ ...sheetEditor(), sheetRetry: false, sheetNeedsRefresh: true });
+      try { await this.readSheet(generation, token, target, true); }
+      catch (error) {
+        if (error instanceof WorkspaceError && error.status === 401) throw error;
+        throw new Error('本次操作已保存，请重新读取单据');
+      }
+    });
+  },
+
+  retrySheetWrite() {
+    const retry = this.unresolvedSheetWrite;
+    if (retry) return this.writeSheet(retry.route, retry.input);
+  },
+
+  markDelivery(event: WechatMiniprogram.TouchEvent) {
+    const sheet = this.data.sheet;
+    if (!sheet || !this.sheetReady() || this.data.sheetAction) return;
+    const lineId = event.currentTarget.dataset.id ?? null;
+    const status = event.currentTarget.dataset.status as DeliveryMark;
+    const input = { version: sheet.version, statusRevision: sheet.statusRevision, lineId, status };
+    if (!sheet.reviewed) return this.writeSheet('/delivery', input);
+    return this.run(async generation => {
+      const { preview } = await this.sheetCommand<{ preview: DeliveryPreview }>('/delivery/preview', input, this.token, sheet);
+      if (generation !== this.generation) return;
+      const line = sheet.lines.find(line => line.id === lineId);
+      const label = line ? `${line.brand} ${line.product} · ${line.specification} · ${line.unit}` : '本客户全部明细';
+      this.setData({ sheetAction: 'delivery', changePreview: {
+        id: preview.previewId, title: `${label} → ${deliveryLabel[status]}`, rows: balanceChange(preview.before, preview.after),
+      } });
+    });
+  },
+
+  beginSheetAction(event: WechatMiniprogram.TouchEvent) {
+    const sheet = this.data.sheet;
+    const action = event.currentTarget.dataset.action;
+    if (!sheet || !this.sheetReady() || this.data.sheetAction) return;
+    if (action === 'review' && !sheet.reviewed) this.setData({ sheetAction: 'review' });
+    if (action === 'opening' || action === 'receipt') {
+      if (!sheet.reviewed || (action === 'receipt' && !sheet.canReceive)) return;
+      this.setData({ sheetAction: action, payment: { amount: '', day: localDay(new Date()), source: '' } });
+    }
+    if (action === 'amendment') {
+      this.setData({ sheetAction: 'amendment' });
+      this.updateAmendment(sheet.lines.map(({ id, product, brand, specification, unit, quantity, price }) =>
+        ({ id, product, brand, specification, unit, quantity, price })));
+    }
+  },
+
+  confirmReview() {
+    const sheet = this.data.sheet;
+    if (sheet && this.sheetReady() && this.data.sheetAction === 'review' && !sheet.hasUnrecorded) {
+      return this.writeSheet('/review', { version: sheet.version, statusRevision: sheet.statusRevision });
+    }
+  },
+
+  editPayment(event: WechatMiniprogram.Input | WechatMiniprogram.PickerChange) {
+    const { field } = event.currentTarget.dataset;
+    if (!this.sheetReady() || this.data.paymentPreview || !['amount', 'day', 'source'].includes(field)) return;
+    this.setData({ payment: { ...this.data.payment, [field]: event.detail.value } });
+  },
+
+  previewPayment() {
+    const { sheet, sheetAction, payment } = this.data;
+    if (!sheet || !this.sheetReady() || (sheetAction !== 'opening' && sheetAction !== 'receipt')) return;
+    return this.run(async generation => {
+      const { preview } = await this.sheetCommand<{ preview: OpeningPreview | ReceiptPreview }>(
+        `/${sheetAction}/preview`, sheetAction === 'opening' ? payment : { amount: payment.amount }, this.token, sheet);
+      if (generation === this.generation) this.setData({ paymentPreview: settlementPreview(preview) });
+    });
+  },
+
+  updateAmendment(items: ItemInput[], chosen?: Record<string, DeliveryMark>) {
+    const sheet = this.data.sheet;
+    if (!sheet || !this.sheetReady() || this.data.changePreview || this.data.sheetAction !== 'amendment') return;
+    const originals = new Map(sheet.lines.map(line => [line.id, line]));
+    const statuses = chosen ?? this.data.replacements;
+    const replacementLines = items.flatMap(item => {
+      const old = originals.get(item.id);
+      return old?.status === 'delivered' && pickingKey(old) !== pickingKey(item)
+        ? [{ id: item.id, status: statuses[item.id] ?? '', label: `${item.brand} ${item.product} · ${item.specification} · ${item.unit}` }] : [];
+    });
+    const replacements = Object.fromEntries(replacementLines.filter(line => line.status).map(line => [line.id, line.status]));
+    this.setData({ amendment: items, amendmentForm: formLines(items), replacements, replacementLines });
+  },
+
+  chooseReplacement(event: WechatMiniprogram.TouchEvent) {
+    const { id, status } = event.currentTarget.dataset;
+    this.updateAmendment(this.data.amendment, { ...this.data.replacements, [id]: status });
+  },
+
+  previewAmendment() {
+    const { sheet, sheetAction, amendment, replacements } = this.data;
+    if (!sheet || !this.sheetReady() || sheetAction !== 'amendment') return;
+    return this.run(async generation => {
+      const { preview } = await this.sheetCommand<{ preview: AmendmentPreview }>('/amendment/preview',
+        { version: sheet.version, statusRevision: sheet.statusRevision, items: amendment, replacementStatuses: replacements },
+        this.token, sheet);
+      if (generation !== this.generation) return;
+      this.setData({ changePreview: {
+        id: preview.previewId, title: '正式单更正预览',
+        rows: [{ label: '订单金额', before: money(preview.orderCents.before), after: money(preview.orderCents.after) },
+          ...balanceChange(preview.before, preview.after)],
+        changes: amendmentChanges(preview), picking: preview.picking, unchecked: preview.unchecked.map(lineView),
+      } });
+    });
+  },
+
+  confirmSheetPreview() {
+    const { sheetAction, changePreview, paymentPreview } = this.data;
+    const previewId = changePreview?.id ?? paymentPreview?.id;
+    if (previewId && this.sheetReady() && sheetAction && sheetAction !== 'review') {
+      return this.writeSheet(`/${sheetAction}/confirm`, { previewId });
+    }
+  },
+
+  backFromSheetPreview() {
+    if (!this.data.busy && !this.data.sheetRetry) {
+      this.pending = null;
+      this.setData({ changePreview: null, paymentPreview: null, error: '',
+        ...(this.data.sheetAction === 'delivery' ? { sheetAction: '' } : {}) });
+    }
+  },
+
+  cancelSheetAction() {
+    if (!this.data.busy && !this.data.sheetRetry) {
+      this.pending = null;
+      this.setData({ ...sheetEditor(), error: '' });
+    }
   },
 });

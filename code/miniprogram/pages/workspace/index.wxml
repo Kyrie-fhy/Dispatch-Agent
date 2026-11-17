@@ -11,7 +11,7 @@
   </view>
   <block wx:else>
     <view class="session-actions">
-      <button wx:if="{{draft && !dirty}}" size="mini" bindtap="reload" disabled="{{busy}}">刷新工作区</button>
+      <button wx:if="{{draft && !dirty && !sheetTarget}}" size="mini" bindtap="reload" disabled="{{busy}}">刷新工作区</button>
       <button size="mini" bindtap="logout">退出登录</button>
     </view>
     <view wx:if="{{!draft}}" class="card">
@@ -19,13 +19,17 @@
       <button wx:else class="primary" bindtap="reload">重试恢复</button>
     </view>
     <block wx:else>
-      <view class="workspace-actions">
+      <view class="workspace-actions" wx:if="{{!sheetTarget}}">
         <button size="mini" class="{{section === 'draft' ? 'option-active' : ''}}" data-section="draft" bindtap="selectSection">录单</button>
         <button size="mini" class="{{section === 'picking' ? 'option-active' : ''}}" data-section="picking" bindtap="selectSection">取货</button>
         <button size="mini" class="{{section === 'delivery' ? 'option-active' : ''}}" data-section="delivery" bindtap="selectSection">送货单</button>
       </view>
 
-      <block wx:if="{{section === 'draft'}}">
+      <block wx:if="{{sheetTarget}}">
+        <include src="./sheet.wxml" />
+      </block>
+
+      <block wx:elif="{{section === 'draft'}}">
         <block wx:if="{{draftConfirmed && formal}}">
           <view class="card">
             <view class="section-title">已出单 · 第 {{formal.version}} 版</view>
@@ -117,6 +121,7 @@
               <view class="muted">{{formal.statuses[line.id] || '未记录'}}</view>
             </view>
             <view class="subtotal">订单金额 ¥{{customer.total}}</view>
+            <button bindtap="openSheet" data-trip-id="{{formal.id}}" data-sheet-id="{{customer.id}}" disabled="{{busy}}">打开客户单</button>
           </view>
         </block>
       </block>

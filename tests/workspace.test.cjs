@@ -6,6 +6,9 @@ const tokenA = 'a'.repeat(43);
 const tokenB = 'b'.repeat(43);
 const tripId = '1bc26b68-32b6-48d5-b4fc-e82bed6aaea8';
 
+const tap = dataset => ({ currentTarget: { dataset } });
+const input = (dataset, value) => ({ ...tap(dataset), detail: { value } });
+
 function data(name, revision = 0) {
   let number = 0;
   const draft = emptyTrip(() => `row-${++number}`);
@@ -78,6 +81,82 @@ function setup() {
 
   return { page, take, beginLogin, login, editName, assertIdle: () => assert.deepEqual(queue, []) };
 }
+
+test('S5 customer sheet retains write identity on timeout and requires a new preview after a concurrent change', async () => {
+  const { page, take, login, assertIdle } = setup();
+  const workspace = data('客户甲', 1);
+  const total = formal(workspace);
+  const customer = total.trip.versions[0].customers[0];
+  const sheetId = customer.id;
+  const route = `/trips/${tripId}/sheets/${sheetId}`;
+  const due = { due: 16400, paid: 0, remaining: 16400, excess: 0 };
+  const zero = { due: 0, paid: 0, remaining: 0, excess: 0 };
+  const sheet = {
+    tripId, sheetId, customer: customer.customer, version: 1, statusRevision: 0, reviewed: false,
+    orderCents: 16400, amounts: zero, lines: customer.items.map(item => ({ ...item, status: 'pending' })),
+  };
+  const ledger = { debts: [], receipts: [], remainingCents: 0, otherRemainingCents: 0 };
+  const delivered = { ...sheet, statusRevision: 1, amounts: due, lines: sheet.lines.map(line => ({ ...line, status: 'delivered' })) };
+  const reviewed = { ...delivered, reviewed: true };
+  async function reads(details, includeTrip = true) {
+    (await take('GET', route, tokenA)).respond(200, { sheet: details });
+    (await take('GET', route + '/ledger', tokenA)).respond(200, { ledger });
+    if (includeTrip) (await take('GET', `/trips/${tripId}`, tokenA)).respond(200, total);
+  }
+
+  await login('delivery-code', tokenA, { ...workspace, draftConfirmed: true, currentTrip: { id: tripId } });
+  page.selectSection(tap({ section: 'delivery' }));
+  let done = page.openSheet(tap({ tripId, sheetId }));
+  await reads(sheet, false);
+  await done;
+  assert.equal(page.data.sheet.pending.length, 1);
+  assert.equal(page.data.sheet.balance.due, '0.00');
+
+  done = page.markDelivery(tap({ id: sheet.lines[0].id, status: 'delivered' }));
+  const lost = await take('POST', route + '/delivery', tokenA);
+  assert.equal(lost.data.lineId, sheet.lines[0].id);
+  lost.timeout();
+  await done;
+  page.closeSheet();
+  assert.equal(page.data.sheetTarget.sheetId, sheetId);
+  assert.equal(page.data.sheetRetry, true);
+  done = page.retrySheetWrite();
+  (await take('POST', route + '/delivery', tokenA, lost.data)).respond(200, { sheet: delivered });
+  await reads(delivered);
+  await done;
+  assert.equal(page.data.sheet.balance.due, '164.00');
+
+  page.beginSheetAction(tap({ action: 'review' }));
+  done = page.confirmReview();
+  const review = await take('POST', route + '/review', tokenA);
+  assert.equal(review.data.statusRevision, 1);
+  review.respond(200, { sheet: reviewed });
+  await reads(reviewed);
+  await done;
+
+  done = page.markDelivery(tap({ id: sheet.lines[0].id, status: 'pending' }));
+  (await take('POST', route + '/delivery/preview', tokenA)).respond(200, {
+    preview: { previewId: 'delivery-preview', before: due, after: zero },
+  });
+  await done;
+  assert.deepEqual(page.data.changePreview.rows[0], { label: '应收', before: '164.00', after: '0.00' });
+  assert.equal(page.data.sheet.reviewed, true);
+  done = page.confirmSheetPreview();
+  (await take('POST', route + '/delivery/confirm', tokenA)).respond(409,
+    { error: 'delivery_changed', message: '配送状态已变化' });
+  await done;
+  assert.equal(page.data.changePreview, null);
+  assert.equal(page.data.sheetNeedsRefresh, true);
+  assert.match(page.data.error, /已变化/);
+  done = page.closeSheet();
+  (await take('GET', `/trips/${tripId}`, tokenA)).respond(200, {
+    ...total, trip: { ...total.trip, statuses: { [sheet.lines[0].id]: 'delivered' } },
+  });
+  await done;
+  assert.equal(page.data.sheetTarget, null);
+  assert.equal(page.data.formal.statuses[sheet.lines[0].id], '已送达');
+  assertIdle();
+});
 
 test('S5 page saves, previews and confirms by server, retries lost writes, restores same account', async () => {
   const { page, take, login, editName, assertIdle } = setup();

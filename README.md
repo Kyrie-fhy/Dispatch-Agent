@@ -2,7 +2,7 @@
 
 面向速冻食品配送员的微信原生 TypeScript 小程序。当前 MVP 聚焦录单、取货、按客户送货和本次应收。
 
-接手请先读[开发任务](docs/开发任务.md)，确认应使用的分支、验收范围和下一步。S4 使用本地演示数据，S5 微信工作区通过 API 读写 PostgreSQL。S6 复用该工作区，加入文字录单和配送 MVP 入口。
+接手请先读[开发任务](docs/开发任务.md)，确认分支、验收范围和下一步。配送 MVP 使用微信会话和 PostgreSQL 工作区，支持文字和图片录单。
 
 ## 文档入口
 
@@ -25,10 +25,12 @@ npm run check
 ## 微信预览
 
 ```sh
-npm run build
+npm run build:s6
 ```
 
-用微信开发者工具导入项目根目录，运行目录为 `code/dist`。上述命令构建 S4 本地演示。`npm run build:s5` 构建原工作区，`npm run build:s6` 构建配送 MVP。工作区联调请按 [S5 本机联调](docs/S5微信试用.md#正式页面本机联调)启动服务，文字模型另见 [S6 本地配置](docs/S6文字录单.md#启动和验收)。切换构建后在工具中重新编译；`npm run check` 会重建 S4。预览时把微信测试号 AppID 填入本地 `project.private.config.json`。仓库中的 `touristappid` 用于占位。
+上述命令构建含文字和图片录单的配送 MVP。用微信开发者工具导入项目根目录，运行目录为 `code/dist`。把测试号 AppID 填入本地 `project.private.config.json`，仓库里的 `touristappid` 用于占位。数据库迁移、服务端模型配置和同网手机预览见 [S7a 运行和验收](docs/S7a图片录单.md#运行和验收)。
+
+`npm run build` 构建 S4 本地演示，`npm run build:s5` 构建含收款和对账入口的 S5 工作区。`npm run check` 会重建 S4。检查完成后要预览配送 MVP，重新运行 `npm run build:s6`，再在开发者工具中编译。
 
 使用开发者工具 CLI 或自动化时，在项目窗口的 macOS 菜单栏进入「设置 → 安全设置」，开启「服务端口」。也可按 `⌘ + ,` 打开设置后切到「安全」。重置演示数据会清除当前设备的本地原型数据，由用户在页面弹窗中确认。
 

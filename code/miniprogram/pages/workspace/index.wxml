@@ -22,8 +22,8 @@
       <view class="workspace-actions" wx:if="{{!sheetTarget}}">
         <button size="mini" class="{{section === 'draft' ? 'option-active' : ''}}" data-section="draft" bindtap="selectSection" disabled="{{busy}}">录单</button>
         <button size="mini" class="{{section === 'picking' ? 'option-active' : ''}}" data-section="picking" bindtap="selectSection" disabled="{{busy}}">取货</button>
-        <button size="mini" class="{{section === 'delivery' ? 'option-active' : ''}}" data-section="delivery" bindtap="selectSection" disabled="{{busy}}">送货单</button>
-        <button size="mini" class="{{section === 'materials' ? 'option-active' : ''}}" data-section="materials" bindtap="selectSection" disabled="{{busy}}">材料</button>
+        <button size="mini" class="{{section === 'delivery' ? 'option-active' : ''}}" data-section="delivery" bindtap="selectSection" disabled="{{busy}}">{{deliveryMvp ? '送货' : '送货单'}}</button>
+        <button wx:if="{{!deliveryMvp}}" size="mini" class="{{section === 'materials' ? 'option-active' : ''}}" data-section="materials" bindtap="selectSection" disabled="{{busy}}">材料</button>
       </view>
 
       <block wx:if="{{sheetTarget}}">
@@ -31,6 +31,7 @@
       </block>
 
       <block wx:elif="{{section === 'draft'}}">
+        <button wx:if="{{deliveryMvp && !preview}}" size="mini" data-section="materials" bindtap="selectSection" disabled="{{busy}}">图片材料</button>
         <block wx:if="{{draftConfirmed && formal}}">
           <view class="card">
             <view class="section-title">已出单 · 第 {{formal.version}} 版</view>
@@ -50,6 +51,21 @@
         </block>
 
         <block wx:else>
+          <view wx:if="{{deliveryMvp}}" class="card">
+            <view class="section-title">文字录单</view>
+            <textarea class="order-text" value="{{orderText}}" maxlength="{{textOrderLimit}}" bindinput="editOrderText"
+              disabled="{{busy || !!conflict}}" placeholder="例如：老王要两箱安井水饺 500g" />
+            <view wx:if="{{textNotice}}" class="hint" role="status">{{textNotice}}</view>
+            <view wx:elif="{{orderText}}" class="hint">整理后才会进入草稿；也可以在下方手动填写。</view>
+            <button class="primary" bindtap="organizeText" disabled="{{busy || !!conflict || !orderText}}"
+              loading="{{organizingText}}">{{organizingText ? '正在整理文字' : '整理到草稿'}}</button>
+            <view wx:if="{{textQuestions.length}}" class="section-title">待补齐</view>
+            <view wx:for="{{textQuestions}}" wx:for-item="question" wx:key="id" class="line">
+              <view class="product">{{question.name}}</view>
+              <view wx:for="{{question.issues}}" wx:key="*this" class="hint">{{item}}</view>
+              <button size="mini" data-id="{{question.id}}" bindtap="selectCustomer" disabled="{{busy}}">编辑该客户</button>
+            </view>
+          </view>
           <view class="card" wx:if="{{conflict}}">
             <view class="section-title">核对工作区的最新草稿</view>
             <view class="hint">下方编辑区保留了你的修改。请核对服务端最新版本后选择。</view>
@@ -112,6 +128,7 @@
       </block>
 
       <block wx:elif="{{section === 'materials'}}">
+        <button wx:if="{{deliveryMvp}}" size="mini" data-section="draft" bindtap="selectSection" disabled="{{busy}}">返回录单</button>
         <include src="./materials.wxml" />
       </block>
 
@@ -126,6 +143,7 @@
               <view class="muted">{{formal.statuses[line.id] || '未记录'}}</view>
             </view>
             <view class="subtotal">订单金额 ¥{{customer.total}}</view>
+            <view wx:if="{{deliveryMvp}}" class="subtotal">本次应收 ¥{{formal.due[index]}}</view>
             <button bindtap="openSheet" data-trip-id="{{formal.id}}" data-sheet-id="{{customer.id}}" disabled="{{busy}}">打开客户单</button>
           </view>
         </block>

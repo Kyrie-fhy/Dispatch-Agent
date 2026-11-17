@@ -6,13 +6,15 @@
     "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit",
     "build": "node scripts/build.cjs",
     "build:s5": "node scripts/build.cjs --wechat-workspace",
+    "build:s6": "node scripts/build.cjs --delivery-mvp",
     "test": "npm run build && node --test tests/*.test.cjs",
     "check:docs": "node scripts/check-docs.cjs",
     "check": "npm run typecheck && npm test && npm run check:docs",
     "build:server": "tsc -p tsconfig.server.json",
     "db:migrate": "npm run build:server && node code/server-dist/server/migrate.js",
     "serve:local": "npm run build:server && node code/server-dist/server/main.js",
-    "test:server": "npm run build:server && node --test tests/server/*.test.cjs"
+    "test:server": "npm run build:server && node --test tests/server/*.test.cjs",
+    "eval:s6": "npm run build:server && node --test --test-name-pattern='S6 Harness:' tests/server/drafts.test.cjs"
   },
   "engines": {
     "node": ">=18.15.0"

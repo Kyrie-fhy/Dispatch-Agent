@@ -14,8 +14,9 @@
   <view class="card">
     <view class="section-title">{{sheet.customer}} · 第 {{sheet.version}} 版</view>
     <view>订单金额 ¥{{sheet.total}}</view>
-    <view class="hint">{{sheet.reviewed ? '配送已核对' : '配送待核对，应收为预估'}}</view>
-    <view class="sheet-metrics">
+    <view class="hint">{{sheet.reviewed ? '配送已核对' : deliveryMvp ? '按已送达的明细计算' : '配送待核对，应收为预估'}}</view>
+    <view wx:if="{{deliveryMvp}}" class="amount">本次应收 ¥{{sheet.balance.due}}</view>
+    <view wx:else class="sheet-metrics">
       <view>本单应收 ¥{{sheet.balance.due}}</view>
       <view>本单实收 ¥{{sheet.balance.paid}}</view>
       <view>本单欠款 ¥{{sheet.balance.remaining}}</view>
@@ -75,7 +76,7 @@
     <view class="line" wx:for="{{sheet.pending}}" wx:key="id">
       <template is="order-line" data="{{line: item}}" />
     </view>
-    <button class="primary" bindtap="confirmReview" disabled="{{busy || sheet.hasUnrecorded}}" loading="{{busy}}">确认对账</button>
+    <button class="primary" bindtap="confirmReview" disabled="{{busy || sheet.hasUnrecorded}}" loading="{{busy}}">{{deliveryMvp ? '确认配送核对' : '确认对账'}}</button>
     <button bindtap="cancelSheetAction" disabled="{{busy}}">返回配送明细</button>
   </view>
 
@@ -121,10 +122,10 @@
         </view>
       </view>
       <button wx:if="{{sheet.pending.length}}" bindtap="markDelivery" data-status="delivered" disabled="{{busy}}">本客户整单送达</button>
-      <button wx:if="{{!sheet.reviewed}}" class="primary" data-action="review" bindtap="beginSheetAction" disabled="{{busy}}">开始对账</button>
+      <button wx:if="{{!sheet.reviewed}}" class="primary" data-action="review" bindtap="beginSheetAction" disabled="{{busy}}">{{deliveryMvp ? '核对配送' : '开始对账'}}</button>
       <button data-action="amendment" bindtap="beginSheetAction" disabled="{{busy}}">更正单据</button>
     </view>
-    <view wx:if="{{sheet.reviewed}}" class="card">
+    <view wx:if="{{sheet.reviewed && !deliveryMvp}}" class="card">
       <view class="section-title">客户账目</view>
       <button wx:if="{{sheet.canReceive}}" class="primary" data-action="receipt" bindtap="beginSheetAction" disabled="{{busy}}">记收款</button>
       <button data-action="opening" bindtap="beginSheetAction" disabled="{{busy}}">补录旧欠款</button>

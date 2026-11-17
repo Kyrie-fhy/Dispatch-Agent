@@ -38,6 +38,18 @@ export function readAccount<T>(pool: Pool, accountId: string, read: (client: Poo
   });
 }
 
+export async function readAccountResult<T>(client: PoolClient, accountId: string, requestId: string,
+  input: { action: string; [name: string]: unknown }) {
+  const inputDigest = createHash('sha256').update(JSON.stringify(input)).digest();
+  const { rows: [previous] } = await client.query<{ input_digest: Buffer; result: T }>(
+    'SELECT input_digest, result FROM dispatch.request_results WHERE account_id = $1 AND request_id = $2',
+    [accountId, requestId]);
+  if (previous && !previous.input_digest.equals(inputDigest)) {
+    throw new HttpError(409, 'request_conflict', '同一请求编号已用于不同的操作或内容');
+  }
+  return { inputDigest, previous };
+}
+
 export function writeAccount<T>(
   pool: Pool,
   accountId: string,
@@ -45,19 +57,11 @@ export function writeAccount<T>(
   input: { action: string; [name: string]: unknown },
   write: (client: PoolClient, workspace: Workspace) => Promise<T>,
 ): Promise<T> {
-  const inputDigest = createHash('sha256').update(JSON.stringify(input)).digest();
   return transaction(pool, async client => {
     await setAccount(client, accountId);
     const workspace = await readWorkspace(client, accountId, true);
-    const { rows: [previous] } = await client.query<{ input_digest: Buffer; result: T }>(
-      'SELECT input_digest, result FROM dispatch.request_results WHERE account_id = $1 AND request_id = $2',
-      [accountId, requestId]);
-    if (previous) {
-      if (!previous.input_digest.equals(inputDigest)) {
-        throw new HttpError(409, 'request_conflict', '同一请求编号已用于不同的操作或内容');
-      }
-      return previous.result;
-    }
+    const { inputDigest, previous } = await readAccountResult<T>(client, accountId, requestId, input);
+    if (previous) return previous.result;
 
     const result = await write(client, workspace);
     await client.query(`INSERT INTO dispatch.request_results (account_id, request_id, input_digest, result)

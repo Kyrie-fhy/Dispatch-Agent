@@ -6,18 +6,10 @@
 
 ## 文档入口
 
-- [开发 PRD](docs/PRD.md)
-- [当前技术方案](docs/技术方案.md)
-- [S1 操作验收](docs/S1验收.md)
-- [S2 操作验收](docs/S2验收.md)
-- [S3 操作验收](docs/S3验收.md)
-- [S4 操作验收](docs/S4验收.md)
-- [S5 本地服务联调](docs/S5本地联调.md)
-- [S5 微信试用与登录验收](docs/S5微信试用.md)
-- [S5 HTTPS 试用部署](docs/S5试用部署.md)
-- [开发里程碑](docs/Dispatch%20Agent%20开发里程碑.md)
-- [需求分析](docs/需求分析文档.md)
-- [项目级 Agent 约定](AGENTS.md)
+- 产品与阶段见[开发 PRD](docs/PRD.md)、[开发里程碑](docs/Dispatch%20Agent%20开发里程碑.md)和[需求分析](docs/需求分析文档.md)。
+- 工程结构和本地规则见[技术方案](docs/技术方案.md)及[项目约定](AGENTS.md)。
+- S5 按用途查[本地 API 联调](docs/S5本地联调.md)、[微信真机验收](docs/S5微信试用.md#手机验收)或[异地 HTTPS 部署](docs/S5试用部署.md)。
+- 历史操作验收见 [S1](docs/S1验收.md)、[S2](docs/S2验收.md)、[S3](docs/S3验收.md)和 [S4](docs/S4验收.md)。
 
 ## 本地检查
 

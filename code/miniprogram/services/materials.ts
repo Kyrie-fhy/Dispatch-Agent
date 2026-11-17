@@ -1,4 +1,4 @@
-import { Material, materialChunkBytes, materialDigestPattern, materialFilePattern, materialMaxBytes, MaterialSource } from '../core/materials';
+import { Material, materialChunkBytes, materialDigestPattern, materialMaxBytes, MaterialSource } from '../core/materials';
 import { isObject } from '../core/orders';
 import { workspaceRequest } from './workspace';
 
@@ -56,7 +56,7 @@ export function materialInfo(path: string) {
     wx.getFileSystemManager().getFileInfo({ filePath: path, digestAlgorithm: 'sha256', success: ({ size, digest }) => {
       const normalized = digest?.toLowerCase();
       if (size < 1 || size > materialMaxBytes || !materialDigestPattern.test(normalized ?? '')) {
-        reject(new Error('文件大小或校验信息无效，请选择不超过 10 MB 的图片或音频'));
+        reject(new Error('文件大小或校验信息无效，请选择不超过 10 MB 的图片'));
         return;
       }
       resolve({ size, digest: normalized });
@@ -66,8 +66,8 @@ export function materialInfo(path: string) {
 
 export async function stageMaterial(source: MaterialSource, selectedPath: string) {
   const name = source.name.trim();
-  if (!materialFilePattern.test(name) || name.length > 200 || /[\u0000-\u001f\u007f/\\]/.test(name)) {
-    throw new Error('请选择有效的图片或音频文件');
+  if (!name || name.length > 200 || /[\u0000-\u001f\u007f/\\]/.test(name)) {
+    throw new Error('文件名无效，请重新选择');
   }
   const previous = stagedMaterials();
   const path = filePath(source);

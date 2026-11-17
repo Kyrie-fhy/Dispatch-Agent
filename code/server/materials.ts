@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { Pool, PoolClient } from 'pg';
-import { Material, materialChunkBytes, materialDigestPattern, materialFilePattern, materialMaxBytes,
+import { Material, materialChunkBytes, materialDigestPattern, materialImagePattern, materialMaxBytes,
   MaterialSource } from '../miniprogram/core/materials';
 import { missingDraft, readAccount, readWorkspace, Workspace, writeAccount } from './account-workspace';
 import { setAccount, transaction } from './database';
@@ -16,10 +16,10 @@ export function readMaterialInput(value: unknown): MaterialSource {
   const { requestId, revision, size, digest } = body;
   const name = typeof body.name === 'string' ? body.name.trim() : '';
   if (!validRevision(revision) || !name || name.length > 200 || /[\u0000-\u001f\u007f/\\]/.test(name)
-      || Buffer.from(name).toString() !== name || !materialFilePattern.test(name)
+      || Buffer.from(name).toString() !== name || !materialImagePattern.test(name)
       || typeof size !== 'number' || !Number.isInteger(size) || size < 1 || size > materialMaxBytes
       || typeof digest !== 'string' || !materialDigestPattern.test(digest)) {
-    throw new HttpError(400, 'invalid_material', '请选择不超过 10 MB 的图片或音频文件');
+    throw new HttpError(400, 'invalid_material', '请选择不超过 10 MB 的 JPG、PNG、WebP 或 HEIC 图片');
   }
   return { requestId, draftId, revision, name, size, digest };
 }

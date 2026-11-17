@@ -120,6 +120,10 @@ test('materials resume after interruption and restart with account and draft rev
   const contents = randomBytes(2 * materialChunkBytes + 7);
   const transfer = materialInput(draft, contents, 'material-a');
   const begin = (token, body) => api.request('/v1/materials', { method: 'POST', token, body });
+  const rejected = await begin(a, { ...transfer, name: '材料.mp3' });
+  assert.equal(rejected.status, 400);
+  assert.equal(rejected.data.error, 'invalid_material');
+  assert.deepEqual((await api.request('/v1/materials', { token: a })).data, { materials: [] });
   assert.equal((await begin(b, transfer)).status, 404);
   const started = await begin(a, transfer);
   assert.equal(started.status, 201);

@@ -1,5 +1,5 @@
 import { emptyItem, ItemInput, money } from '../../core/orders';
-import { Material, MaterialSource } from '../../core/materials';
+import { Material, materialImagePattern, MaterialSource } from '../../core/materials';
 import { localDay, OpeningPreview, ReceiptPreview, Sheet } from '../../core/settlement';
 import { CustomerDraft, emptyCustomer, isTripDraft, latest, PickingChange, PickingLine, pickingChanges, pickingKey, TripDraft } from '../../core/trips';
 import { newId } from '../../services/ids';
@@ -645,6 +645,9 @@ Page({
       const token = this.token;
       const selected = await chooseMaterial(album === 'yes');
       if (!selected || generation !== this.generation) return;
+      if (!original && !materialImagePattern.test(selected.name.trim())) {
+        throw new Error('请选择 JPG、PNG、WebP 或 HEIC 图片');
+      }
       const { size, digest } = await materialInfo(selected.path);
       if (generation !== this.generation) return;
       if (original && (original.size !== size || original.digest !== digest)) {

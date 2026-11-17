@@ -89,6 +89,7 @@ test('S5 materials keep the original local file for resume and clear another acc
   const files = new Map([['temp', new ArrayBuffer(materialChunkBytes + 5)]]);
   const reads = [];
   const digest = 'f'.repeat(64);
+  let chosenName = '材料.mp3';
   Object.assign(global.wx, {
     env: { USER_DATA_PATH: 'wxfile://private' },
     getStorageSync(key) {
@@ -99,7 +100,7 @@ test('S5 materials keep the original local file for resume and clear another acc
       assert.equal(key, 'dispatch-s5-material-outbox');
       cache.set(key, structuredClone(value));
     },
-    chooseMessageFile: ({ success }) => success({ tempFiles: [{ path: 'temp', name: '材料.png' }] }),
+    chooseMessageFile: ({ success }) => success({ tempFiles: [{ path: 'temp', name: chosenName }] }),
     getFileSystemManager: () => ({
       getFileInfo: ({ filePath, success }) => success({ size: files.get(filePath).byteLength, digest }),
       copyFile: ({ srcPath, destPath, success }) => { files.set(destPath, files.get(srcPath)); success(); },
@@ -119,6 +120,12 @@ test('S5 materials keep the original local file for resume and clear another acc
     await done;
   }
   await enter(tokenA, []);
+  await page.selectMaterial(tap({}));
+  assert.match(page.data.error, /请选择.*图片/);
+  assert.equal(cache.has('dispatch-s5-material-outbox'), false);
+  assertIdle();
+
+  chosenName = '材料.png';
   let done = page.selectMaterial(tap({}));
   const begin = await take('POST', '/materials', tokenA);
   assert.equal(begin.data.draftId, workspace.draft.id);

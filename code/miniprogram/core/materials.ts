@@ -1,6 +1,6 @@
 export const materialChunkBytes = 256 * 1024;
 export const materialMaxBytes = 10 * 1024 * 1024;
-export const materialFilePattern = /\.(?:jpe?g|png|webp|heic|mp3|m4a|aac|wav|ogg|amr|silk)$/i;
+export const materialImagePattern = /\.(?:jpe?g|png|webp|heic)$/i;
 export const materialDigestPattern = /^[0-9a-f]{64}$/;
 
 export interface MaterialSource {

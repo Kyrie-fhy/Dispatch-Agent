@@ -44,6 +44,7 @@ function setup(mvp = false) {
   };
   const modulePath = require.resolve('../code/dist/pages/workspace/index');
   delete require.cache[modulePath];
+  delete require.cache[require.resolve('../code/dist/services/voice')];
   require(modulePath);
 
   async function take(method, path, token, input) {
@@ -501,9 +502,23 @@ test('S6 workspace keeps failed text for retry and confirms only after draft rev
   assertIdle();
 });
 
-test('S7a image action keeps uploads on failure and returns to the editable draft on retry', async () => {
+test('S7c retries an image and fills its missing price with typed context and editable voice', async () => {
   const { page, take, login, assertIdle } = setup(true);
-  wx.getStorageSync = () => [];
+  const callbacks = {};
+  Object.assign(wx, {
+    getStorageSync: () => [],
+    authorize: ({ success }) => success(),
+    arrayBufferToBase64: bytes => Buffer.from(bytes).toString('base64'),
+    getRecorderManager: () => ({
+      onStart: listener => { callbacks.start = listener; },
+      onStop: listener => { callbacks.stop = listener; },
+      onError() {},
+      onInterruptionBegin() {},
+      start: () => callbacks.start(),
+      stop: () => callbacks.stop({ tempFilePath: 'supplement.pcm', duration: 1000 }),
+    }),
+    getFileSystemManager: () => ({ readFile: ({ success }) => success({ data: new ArrayBuffer(32000) }) }),
+  });
   const start = data('', 2);
   await login('s7-code', tokenA, start);
   const photo = { id: 'photo', requestId: 'upload', draftId: tripId, revision: 0, name: '订单.png',
@@ -535,7 +550,65 @@ test('S7a image action keeps uploads on failure and returns to the editable draf
   assert.equal(page.data.section, 'draft');
   assert.match(page.data.textQuestions[0].issues[0], /单价/);
   assert.deepEqual(page.data.draft, after);
+
+  page.editOrderText(input({}, '老王的安井水饺'));
+  const record = page.recordOrderVoice();
+  page.stopOrderVoice();
+  const voice = await take('POST', `/drafts/${tripId}/transcription`, tokenA);
+  assert.equal(voice.header['X-Draft-Revision'], '3');
+  voice.respond(200, { draftId: tripId, revision: 3, text: '每箱八十元' });
+  await record;
+  assert.equal(page.data.orderText, '老王的安井水饺\n每箱八十元');
+  assert.deepEqual(page.data.draft, after);
+  page.editOrderText(input({}, '老王的安井水饺\n每箱八十二元'));
+  const supplement = page.organizeText();
+  const submit = await take('POST', '/text-orders', tokenA);
+  assert.equal(submit.data.revision, 3);
+  assert.equal(submit.data.text, '老王的安井水饺\n每箱八十二元');
+  submit.respond(200, { draft: data('老王', 4).draft });
+  await supplement;
+  assert.deepEqual(page.data.textQuestions, []);
+  assert.equal(page.data.orderText, '');
   assert.equal(page.data.formal, null);
+  assertIdle();
+});
+
+test('S7c refreshes stale material requests and clears inputs when a second session starts the next trip', async () => {
+  const { page, take, login, assertIdle } = setup(true);
+  wx.getStorageSync = () => [];
+  const start = data('老王', 1);
+  const newer = data('老王', 2);
+  newer.draft.customers[0].items[0].quantity = '3';
+  await login('s7c-code', tokenA, start);
+  const supplement = '老王的安井水饺，每箱82元';
+  page.editOrderText(input({}, supplement));
+  const delayed = page.organizeText();
+  (await take('POST', '/text-orders', tokenA)).respond(409, { error: 'draft_changed' });
+  (await take('GET', '/workspace', tokenA)).respond(200, newer);
+  await delayed;
+  assert.equal(page.data.draft.customers[0].items[0].quantity, '3');
+  assert.equal(page.data.orderText, supplement);
+  assert.match(page.data.error, /核对最新明细后重试/);
+  assertIdle();
+
+  const photo = { id: 'photo', requestId: 'upload', draftId: tripId, revision: 1, name: '订单.png',
+    digest: 'a'.repeat(64), size: 60, received: 60, status: 'ready', draftCurrent: false, organized: false };
+  const enter = page.selectSection(tap({ section: 'materials' }));
+  (await take('GET', '/materials', tokenA)).respond(200, { materials: [photo] });
+  await enter;
+  const image = page.organizeImage(tap({ id: photo.id }));
+  (await take('POST', '/image-orders', tokenA)).respond(404, { error: 'draft_not_found' });
+  const next = data('');
+  next.draft.id = '1bc26b68-32b6-48d5-b4fc-e82bed6aaea9';
+  next.currentTrip = { id: tripId, version: 1, totalCents: 24600 };
+  (await take('GET', '/workspace', tokenA)).respond(200, next);
+  (await take('GET', `/trips/${tripId}`, tokenA)).respond(200, formal(newer));
+  (await take('GET', '/materials', tokenA)).respond(200, { materials: [photo] });
+  await image;
+  assert.deepEqual(page.data.draft, next.draft);
+  assert.equal(page.data.orderText, '');
+  assert.equal(page.data.materialRows[0].canOrganize, false);
+  assert.match(page.data.error, /已切换到新一趟/);
   assertIdle();
 });
 
@@ -634,6 +707,22 @@ test('S7b handles permission, interruption and retry before submitting editable 
   await organized;
   assert.equal(page.data.formal, null);
 
+  const localItem = page.data.active.items[0];
+  page.editItem(input({ id: localItem.id, field: 'quantity' }, '7'));
+  const conflict = page.recordOrderVoice();
+  page.stopOrderVoice();
+  (await take('POST', `/drafts/${tripId}/transcription`, tokenA)).respond(409, { error: 'draft_changed' });
+  const newer = data('老王', 4);
+  newer.draft.customers[0].items[0].quantity = '3';
+  (await take('GET', '/workspace', tokenA)).respond(200, newer);
+  await conflict;
+  assert.equal(page.data.active.items[0].quantity, '7');
+  assert.equal(page.data.dirty, true);
+  assert.equal(page.data.voiceRetry, false);
+  assert.deepEqual(page.data.conflict, newer);
+  await page.useSavedDraft();
+  assert.equal(page.data.active.items[0].quantity, '3');
+
   const hidden = page.recordOrderVoice();
   page.onHide();
   await hidden;
@@ -645,7 +734,7 @@ test('S7b handles permission, interruption and retry before submitting editable 
   (await take('DELETE', '/session', tokenA)).respond(204);
   await logout;
   await login('next-login', tokenB, data('新账号'));
-  request.respond(200, { draftId: tripId, revision: 3, text: '旧账号录音' });
+  request.respond(200, { draftId: tripId, revision: 4, text: '旧账号录音' });
   await late;
   assert.equal(page.data.orderText, '');
   assert.equal(page.data.voiceRetry, false);

@@ -1295,9 +1295,7 @@ test('S7a organizes a private image once, retries failures and protects newer dr
   assert.equal((await preview(api, a, continued.data.draft, 'handwritten-needs-review')).status, 400);
 });
 
-test('S7b transcribes WAV without changing a draft and rejects stale results', { timeout: 20_000 }, async t => {
-  const db = await isolatedDatabase(t);
-  const pcmSize = 640_000;
+function pcmWave(pcmSize) {
   const wave = Buffer.alloc(44 + pcmSize);
   wave.write('RIFF', 0);
   wave.writeUInt32LE(wave.length - 8, 4);
@@ -1311,6 +1309,12 @@ test('S7b transcribes WAV without changing a draft and rejects stale results', {
   wave.writeUInt16LE(16, 34);
   wave.write('data', 36);
   wave.writeUInt32LE(pcmSize, 40);
+  return wave;
+}
+
+test('S7b transcribes WAV without changing a draft and rejects stale results', { timeout: 20_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const wave = pcmWave(640_000);
 
   const originalFetch = global.fetch;
   const calls = [];
@@ -1369,4 +1373,110 @@ test('S7b transcribes WAV without changing a draft and rejects stale results', {
   assert.equal((await transcribe(a, draft)).data.error, 'draft_changed');
   assert.equal(calls.length, 3);
   assert.deepEqual(await read(api, a), saved.data.draft);
+});
+
+test('S7c merges image, text and speech and isolates late results by revision and trip', { timeout: 20_000 }, async t => {
+  function delayModel() {
+    let notify;
+    let release;
+    const started = new Promise(resolve => { notify = resolve; });
+    const wait = new Promise(resolve => { release = resolve; });
+    t.after(release);
+    return { started, release, async pause() { notify(); await wait; } };
+  }
+  const lateText = delayModel();
+  const lateImage = delayModel();
+  const lateVoice = delayModel();
+  const db = await isolatedDatabase(t);
+  const item = fixtureLine('老王', '安井', '箱', '2');
+  let imageCalls = 0;
+  let voiceCalls = 0;
+  const api = await start(db, undefined, async ({ text, current }) => {
+    if (text === '补另一个客户的订单') {
+      await lateText.pause();
+      return { operations: [fixtureLine('另一客户', '安井', '箱', '1', '82')] };
+    }
+    assert.equal(text, '老王的安井水饺是500g\n每箱八十二元');
+    assert.deepEqual(current.map(({ customer, product, quantity, specification, price }) =>
+      [customer, product, quantity, specification, price]), [['老王', '水饺', '2', '', '']]);
+    return { operations: [{ action: 'fill', target: 1, specification: '500g', price: '82' }] };
+  }, async () => {
+    if (++imageCalls === 2) await lateImage.pause();
+    return { operations: [{ ...item, specification: '', ...(imageCalls === 2 ? { customer: '另一客户' } : {}) }] };
+  }, async () => {
+    if (++voiceCalls === 2) await lateVoice.pause();
+    return { text: '每箱八十二元' };
+  });
+  const a = await login(api, 'a');
+  const second = await login(api, 'a');
+  const original = await read(api, a);
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+lRJ0AAAAASUVORK5CYII=', 'base64');
+  const post = (path, body) => api.request(path, { method: 'POST', token: a, body });
+  const register = async (draft, bytes, requestId) => {
+    const upload = await post('/v1/materials', materialInput(draft, bytes, requestId));
+    assert.equal(upload.status, 201);
+    const { id } = upload.data.material;
+    assert.equal((await api.request(`/v1/materials/${id}/chunks`, { method: 'PUT', token: a, chunk: bytes, offset: 0 })).status, 200);
+    return id;
+  };
+  const organize = (draft, materialId, requestId) => post('/v1/image-orders',
+    { draftId: draft.id, revision: draft.revision, materialId, requestId });
+  const transcribe = draft => api.request(`/v1/drafts/${draft.id}/transcription`, {
+    method: 'POST', token: a, body: { wave: pcmWave(32_000).toString('base64') },
+    headers: { 'x-draft-revision': String(draft.revision) },
+  });
+
+  const image = await register(original, png, 'mixed-register');
+  const extracted = await organize(original, image, 'mixed-image');
+  assert.equal(extracted.status, 200);
+  const draft = extracted.data.draft;
+  assert.equal(draft.revision, original.revision + 1);
+  assert.equal(draft.customers[0].items[0].price, '');
+  assert.equal((await preview(api, a, draft, 'mixed-incomplete')).status, 400);
+  const voice = await transcribe(draft);
+  assert.equal(voice.status, 200);
+  assert.deepEqual(await read(api, a), draft);
+  const originalItemId = draft.customers[0].items[0].id;
+  const filled = await sendText(api, a, draft, 'mixed-supplement', `老王的安井水饺是500g\n${voice.data.text}`);
+  assert.equal(filled.status, 200);
+  const complete = filled.data.draft;
+  assert.equal(complete.revision, draft.revision + 1);
+  assert.equal(complete.customers[0].items.length, 1);
+  assert.deepEqual(complete.customers[0].items[0], { id: originalItemId, product: '水饺', brand: '安井',
+    specification: '500g', unit: '箱', quantity: '2', price: '82' });
+  const firstPreview = await preview(api, a, complete, 'mixed-preview');
+  assert.equal(firstPreview.data.preview.totalCents, 16400);
+  assert.equal((await api.request(`/v1/trips/${complete.id}`, { token: a })).status, 404);
+
+  const pendingText = sendText(api, a, complete, 'mixed-late-text', '补另一个客户的订单');
+  await lateText.started;
+  const customers = structuredClone(complete.customers);
+  customers[0].items[0].quantity = '3';
+  const edited = await api.request(`/v1/drafts/${complete.id}`, { method: 'PUT', token: second,
+    body: { requestId: 'mixed-edit', revision: complete.revision, customers } }).finally(lateText.release);
+  assert.equal(edited.status, 200);
+  assert.equal((await pendingText).data.error, 'draft_changed');
+  const updated = edited.data.draft;
+  assert.deepEqual(await read(api, a), updated);
+  assert.equal((await confirm(api, second, firstPreview.data.preview.previewId, 'mixed-old-confirm')).data.error, 'draft_changed');
+
+  const another = await register(updated, Buffer.concat([png, Buffer.from('another image')]), 'mixed-register-late');
+  const pendingImage = organize(updated, another, 'mixed-late-image');
+  const pendingVoice = transcribe(updated);
+  await Promise.all([lateImage.started, lateVoice.started]);
+  const revised = await preview(api, second, updated, 'mixed-preview-revised');
+  assert.equal(revised.data.preview.totalCents, 24600);
+  const confirmed = await confirm(api, second, revised.data.preview.previewId, 'mixed-confirm');
+  assert.equal(confirmed.status, 200);
+  assert.equal(confirmed.data.picking[0].quantity, 3);
+  const next = await tripCommand(api, second, 'next-draft', { draftId: updated.id, requestId: 'mixed-next' });
+  assert.equal(next.status, 200);
+  lateImage.release();
+  lateVoice.release();
+  assert.equal((await pendingImage).data.error, 'draft_not_found');
+  assert.equal((await pendingVoice).data.error, 'draft_not_found');
+  assert.deepEqual(await read(api, a), next.data.draft);
+  assert.notEqual(next.data.draft.id, updated.id);
+  assert.equal((await api.request(`/v1/materials/${another}`, { token: a })).data.material.organized, false);
+  assert.deepEqual((await api.request(`/v1/trips/${updated.id}`, { token: a })).data, confirmed.data);
 });

@@ -543,7 +543,7 @@ test('S7b handles permission, interruption and retry before submitting editable 
   const { page, take, login, assertIdle } = setup(true);
   const start = data('老王', 2);
   const callbacks = {};
-  const audio = new ArrayBuffer(44);
+  const audio = Uint8Array.from([253, 255, 17, 0, 7, 0]).buffer;
   let allowed = false;
   let stopCount = 0;
   Object.assign(wx, {
@@ -562,18 +562,19 @@ test('S7b handles permission, interruption and retry before submitting editable 
       onError: listener => { callbacks.error = listener; },
       onInterruptionBegin: listener => { callbacks.interrupt = listener; },
       start(options) {
-        assert.equal(options.format, 'wav');
+        assert.equal(options.format, 'PCM');
         assert.equal(options.numberOfChannels, 1);
+        assert.equal(options.sampleRate, 16000);
         callbacks.start();
       },
       stop() {
         stopCount += 1;
-        callbacks.stop({ tempFilePath: 'voice.wav', duration: 1000 });
+        callbacks.stop({ tempFilePath: 'voice.pcm', duration: 1000 });
       },
     }),
     getFileSystemManager: () => ({
       readFile: ({ filePath, success }) => {
-        assert.equal(filePath, 'voice.wav');
+        assert.equal(filePath, 'voice.pcm');
         success({ data: audio });
       },
     }),
@@ -596,7 +597,19 @@ test('S7b handles permission, interruption and retry before submitting editable 
 
   const failed = page.recordOrderVoice();
   page.stopOrderVoice();
-  const first = await take('POST', `/drafts/${tripId}/transcription`, tokenA, audio);
+  const first = await take('POST', `/drafts/${tripId}/transcription`, tokenA);
+  const wave = Buffer.from(first.data);
+  assert.equal(wave.toString('ascii', 0, 4), 'RIFF');
+  assert.equal(wave.readUInt32LE(4), wave.length - 8);
+  assert.equal(wave.toString('ascii', 8, 16), 'WAVEfmt ');
+  assert.equal(wave.readUInt32LE(16), 16);
+  assert.equal(wave.readUInt16LE(20), 1);
+  assert.equal(wave.readUInt16LE(22), 1);
+  assert.equal(wave.readUInt32LE(24), 16000);
+  assert.equal(wave.readUInt16LE(34), 16);
+  assert.equal(wave.toString('ascii', 36, 40), 'data');
+  assert.equal(wave.readUInt32LE(40), audio.byteLength);
+  assert.deepEqual(wave.subarray(44), Buffer.from(audio));
   assert.equal(first.header['Content-Type'], 'audio/wav');
   assert.equal(first.header['X-Draft-Revision'], '2');
   first.respond(502, { message: '语音转写暂未完成' });
@@ -605,7 +618,7 @@ test('S7b handles permission, interruption and retry before submitting editable 
   assert.equal(page.data.orderText, '老王的订单');
 
   const retry = page.retryOrderVoice();
-  (await take('POST', `/drafts/${tripId}/transcription`, tokenA, audio))
+  (await take('POST', `/drafts/${tripId}/transcription`, tokenA, first.data))
     .respond(200, { draftId: tripId, revision: 2, text: '两箱安井水饺，每箱八十元' });
   await retry;
   assert.equal(page.data.voiceRetry, false);

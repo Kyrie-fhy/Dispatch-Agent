@@ -16,6 +16,7 @@ type Capture = {
 let recorder: WechatMiniprogram.RecorderManager | undefined;
 let active: Capture | undefined;
 const interrupted = '录音已中断，请重新录音。';
+const sampleRate = 16000;
 
 function stopCapture(manager: WechatMiniprogram.RecorderManager, capture: Capture) {
   if (capture.stopping) return;
@@ -76,7 +77,7 @@ export function startVoiceRecording(onStart: () => void) {
         if (active !== capture) return;
         capture.requested = true;
         try {
-          manager.start({ duration: 60_000, format: 'wav', numberOfChannels: 1, sampleRate: 16000, encodeBitRate: 48000 });
+          manager.start({ duration: 60_000, format: 'PCM', numberOfChannels: 1, sampleRate, encodeBitRate: 48000 });
         } catch {
           active = undefined;
           reject(new Error('无法开始录音，请检查麦克风后重试。'));
@@ -96,12 +97,32 @@ export function startVoiceRecording(onStart: () => void) {
   };
 }
 
+function waveFromPcm(pcm: ArrayBuffer) {
+  const file = new ArrayBuffer(44 + pcm.byteLength);
+  const bytes = new Uint8Array(file);
+  const header = new DataView(file);
+  for (const [offset, label] of [[0, 'RIFF'], [8, 'WAVEfmt '], [36, 'data']] as const) {
+    for (let index = 0; index < label.length; index++) bytes[offset + index] = label.charCodeAt(index);
+  }
+  header.setUint32(4, file.byteLength - 8, true);
+  header.setUint32(16, 16, true);
+  header.setUint16(20, 1, true);
+  header.setUint16(22, 1, true);
+  header.setUint32(24, sampleRate, true);
+  header.setUint32(28, sampleRate * 2, true);
+  header.setUint16(32, 2, true);
+  header.setUint16(34, 16, true);
+  header.setUint32(40, pcm.byteLength, true);
+  bytes.set(new Uint8Array(pcm), 44);
+  return file;
+}
+
 export function readVoiceFile(path: string) {
   return new Promise<ArrayBuffer>((resolve, reject) => {
     const fail = () => reject(new VoiceFileError('无法读取原录音，请重新录音。'));
     wx.getFileSystemManager().readFile({ filePath: path, fail, success: ({ data }) => {
-      if (typeof data === 'string' || !data.byteLength) fail();
-      else resolve(data);
+      if (typeof data === 'string' || !data.byteLength || data.byteLength % 2) fail();
+      else resolve(waveFromPcm(data));
     } });
   });
 }

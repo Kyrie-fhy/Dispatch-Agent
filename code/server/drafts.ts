@@ -20,14 +20,21 @@ export class DraftStore {
     if (!developmentAccounts.has(subject)) {
       throw new HttpError(400, 'invalid_development_account', '请选择本地测试账号 a 或 b');
     }
+    return this.startSession('development', subject);
+  }
 
+  async wechatSession(appId: string, openId: string) {
+    return this.startSession('wechat', `${appId}:${openId}`);
+  }
+
+  private async startSession(provider: 'development' | 'wechat', subject: string) {
     const token = randomBytes(32).toString('base64url');
     const expiresAt = new Date(Date.now() + sessionLifetimeSeconds * 1000);
     await transaction(this.pool, async client => {
       await client.query(`INSERT INTO dispatch.accounts (id, identity_provider, identity_subject)
-        VALUES ($1, 'development', $2) ON CONFLICT (identity_provider, identity_subject) DO NOTHING`, [randomUUID(), subject]);
+        VALUES ($1, $2, $3) ON CONFLICT (identity_provider, identity_subject) DO NOTHING`, [randomUUID(), provider, subject]);
       const { rows: [account] } = await client.query<{ id: string }>(
-        "SELECT id FROM dispatch.accounts WHERE identity_provider = 'development' AND identity_subject = $1", [subject]);
+        'SELECT id FROM dispatch.accounts WHERE identity_provider = $1 AND identity_subject = $2', [provider, subject]);
       await setAccount(client, account.id);
       const draft = emptyTrip(randomUUID);
       await client.query(`INSERT INTO dispatch.workspaces (account_id, draft_id, draft_customers)
@@ -40,9 +47,12 @@ export class DraftStore {
     return { token, expiresAt: expiresAt.toISOString() };
   }
 
-  async accountFor(token: string): Promise<string> {
-    const { rows: [session] } = await this.pool.query<{ account_id: string }>(
-      'SELECT account_id FROM dispatch.sessions WHERE token_digest = $1 AND expires_at > now()', [digest(token)]);
+  async accountFor(token: string, appId?: string): Promise<string> {
+    const { rows: [session] } = await this.pool.query<{ account_id: string }>(`
+      SELECT s.account_id FROM dispatch.sessions s JOIN dispatch.accounts a ON a.id = s.account_id
+      WHERE s.token_digest = $1 AND s.expires_at > now() AND a.identity_provider = $2
+        AND ($3::text IS NULL OR starts_with(a.identity_subject, $3))
+    `, [digest(token), appId ? 'wechat' : 'development', appId ? `${appId}:` : null]);
     if (!session) throw new HttpError(401, 'session_required', '请重新登录');
     return session.account_id;
   }

@@ -10,6 +10,7 @@ import { TripStore } from './trips';
 import { readConfirmInput, readDeliveryInput, readNextInput, readOpeningInput, readPreviewInput, readReceiptInput,
   readReviewInput, uuidPattern, validSheetKey } from './request-input';
 import { HttpError } from './http-error';
+import { configuredWechatLogin, readWechatCode, WechatLogin } from './wechat-login';
 import { isObject } from '../miniprogram/core/orders';
 
 const bodyLimit = 512 * 1024;
@@ -52,7 +53,7 @@ function resourceId(path: string, collection: 'drafts' | 'trips'): string | null
 }
 
 async function handle(store: DraftStore, trips: TripStore, delivery: DeliveryStore, ledger: LedgerStore, amendments: AmendmentStore,
-  request: IncomingMessage, response: ServerResponse): Promise<void> {
+  request: IncomingMessage, response: ServerResponse, wechat?: WechatLogin): Promise<void> {
   const host = request.headers.host ?? '';
   if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host)) {
     throw new HttpError(400, 'invalid_host', '请通过本机地址访问草稿服务');
@@ -63,6 +64,7 @@ async function handle(store: DraftStore, trips: TripStore, delivery: DeliverySto
   const tripId = resourceId(path, 'trips');
 
   if (method === 'POST' && path === '/v1/session/development') {
+    if (wechat) throw new HttpError(404, 'not_found', '未找到此接口');
     const body = await readJson(request, response);
     if (!isObject(body) || typeof body.account !== 'string') {
       throw new HttpError(400, 'invalid_development_account', '请选择本地测试账号 a 或 b');
@@ -70,10 +72,17 @@ async function handle(store: DraftStore, trips: TripStore, delivery: DeliverySto
     sendJson(response, 201, await store.developmentSession(body.account));
     return;
   }
+  if (method === 'POST' && path === '/v1/session/wechat') {
+    if (!wechat) throw new HttpError(404, 'not_found', '未找到此接口');
+    const code = readWechatCode(await readJson(request, response));
+    const openId = await wechat.exchange(code);
+    sendJson(response, 201, await store.wechatSession(wechat.appId, openId));
+    return;
+  }
 
   const token = /^Bearer ([A-Za-z0-9_-]{43})$/.exec(request.headers.authorization ?? '')?.[1];
   if (!token) throw new HttpError(401, 'session_required', '请先登录');
-  const account = await store.accountFor(token);
+  const account = await store.accountFor(token, wechat?.appId);
 
   if (method === 'DELETE' && path === '/v1/session') {
     await store.revoke(token);
@@ -161,7 +170,7 @@ async function handle(store: DraftStore, trips: TripStore, delivery: DeliverySto
   throw new HttpError(404, 'not_found', '未找到此接口');
 }
 
-export async function startLocalServer(pool: Pool, port: number): Promise<Server> {
+export async function startLocalServer(pool: Pool, port: number, wechat?: WechatLogin): Promise<Server> {
   await requireApplicationRole(pool);
   const store = new DraftStore(pool);
   const trips = new TripStore(pool);
@@ -169,7 +178,7 @@ export async function startLocalServer(pool: Pool, port: number): Promise<Server
   const ledger = new LedgerStore(pool);
   const amendments = new AmendmentStore(pool);
   const server = createServer({ requestTimeout: 15_000 }, (request, response) => {
-    void handle(store, trips, delivery, ledger, amendments, request, response).catch(error => {
+    void handle(store, trips, delivery, ledger, amendments, request, response, wechat).catch(error => {
       if (response.destroyed) return;
       if (error instanceof HttpError) {
         sendJson(response, error.status, { error: error.code, message: error.message });
@@ -192,17 +201,18 @@ export async function startLocalServer(pool: Pool, port: number): Promise<Server
 async function main(): Promise<void> {
   const port = Number(process.env.DISPATCH_API_PORT ?? 8787);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('本地 API 端口不正确');
+  const wechat = configuredWechatLogin(process.env);
   const pool = new Pool({ connectionString: localDatabaseUrl('DISPATCH_DB_URL'), connectionTimeoutMillis: 5000 });
   pool.on('error', () => console.error('PostgreSQL 空闲连接已断开，后续请求会重新连接'));
   try {
-    const server = await startLocalServer(pool, port);
+    const server = await startLocalServer(pool, port, wechat);
     const stop = () => {
       server.close(() => { void pool.end(); });
       server.closeIdleConnections();
     };
     process.once('SIGINT', stop);
     process.once('SIGTERM', stop);
-    console.log(`S5 本地草稿服务已启动 http://127.0.0.1:${port}`);
+    console.log(`S5 本地草稿服务已启动 http://127.0.0.1:${port}（${wechat ? '微信会话' : '开发会话'}）`);
   } catch (error) {
     await pool.end();
     throw error;

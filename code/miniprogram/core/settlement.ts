@@ -93,7 +93,11 @@ function deliveredAmount(customer: CustomerOrder, statuses: Record<string, Deliv
 
 export function sheetBalance(ledger: Ledger, trip: Trip, customer: CustomerOrder, statuses: Record<string, DeliveryStatus> = trip.statuses) {
   const id = orderDebtId({ tripId: trip.id, sheetId: customer.id });
-  return balance(deliveredAmount(customer, statuses), allocatedAmounts(ledger).get(id) ?? 0);
+  return deliveredBalance(customer, statuses, allocatedAmounts(ledger).get(id) ?? 0);
+}
+
+export function deliveredBalance(customer: CustomerOrder, statuses: Record<string, DeliveryStatus>, paid: number) {
+  return balance(deliveredAmount(customer, statuses), paid);
 }
 
 function compareText(left: string, right: string): number {

@@ -3,8 +3,9 @@ import { Pool } from 'pg';
 import { localDatabaseUrl, requireApplicationRole } from './database';
 import { readSaveDraft } from './draft-input';
 import { DraftStore } from './drafts';
+import { DeliveryStore } from './delivery';
 import { TripStore } from './trips';
-import { readConfirmInput, readNextInput, readPreviewInput, uuidPattern } from './request-input';
+import { readConfirmInput, readDeliveryInput, readNextInput, readPreviewInput, readReviewInput, uuidPattern, validSheetKey } from './request-input';
 import { HttpError } from './http-error';
 import { isObject } from '../miniprogram/core/orders';
 
@@ -47,7 +48,7 @@ function resourceId(path: string, collection: 'drafts' | 'trips'): string | null
   return uuidPattern.test(id) ? id : null;
 }
 
-async function handle(store: DraftStore, trips: TripStore, request: IncomingMessage, response: ServerResponse): Promise<void> {
+async function handle(store: DraftStore, trips: TripStore, delivery: DeliveryStore, request: IncomingMessage, response: ServerResponse): Promise<void> {
   const host = request.headers.host ?? '';
   if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host)) {
     throw new HttpError(400, 'invalid_host', '请通过本机地址访问草稿服务');
@@ -110,6 +111,32 @@ async function handle(store: DraftStore, trips: TripStore, request: IncomingMess
     return;
   }
 
+  const sheetRoute = /^\/v1\/trips\/([^/]+)\/sheets\/([^/]+)(?:\/(delivery|delivery\/preview|delivery\/confirm|review))?$/.exec(path);
+  if (sheetRoute && uuidPattern.test(sheetRoute[1])) {
+    const [, sheetTripId, key, action] = sheetRoute;
+    let sheetId: string;
+    try { sheetId = decodeURIComponent(key); }
+    catch { throw new HttpError(400, 'invalid_id', '请提供有效的客户单编号'); }
+    if (!validSheetKey(sheetId)) throw new HttpError(400, 'invalid_id', '请提供有效的客户单编号');
+    if (method === 'GET' && !action) {
+      sendJson(response, 200, { sheet: await delivery.sheet(account, sheetTripId, sheetId) });
+      return;
+    }
+    if (method === 'POST' && action) {
+      const body = await readJson(request, response);
+      if (action === 'delivery/preview') {
+        const preview = await delivery.preview(account, sheetTripId, sheetId, readDeliveryInput(body));
+        sendJson(response, 200, { preview });
+      } else {
+        const sheet = action === 'review' ? await delivery.review(account, sheetTripId, sheetId, readReviewInput(body))
+          : action === 'delivery/confirm' ? await delivery.confirm(account, sheetTripId, sheetId, readConfirmInput(body))
+          : await delivery.setDelivery(account, sheetTripId, sheetId, readDeliveryInput(body));
+        sendJson(response, 200, { sheet });
+      }
+      return;
+    }
+  }
+
   throw new HttpError(404, 'not_found', '未找到此接口');
 }
 
@@ -117,8 +144,9 @@ export async function startLocalServer(pool: Pool, port: number): Promise<Server
   await requireApplicationRole(pool);
   const store = new DraftStore(pool);
   const trips = new TripStore(pool);
+  const delivery = new DeliveryStore(pool);
   const server = createServer({ requestTimeout: 15_000 }, (request, response) => {
-    void handle(store, trips, request, response).catch(error => {
+    void handle(store, trips, delivery, request, response).catch(error => {
       if (response.destroyed) return;
       if (error instanceof HttpError) {
         sendJson(response, error.status, { error: error.code, message: error.message });

@@ -8,8 +8,8 @@ const labels: Record<TextField, string> = {
   product: '货品', brand: '品牌', specification: '规格', unit: '单位', quantity: '有效数量', price: '有效单价',
 };
 
-export function validTextField(field: TextField, value: string): boolean {
-  if (!value.trim()) return false;
+export function validTextField(field: TextField, value: string | null): boolean {
+  if (!value?.trim()) return false;
   if (field === 'quantity') return /^[1-9]\d*$/.test(value) && Number.isSafeInteger(Number(value));
   if (field === 'price') {
     const cents = yuanToCents(value);
@@ -25,8 +25,10 @@ export function textOrderQuestions(draft: TripDraft) {
       ? customer.partyId === undefined ? ['请选择已有客户或明确新建'] : []
       : ['请填写客户名称'];
     const lines = customer.items.flatMap((line: ItemInput, i) => {
-      const fields = textFields.filter(field => !validTextField(field, line[field])).map(field =>
-        field === 'quantity' ? '有效数量（正整数）' : field === 'price' && !line.price ? '单价' : labels[field]);
+      const fields = textFields.filter(field => {
+        if (field === 'brand' || field === 'specification' || (field === 'price' && !line.price?.trim())) return false;
+        return !validTextField(field, line[field]);
+      }).map(field => field === 'quantity' ? '有效数量（正整数）' : labels[field]);
       return fields.length ? [`${line.product || '第 ' + (i + 1) + ' 条'}：请补齐${fields.join('、')}`] : [];
     });
     return issues.length || lines.length

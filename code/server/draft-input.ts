@@ -8,6 +8,11 @@ function cleanText(value: string, limit: number): boolean {
   return value.length <= limit && !value.includes('\0') && Buffer.from(value).toString() === value;
 }
 
+function optionalItemFields(value: unknown) {
+  if (!isObject(value)) return value;
+  return { ...value, brand: value.brand ?? '', specification: value.specification ?? '', price: value.price ?? null };
+}
+
 function itemFields({ id, product, brand, specification, unit, quantity, price }: ItemInput): ItemInput {
   return { id, product, brand, specification, unit, quantity, price };
 }
@@ -19,7 +24,10 @@ export interface SaveDraftInput {
 
 export function readSaveDraft(id: string, value: unknown): SaveDraftInput {
   const body = readCommand(value);
-  const draft = { id, revision: body.revision, customers: body.customers };
+  const customersInput = Array.isArray(body.customers) ? body.customers.map(customer =>
+    isObject(customer) && Array.isArray(customer.items) ? { ...customer, items: customer.items.map(optionalItemFields) } : customer)
+    : body.customers;
+  const draft = { id, revision: body.revision, customers: customersInput };
   if (!isTripDraft(draft) || !validRevision(draft.revision, true)) {
     throw new HttpError(400, 'invalid_draft', '草稿格式或版本不正确');
   }
@@ -31,7 +39,7 @@ export function readSaveDraft(id: string, value: unknown): SaveDraftInput {
     const fields = [customer.id, customer.customer];
     const items = customer.items.map(itemFields);
     for (const item of items) fields.push(...Object.values(item));
-    if (!fields.every(value => cleanText(value, 200))) {
+    if (!fields.every(value => value === null || cleanText(value, 200))) {
       throw new HttpError(400, 'invalid_draft', '草稿字段过长或包含无效字符');
     }
     return { id: customer.id, customer: customer.customer, items, ...(customer.partyId === undefined ? {} : { partyId: customer.partyId }) };
@@ -42,10 +50,10 @@ export function readSaveDraft(id: string, value: unknown): SaveDraftInput {
 export function readAmendmentInput(value: unknown) {
   const basis = readReviewInput(value);
   const { items, replacementStatuses = {} } = value as Record<string, unknown>;
-  const draft = { id: 'amendment', revision: 0, customer: '', items };
+  const draft = { id: 'amendment', revision: 0, customer: '', items: Array.isArray(items) ? items.map(optionalItemFields) : items };
   if (!isDraft(draft)) throw new HttpError(400, 'invalid_amendment', '更正须包含至少一条有效且编号唯一的货品明细');
   const lines = draft.items.map(itemFields);
-  if (lines.some(line => Object.values(line).some(value => !cleanText(value, 200)))) {
+  if (lines.some(line => Object.values(line).some(value => value !== null && !cleanText(value, 200)))) {
     throw new HttpError(400, 'invalid_amendment', '货品字段过长或包含无效字符');
   }
   if (!isObject(replacementStatuses)) throw new HttpError(400, 'invalid_amendment', '请选择有效的替换明细配送状态');

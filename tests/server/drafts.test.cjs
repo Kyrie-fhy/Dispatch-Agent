@@ -1103,8 +1103,10 @@ test('S6 Harness: fixed trip from text through draft, picking and delivery', { t
   const missing = await extract('initial', blank, s6.initial, 200);
   const { id, ...missingLine } = missing.customers[0].items[0];
   check('missing_price', [missing.customers[0].customer, ...['product', 'brand', 'specification', 'unit', 'quantity', 'price']
-    .map(field => missingLine[field])], [...s6.expected[0].slice(0, -1), '']);
-  check('preview_requires_price', (await preview(api, token, missing, 'no-price')).status, 400);
+    .map(field => missingLine[field])], [...s6.expected[0].slice(0, -1), null]);
+  const unpriced = await preview(api, token, missing, 'no-price');
+  check('preview_allows_missing_price', unpriced.status, 200);
+  check('unpriced_subtotal_is_null', unpriced.data.preview.customers[0].items[0].amountCents, null);
   await api.stop();
   api = await start(db, undefined, model);
   check('same_request_replays_after_restart', (await sendText(api, token, blank, 'initial', s6.initial)).data.draft, missing);
@@ -1266,7 +1268,7 @@ test('S7a organizes a private image once, retries failures and protects newer dr
   const { draft: recognized } = applied.data;
   assert.equal(recognized.revision, draft.revision + 1);
   assert.equal(recognized.customers[0].customer, '老王');
-  assert.equal(recognized.customers[0].items[0].price, '');
+  assert.equal(recognized.customers[0].items[0].price, null);
   assert.equal((await api.request(`/v1/trips/${draft.id}`, { token: a })).status, 404);
   assert.deepEqual(await organize(a, draft, original.id, 'image-order'), applied);
   assert.equal((await organize(a, recognized, duplicate.id, 'duplicate-image')).data.error, 'duplicate_order_image');
@@ -1291,7 +1293,7 @@ test('S7a organizes a private image once, retries failures and protects newer dr
   const items = continued.data.draft.customers[1].items;
   assert.equal(items.length, 40);
   assert.deepEqual(items.slice(0, 2).map(item => item.unit), ['箱', '袋']);
-  assert.deepEqual([items[39].product, items[39].quantity, items[39].unit, items[39].price], ['', '2', '件', '']);
+  assert.deepEqual([items[39].product, items[39].quantity, items[39].unit, items[39].price], ['', '2', '件', null]);
   assert.equal((await preview(api, a, continued.data.draft, 'handwritten-needs-review')).status, 400);
 });
 
@@ -1398,7 +1400,7 @@ test('S7c merges image, text and speech and isolates late results by revision an
     }
     assert.equal(text, '老王的安井水饺是500g\n每箱八十二元');
     assert.deepEqual(current.map(({ customer, product, quantity, specification, price }) =>
-      [customer, product, quantity, specification, price]), [['老王', '水饺', '2', '', '']]);
+      [customer, product, quantity, specification, price]), [['老王', '水饺', '2', '', null]]);
     return { operations: [{ action: 'fill', target: 1, specification: '500g', price: '82' }] };
   }, async () => {
     if (++imageCalls === 2) await lateImage.pause();
@@ -1431,8 +1433,8 @@ test('S7c merges image, text and speech and isolates late results by revision an
   assert.equal(extracted.status, 200);
   const draft = extracted.data.draft;
   assert.equal(draft.revision, original.revision + 1);
-  assert.equal(draft.customers[0].items[0].price, '');
-  assert.equal((await preview(api, a, draft, 'mixed-incomplete')).status, 400);
+  assert.equal(draft.customers[0].items[0].price, null);
+  assert.equal((await preview(api, a, draft, 'mixed-incomplete')).status, 200);
   const voice = await transcribe(draft);
   assert.equal(voice.status, 200);
   assert.deepEqual(await read(api, a), draft);
@@ -1479,4 +1481,136 @@ test('S7c merges image, text and speech and isolates late results by revision an
   assert.notEqual(next.data.draft.id, updated.id);
   assert.equal((await api.request(`/v1/materials/${another}`, { token: a })).data.material.organized, false);
   assert.deepEqual((await api.request(`/v1/trips/${updated.id}`, { token: a })).data, confirmed.data);
+});
+
+test('flexible issue keeps pending prices null and groups empty brands and specs in picking', { timeout: 20_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const api = await start(db);
+  const token = await login(api, 'a');
+  const entry = (id, fields = {}) => ({ id, product: '水饺', brand: '', specification: '', unit: '箱',
+    quantity: '5', price: null, ...fields });
+  const customers = [
+    { id: 'market', customer: '王记', partyId: null, items: [
+      entry('unpriced', { brand: null, specification: ' ' }),
+      entry('priced', { specification: null, quantity: '2', price: '1.23' }),
+    ] },
+    { id: 'second', customer: '李记', partyId: null, items: [
+      entry('branded', { brand: '安井', specification: undefined, price: undefined }),
+      entry('sized', { specification: '500g' }),
+      entry('bag', { unit: '袋', price: '  ' }),
+    ] },
+  ];
+  let draft = await read(api, token);
+  for (const [key, value, message] of [
+    ['customer', '', /第 1 位客户.*客户名称/], ['product', '', /第 1 条.*货品/],
+    ['unit', '', /第 1 条.*单位/], ['quantity', '0', /第 1 条.*正整数/],
+    ['quantity', '1.5', /第 1 条.*正整数/], ['price', '0', /第 1 条.*单价/],
+  ]) {
+    const invalid = structuredClone(customers);
+    (key === 'customer' ? invalid[0] : invalid[0].items[0])[key] = value;
+    draft = await putCustomers(api, token, draft, `save-invalid-${draft.revision}`, invalid);
+    const blocked = await preview(api, token, draft, `invalid-${draft.revision}`);
+    assert.equal(blocked.status, 400);
+    assert.match(blocked.data.message, message);
+  }
+  draft = await putCustomers(api, token, draft, 'save-flexible', customers);
+  assert.equal(draft.customers[1].items[0].price, null);
+  assert.equal(draft.customers[1].items[0].specification, '');
+  assert.equal(draft.customers[1].items[2].price, null);
+  const result = await preview(api, token, draft, 'flexible-preview');
+  assert.equal(result.status, 200);
+  const { previewId, totalCents } = result.data.preview;
+  assert.equal(totalCents, 246);
+  assert.deepEqual(result.data.preview.customers[0].items.map(line => [line.unitPriceCents, line.amountCents]), [[null, null], [123, 246]]);
+  assert.equal((await api.request(`/v1/trips/${draft.id}`, { token })).status, 404);
+  const confirmed = await confirm(api, token, previewId, 'flexible-confirm');
+  assert.equal(confirmed.status, 200);
+  assert.deepEqual(await confirm(api, token, previewId, 'flexible-confirm'), confirmed);
+  assert.deepEqual(confirmed.data.picking.map(row => [row.brand, row.specification, row.unit, row.quantity]), [
+    ['', '', '箱', 7], ['安井', '', '箱', 5], ['', '500g', '箱', 5], ['', '', '袋', 5],
+  ]);
+  const { rows: [stored] } = await db.admin.query('SELECT customers FROM dispatch.trip_versions');
+  assert.equal(stored.customers[0].items[0].unitPriceCents, null);
+  assert.equal(stored.customers[0].items[0].amountCents, null);
+});
+
+test('onsite updates persist and lock exact receivables without changing formal snapshots or picking', { timeout: 20_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  let api = await start(db);
+  const token = await login(api, 'a');
+  const other = await login(api, 'b');
+  const initial = await read(api, token);
+  const items = [
+    { id: 'boxes', product: '水饺', quantity: '5', price: null },
+    { id: 'rejected', product: '馄饨', quantity: '2', price: null },
+    { id: 'priced', product: '包子', quantity: '2', price: '1.23' },
+  ].map(item => ({ brand: '', specification: '', unit: '箱', ...item }));
+  const draft = await putCustomers(api, token, initial, 'field-save', [{ id: 'market', customer: '王记', partyId: null, items }]);
+  const unpricedOnly = await putCustomers(api, token, draft, 'all-unpriced', [{
+    ...draft.customers[0], items: items.map(item => ({ ...item, price: null })),
+  }]);
+  const { data: { preview: order } } = await preview(api, token, unpricedOnly, 'all-unpriced-preview');
+  assert.equal(order.totalCents, 0);
+  const confirmed = await confirm(api, token, order.previewId, 'field-confirm');
+  assert.equal(confirmed.status, 200);
+  const sheet = sheetEndpoint(api, token, draft.id, 'market');
+  const complete = { version: 1, statusRevision: 0, requestId: 'field-complete' };
+  const blocked = await sheet('delivery/complete', complete);
+  assert.equal(blocked.data.error, 'delivery_price_required');
+  assert.match(blocked.data.message, /水饺.*馄饨.*包子/);
+  const first = { version: 1, statusRevision: 0, requestId: 'edit-boxes', lineId: 'boxes', receivedQuantity: '3', price: '12.34' };
+  assert.equal((await sheetEndpoint(api, other, draft.id, 'market')('delivery/line', first)).status, 404);
+  assert.equal((await sheet('delivery/line', { ...first, lineId: 'new-line' })).status, 404);
+  assert.equal((await sheet('delivery/line', { ...first, receivedQuantity: '-1' })).data.error, 'invalid_delivery_quantity');
+  assert.equal((await sheet('delivery/line', { ...first, price: '0' })).data.error, 'invalid_delivery_price');
+  const [saved, conflict] = await Promise.all([
+    sheet('delivery/line', first),
+    sheet('delivery/line', { ...first, requestId: 'edit-concurrent', receivedQuantity: '4' }),
+  ]).then(results => results.sort((left, right) => left.status - right.status));
+  assert.equal(saved.status, 200);
+  assert.equal(conflict.data.error, 'delivery_changed');
+  const accepted = saved.data.sheet.lines.find(line => line.id === 'boxes');
+  const acceptedInput = accepted.receivedQuantity === 3 ? first : { ...first, requestId: 'edit-concurrent', receivedQuantity: '4' };
+  assert.deepEqual(await sheet('delivery/line', acceptedInput), saved);
+  assert.equal((await sheet('delivery/line', { ...acceptedInput, price: '12.35' })).data.error, 'request_conflict');
+  const adjusted = await sheet('delivery/line', { ...first, requestId: 'edit-final', statusRevision: 1 });
+  assert.deepEqual(adjusted.data.sheet.execution, { totalCents: 3702, pendingPrices: 2 });
+  const repriced = await sheet('delivery/line', { ...first, requestId: 'reprice', statusRevision: 2, price: '12.35' });
+  assert.deepEqual(repriced.data.sheet.execution, { totalCents: 3705, pendingPrices: 2 });
+  const refused = await sheet('delivery/line', { ...first, requestId: 'refused', statusRevision: 3,
+    lineId: 'rejected', receivedQuantity: '0', price: null });
+  assert.deepEqual(refused.data.sheet.execution, { totalCents: 3705, pendingPrices: 1 });
+  assert.equal(refused.data.sheet.lines[1].amountCents, 0);
+  assert.equal(refused.data.sheet.lines[1].unitPriceCents, null);
+  const last = await sheet('delivery/line', { ...first, requestId: 'price-buns', statusRevision: 4,
+    lineId: 'priced', receivedQuantity: '2', price: '1.23' });
+  assert.deepEqual(last.data.sheet.execution, { totalCents: 3951, pendingPrices: 0 });
+  assert.equal((await sheet('delivery/complete', complete)).data.error, 'delivery_changed');
+  const lock = { ...complete, statusRevision: 5 };
+  await db.admin.query("ALTER TABLE dispatch.request_results ADD CONSTRAINT fail_delivery_lock CHECK (request_id <> 'field-complete')");
+  assert.equal((await sheet('delivery/complete', lock)).status, 500);
+  const afterFailure = (await sheet()).data.sheet;
+  assert.equal(afterFailure.deliveryCompleted, false);
+  assert.equal(afterFailure.statusRevision, 5);
+  await db.admin.query('ALTER TABLE dispatch.request_results DROP CONSTRAINT fail_delivery_lock');
+  const done = await sheet('delivery/complete', lock);
+  assert.equal(done.status, 200);
+  assert.equal(done.data.sheet.amounts.due, 3951);
+  assert.equal(done.data.sheet.deliveryCompleted, true);
+  assert.deepEqual(done.data.sheet.lines.map(line => [line.originalQuantity, line.receivedQuantity, line.status]),
+    [['5', 3, 'delivered'], ['2', 0, 'pending'], ['2', 2, 'delivered']]);
+  assert.equal((await sheet('delivery/line', { ...first, requestId: 'after-lock', statusRevision: 6 })).data.error, 'delivery_completed');
+  assert.equal((await sheet('delivery/preview', { ...lock, requestId: 'status-after-lock', statusRevision: 6,
+    lineId: 'boxes', status: 'pending' })).data.error, 'delivery_completed');
+  assert.equal((await sheet('ledger')).data.ledger.debts[0].cents, 3951);
+
+  await api.stop();
+  api = await start(db);
+  const reopened = sheetEndpoint(api, token, draft.id, 'market');
+  assert.deepEqual((await reopened()).data.sheet, done.data.sheet);
+  assert.deepEqual(await reopened('delivery/complete', lock), done);
+  const after = (await api.request(`/v1/trips/${draft.id}`, { token })).data;
+  assert.deepEqual(after.picking, confirmed.data.picking);
+  assert.deepEqual(after.trip.versions, confirmed.data.trip.versions);
+  assert.equal(after.deliveryEdits.boxes.unitPriceCents, 1235);
 });

@@ -466,7 +466,8 @@ test('S6 workspace keeps failed text for retry and confirms only after draft rev
   (await take('POST', '/text-orders', tokenA, first.data)).respond(200, { draft: missing.draft });
   await retry;
   assert.equal(page.data.orderText, '');
-  assert.match(page.data.textQuestions[0].issues[0], /单价/);
+  assert.deepEqual(page.data.textQuestions, []);
+  assert.equal(page.data.form[0].pendingPrice, true);
   assert.equal(page.data.formal, null);
 
   const filled = data('老王', 2);
@@ -548,7 +549,8 @@ test('S7c retries an image and fills its missing price with typed context and ed
   (await take('POST', '/image-orders', tokenA, request.data)).respond(200, { draft: after });
   await retry;
   assert.equal(page.data.section, 'draft');
-  assert.match(page.data.textQuestions[0].issues[0], /单价/);
+  assert.deepEqual(page.data.textQuestions, []);
+  assert.equal(page.data.form[0].pendingPrice, true);
   assert.deepEqual(page.data.draft, after);
 
   page.editOrderText(input({}, '老王的安井水饺'));
@@ -738,5 +740,99 @@ test('S7b handles permission, interruption and retry before submitting editable 
   await late;
   assert.equal(page.data.orderText, '');
   assert.equal(page.data.voiceRetry, false);
+  assertIdle();
+});
+
+test('delivery MVP shows unpriced totals and edits existing lines with a retry before locking', async () => {
+  const { previewTrip, statusesFor, pickingList } = require('../code/dist/core/trips');
+  const { deliveryLines, deliverySummary } = require('../code/dist/core/delivery-execution');
+  const { page, take, login, assertIdle } = setup(true);
+  const workspace = data('王记');
+  const customer = workspace.draft.customers[0];
+  const first = customer.items[0];
+  Object.assign(first, { quantity: '5', brand: '', specification: '', price: null });
+  customer.items.push({ ...first, id: 'wont-receive', product: '馄饨', quantity: '1' },
+    { ...first, id: 'priced', product: '包子', quantity: '2', price: '1.23' });
+  const summary = previewTrip(workspace.draft, true);
+  const [issued] = summary.customers;
+  const result = { trip: { id: tripId, origin: 's2', versions: [{ ...summary, version: 1, savedAt: '2026-11-18T00:00:00Z' }],
+    statuses: statusesFor(summary.customers, 'pending'), statusRevision: 0 },
+  picking: pickingList(summary.customers) };
+  await login('flexible-code', tokenA, workspace);
+  assert.equal(page.data.form[0].pendingPrice, true);
+  const showing = page.showPreview();
+  (await take('POST', '/trips/preview', tokenA)).respond(200, { preview: { ...summary, previewId: 'test-preview', choices: [null] } });
+  await showing;
+  assert.match(page.data.preview.totalLabel, /已算金额 ¥2.46.*含 2 项待补价/);
+  assert.equal(page.data.preview.customers[0].items[0].priceLabel, '待补价');
+  assert.equal(page.data.preview.customers[0].items[0].amountLabel, '待补价');
+  assert.equal(page.data.preview.customers[0].items[0].productLabel, '水饺');
+  const confirming = page.confirmTrip();
+  (await take('POST', '/trips/confirm', tokenA)).respond(200, result);
+  await confirming;
+  const route = `/trips/${tripId}/sheets/${customer.id}`;
+  const sheet = (edits, statusRevision, reviewed = false) => {
+    const lines = deliveryLines(issued, edits);
+    const execution = deliverySummary(lines);
+    const due = reviewed ? execution.totalCents : 0;
+    return { sheet: { tripId, sheetId: customer.id, customer: customer.customer, reviewed, deliveryCompleted: reviewed,
+      version: 1, statusRevision, orderCents: issued.totalCents, execution,
+      amounts: { due, remaining: due, paid: 0, excess: 0 },
+      lines: lines.map(line => ({ ...line, status: reviewed && line.receivedQuantity > 0 ? 'delivered' : 'pending' })) } };
+  };
+  page.selectSection(tap({ section: 'delivery' }));
+  const opening = page.openSheet(tap({ tripId, sheetId: customer.id }));
+  (await take('GET', route, tokenA)).respond(200, sheet({}, 0));
+  await opening;
+  const blocked = page.completeDelivery();
+  (await take('POST', route + '/delivery/complete', tokenA)).respond(409, {
+    error: 'delivery_price_required', message: '请先补填单价：水饺、馄饨',
+  });
+  await blocked;
+  assert.match(page.data.error, /水饺、馄饨/);
+  assert.equal(page.data.sheetNeedsRefresh, false);
+
+  page.beginFieldEdit(tap({ id: first.id }));
+  page.editDeliveryField(input({ field: 'receivedQuantity' }, '3'));
+  page.editDeliveryField(input({ field: 'price' }, '12.34'));
+  const saving = page.saveFieldEdit();
+  const submitted = await take('POST', route + '/delivery/line', tokenA);
+  assert.equal(submitted.data.receivedQuantity, '3');
+  submitted.timeout();
+  await saving;
+  assert.equal(page.data.sheetRetry, true);
+  const edits = { [first.id]: { receivedQuantity: 3, unitPriceCents: 1234 } };
+  const retry = page.retrySheetWrite();
+  (await take('POST', route + '/delivery/line', tokenA, submitted.data)).respond(200, sheet(edits, 1));
+  (await take('GET', route, tokenA)).respond(200, sheet(edits, 1));
+  (await take('GET', `/trips/${tripId}`, tokenA)).respond(200, { ...result, deliveryEdits: edits });
+  await retry;
+  assert.equal(page.data.sheet.lines[0].originalQuantity, '5');
+  assert.equal(page.data.sheet.lines[0].receivedQuantity, 3);
+  assert.match(page.data.sheet.executionLabel, /¥39.48.*含 1 项待补价/);
+  assert.deepEqual(page.data.formal.picking, result.picking);
+
+  page.beginFieldEdit(tap({ id: 'wont-receive' }));
+  page.editDeliveryField(input({ field: 'receivedQuantity' }, '0'));
+  const rejectLine = page.saveFieldEdit();
+  const saveZero = await take('POST', route + '/delivery/line', tokenA);
+  assert.equal(saveZero.data.price, null);
+  edits['wont-receive'] = { receivedQuantity: 0, unitPriceCents: null };
+  saveZero.respond(200, sheet(edits, 2));
+  (await take('GET', route, tokenA)).respond(200, sheet(edits, 2));
+  (await take('GET', `/trips/${tripId}`, tokenA)).respond(200, { ...result, deliveryEdits: edits });
+  await rejectLine;
+  assert.equal(page.data.sheet.lines[1].amountLabel, '¥0.00');
+  const completing = page.completeDelivery();
+  const lock = await take('POST', route + '/delivery/complete', tokenA);
+  assert.equal(lock.data.statusRevision, 2);
+  lock.respond(200, sheet(edits, 3, true));
+  (await take('GET', route, tokenA)).respond(200, sheet(edits, 3, true));
+  (await take('GET', `/trips/${tripId}`, tokenA)).respond(200, { ...result, deliveryEdits: edits });
+  await completing;
+  assert.equal(page.data.sheet.balance.due, '39.48');
+  assert.equal(page.data.sheet.deliveryCompleted, true);
+  page.beginFieldEdit(tap({ id: first.id }));
+  assert.equal(page.data.fieldEdit, null);
   assertIdle();
 });

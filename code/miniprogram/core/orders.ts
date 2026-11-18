@@ -1,9 +1,9 @@
 export interface ItemInput {
   id: string; product: string; brand: string; specification: string;
-  unit: string; quantity: string; price: string;
+  unit: string; quantity: string; price: string | null;
 }
 export interface Draft { id: string; revision: number; customer: string; items: ItemInput[] }
-export interface OrderLine extends ItemInput { amountCents: number }
+export interface OrderLine extends ItemInput { amountCents: number | null; unitPriceCents?: number | null }
 export interface Order {
   id: string; revision: number; customer: string; items: OrderLine[];
   totalCents: number; confirmedAt: string;
@@ -21,29 +21,63 @@ export function money(cents: number): string {
   const fraction = absolute % 100;
   return `${cents < 0 ? '-' : ''}${(absolute - fraction) / 100}.${String(fraction).padStart(2, '0')}`;
 }
-export function yuanToCents(input: string): number {
+export function yuanToCents(input: string | null): number {
+  if (input === null) return NaN;
   if (!/^(0|[1-9]\d*)(\.\d{1,2})?$/.test(input)) return NaN;
   const [yuan, fraction = ''] = input.split('.');
   return Number(yuan) * 100 + Number(fraction.padEnd(2, '0'));
 }
-export function preview(draft: Draft): Order {
+export function nullablePrice(price: string | null): string | null {
+  return price?.trim() || null;
+}
+
+export function unitPrice(price: string | null): number | null {
+  const input = nullablePrice(price);
+  if (input === null) return null;
+  const cents = yuanToCents(input);
+  if (!Number.isSafeInteger(cents) || cents <= 0) throw new Error('单价须为大于零且最多两位小数的金额');
+  return cents;
+}
+
+export function lineAmount(quantity: number, cents: number | null): number | null {
+  if (quantity === 0) return 0;
+  if (cents === null) return null;
+  const amount = quantity * cents;
+  if (!Number.isSafeInteger(amount)) throw new Error('明细金额超出可计算范围');
+  return amount;
+}
+
+export function preview(draft: Draft, flexible = false): Order {
   if (!draft.customer.trim()) throw new Error('请填写客户名称');
   if (draft.items.length === 0) throw new Error('请至少添加一条货品');
   const items = draft.items.map((item, index) => {
     for (const [key, label] of [['product', '货品'], ['brand', '品牌'], ['specification', '规格'], ['unit', '单位']] as const) {
-      if (!item[key].trim()) throw new Error(`第 ${index + 1} 条：请填写${label}`);
+      if (flexible && (key === 'brand' || key === 'specification')) continue;
+      if (!item[key]?.trim()) throw new Error(`第 ${index + 1} 条：请填写${label}`);
     }
     if (!/^[1-9]\d*$/.test(item.quantity)) throw new Error(`第 ${index + 1} 条：数量须为正整数`);
+    const quantity = Number(item.quantity);
+    if (!Number.isSafeInteger(quantity)) throw new Error(`第 ${index + 1} 条：数量超出可计算范围`);
+    if (flexible) {
+      const price = nullablePrice(item.price);
+      try {
+        const unitPriceCents = unitPrice(price);
+        return { ...item, product: item.product.trim(), brand: item.brand?.trim() || '',
+          specification: item.specification?.trim() || '', unit: item.unit.trim(), price, unitPriceCents,
+          amountCents: lineAmount(quantity, unitPriceCents) };
+      } catch (error) {
+        throw new Error(`第 ${index + 1} 条：${(error as Error).message}`);
+      }
+    }
     const cents = yuanToCents(item.price);
     if (Number.isNaN(cents)) throw new Error(`第 ${index + 1} 条：单价须为最多两位小数的金额`);
-    const quantity = Number(item.quantity);
     const amountCents = cents * quantity;
-    if (cents <= 0 || !Number.isSafeInteger(cents) || !Number.isSafeInteger(quantity) || !Number.isSafeInteger(amountCents)) {
+    if (cents <= 0 || !Number.isSafeInteger(cents) || !Number.isSafeInteger(amountCents)) {
       throw new Error(`第 ${index + 1} 条：单价须大于零，金额和数量不能超出可计算范围`);
     }
     return { ...item, product: item.product.trim(), brand: item.brand.trim(), specification: item.specification.trim(), unit: item.unit.trim(), amountCents };
   });
-  const totalCents = items.reduce((total, item) => total + item.amountCents, 0);
+  const totalCents = items.reduce((total, item) => total + (item.amountCents ?? 0), 0);
   if (!Number.isSafeInteger(totalCents)) throw new Error('订单总额超出可计算范围');
   return { id: draft.id, revision: draft.revision, customer: draft.customer.trim(), items, totalCents, confirmedAt: '' };
 }
@@ -52,8 +86,8 @@ export function isObject(value: unknown): value is Record<string, unknown> {
 }
 export function isDraft(value: unknown): value is Draft {
   if (!isObject(value) || typeof value.id !== 'string' || !value.id || typeof value.customer !== 'string' || !Number.isSafeInteger(value.revision) || Number(value.revision) < 0 || !Array.isArray(value.items) || !value.items.length) return false;
-  const keys = ['id', 'product', 'brand', 'specification', 'unit', 'quantity', 'price'];
-  return value.items.every(item => isObject(item) && keys.every(key => typeof item[key] === 'string') && !!item.id)
+  const keys = ['id', 'product', 'brand', 'specification', 'unit', 'quantity'];
+  return value.items.every(item => isObject(item) && keys.every(key => typeof item[key] === 'string') && (item.price === null || typeof item.price === 'string') && !!item.id)
     && new Set(value.items.map(item => item.id)).size === value.items.length;
 }
 export function readState(raw: unknown, newId: string): State {

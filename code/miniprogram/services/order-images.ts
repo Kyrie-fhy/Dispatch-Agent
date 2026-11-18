@@ -1,4 +1,5 @@
-import { money } from '../core/orders';
+import { deliverySummary } from '../core/delivery-execution';
+import { amountLabel, lineView } from '../pages/order-view';
 import { CustomerOrder } from '../core/trips';
 
 type Context = WechatMiniprogram.CanvasRenderingContext.CanvasRenderingContext2D;
@@ -29,11 +30,12 @@ function layout(context: Context, customer: CustomerOrder, version: number) {
   const title = wrap(context, customer.customer, titleFont);
   const reference = wrap(context, `单据 ${customer.id} · 第 ${version} 版`, smallFont);
   const headerHeight = padding + title.length * 55 + reference.length * 34 + 24;
-  const total = wrap(context, `订单金额 ¥${money(customer.totalCents)}`, titleFont);
+  const total = wrap(context, amountLabel(customer.totalCents, deliverySummary(customer.items).pendingPrices, '订单金额'), titleFont);
   const footerHeight = total.length * 55 + 60;
   const rows = customer.items.map(item => {
-    const product = wrap(context, `${item.brand} ${item.product} · ${item.specification}`, bodyFont);
-    const amount = wrap(context, `${item.quantity} ${item.unit} × ¥${item.price} = ¥${money(item.amountCents)}`, bodyFont);
+    const line = lineView(item);
+    const product = wrap(context, line.productLabel, bodyFont);
+    const amount = wrap(context, `${line.quantity} ${line.unit} × ${line.priceLabel} = ${line.amountLabel}`, bodyFont);
     return { product, amount, height: (product.length + amount.length) * 42 + 30 };
   });
   const pages: { rows: typeof rows; height: number }[] = [];

@@ -1,4 +1,5 @@
-import { emptyItem, ItemInput, money } from '../../core/orders';
+import { deliveryLines, deliverySummary } from '../../core/delivery-execution';
+import { emptyItem, ItemInput, money, nullablePrice } from '../../core/orders';
 import { Material, materialImagePattern, MaterialSource } from '../../core/materials';
 import { deliveredBalance, localDay, OpeningPreview, ReceiptPreview, Sheet } from '../../core/settlement';
 import { textOrderLimit, textOrderQuestions } from '../../core/text-order';
@@ -8,7 +9,7 @@ import { chooseMaterial, forgetStaged, materialInfo, readChunk, sameMaterial, st
 import { readVoiceFile, startVoiceRecording, transcribeVoice, VoiceFileError, VoicePermissionError } from '../../services/voice';
 import { FormalTrip, revokeSession, TripPreview, wechatCode, Workspace, WorkspaceError, workspaceRequest } from '../../services/workspace';
 import { deliveryMvp } from '../../services/workspace-config';
-import { deliveryLabel, editLines, errorMessage, formLines, lineView, tripView } from '../order-view';
+import { amountLabel, deliveryLabel, editLines, errorMessage, formLines, lineView, productLabel, tripView } from '../order-view';
 import { AmendmentPreview, balanceChange, DeliveryMark, DeliveryPreview, ServerLedger, ServerSheet, settlementPreview,
   SheetAction, sheetPath, sheetView } from './sheet-view';
 
@@ -23,7 +24,7 @@ type FormalView = ReturnType<typeof tripView> & {
   statuses: Record<string, string>;
   picking: PickingLine[];
   changes: PickingChange[];
-  due: string[];
+  deliveryRows: { totalLabel: string; lines: ReturnType<typeof lineView>[] }[];
 };
 
 function sheetEditor() {
@@ -39,6 +40,7 @@ function sheetEditor() {
     },
     paymentPreview: null as ReturnType<typeof settlementPreview> | null,
     payment: { amount: '', day: '', source: '' },
+    fieldEdit: null as { id: string; receivedQuantity: string; price: string } | null,
     amendment: [] as ItemInput[],
     amendmentForm: [] as ReturnType<typeof formLines>,
     replacements: {} as Record<string, DeliveryMark>,
@@ -216,12 +218,19 @@ Page({
     if (this.data.section === 'materials') await this.loadMaterials(generation, token);
   },
 
-  formalView({ trip, picking }: FormalTrip): FormalView {
+  formalView({ trip, picking, deliveryEdits, sheets = [] }: FormalTrip): FormalView {
     const version = latest(trip);
     const previous = trip.versions[trip.versions.length - 2];
     const statuses = Object.fromEntries(Object.entries(trip.statuses).map(([id, status]) => [id, deliveryLabel[status]]));
-    return { ...tripView(version), id: trip.id, version: version.version, picking, statuses,
-      due: version.customers.map(customer => money(deliveredBalance(customer, trip.statuses, 0).due)),
+    const deliveryRows = version.customers.map(customer => {
+      const lines = deliveryLines(customer, deliveryEdits);
+      const { totalCents, pendingPrices } = deliverySummary(lines);
+      const reviewed = sheets.some(sheet => sheet.sheetId === customer.id && sheet.reviewed);
+      const due = reviewed ? deliveredBalance({ ...customer, items: lines }, trip.statuses, 0).due : totalCents;
+      return { lines: lines.map(line => lineView({ ...line, quantity: String(line.receivedQuantity) })),
+        totalLabel: amountLabel(due, pendingPrices, reviewed ? '本次应收' : '预计应收') };
+    });
+    return { ...tripView(version), deliveryRows, id: trip.id, version: version.version, picking, statuses,
       changes: previous ? pickingChanges(previous.customers, version.customers) : [] };
   },
 
@@ -336,8 +345,11 @@ Page({
   async persist(generation: number, token: string, draft: TripDraft) {
     if (!this.data.dirty) return draft;
     try {
+      const customers = draft.customers.map(customer => ({ ...customer,
+        items: customer.items.map(item => ({ ...item, price: nullablePrice(item.price) })),
+      }));
       const { draft: saved } = await this.command<{ draft: TripDraft }>('PUT', `/drafts/${draft.id}`, token,
-        { revision: draft.revision, customers: draft.customers });
+        { revision: draft.revision, customers });
       if (generation !== this.generation) return null;
       this.showDraft(saved, this.data.active?.id);
       this.setData({ dirty: false });
@@ -628,7 +640,7 @@ Page({
         const staleAmendment = this.data.sheetAction === 'amendment';
         this.pending = null;
         this.setData({
-          ...(staleAmendment ? sheetEditor() : { changePreview: null, paymentPreview: null }),
+          ...(staleAmendment ? sheetEditor() : { changePreview: null, paymentPreview: null, fieldEdit: null }),
           sheetNeedsRefresh: true,
         });
       }
@@ -671,6 +683,33 @@ Page({
     if (retry) return this.writeSheet(retry.route, retry.input);
   },
 
+  beginFieldEdit(event: WechatMiniprogram.TouchEvent) {
+    const sheet = this.data.sheet;
+    if (!this.data.deliveryMvp || !sheet || !this.sheetReady() || sheet.reviewed) return;
+    const line = sheet.lines.find(line => line.id === event.currentTarget.dataset.id);
+    if (!line) return;
+    this.setData({ error: '', fieldEdit: { id: line.id, receivedQuantity: String(line.receivedQuantity), price: line.price ?? '' } });
+  },
+
+  editDeliveryField(event: WechatMiniprogram.Input) {
+    const { field } = event.currentTarget.dataset;
+    if (!this.data.fieldEdit || !this.sheetReady() || (field !== 'receivedQuantity' && field !== 'price')) return;
+    this.setData({ fieldEdit: { ...this.data.fieldEdit, [field]: event.detail.value } });
+  },
+
+  saveFieldEdit() {
+    const { sheet, fieldEdit } = this.data;
+    if (!sheet || !fieldEdit || !this.sheetReady() || sheet.reviewed) return;
+    return this.writeSheet('/delivery/line', { version: sheet.version, statusRevision: sheet.statusRevision,
+      lineId: fieldEdit.id, receivedQuantity: fieldEdit.receivedQuantity.trim(), price: nullablePrice(fieldEdit.price) });
+  },
+
+  completeDelivery() {
+    const { sheet, fieldEdit } = this.data;
+    if (!this.data.deliveryMvp || !sheet || fieldEdit || !this.sheetReady() || sheet.reviewed) return;
+    return this.writeSheet('/delivery/complete', { version: sheet.version, statusRevision: sheet.statusRevision });
+  },
+
   markDelivery(event: WechatMiniprogram.TouchEvent) {
     const sheet = this.data.sheet;
     if (!sheet || !this.sheetReady() || this.data.sheetAction) return;
@@ -682,7 +721,7 @@ Page({
       const { preview } = await this.sheetCommand<{ preview: DeliveryPreview }>('/delivery/preview', input, this.token, sheet);
       if (generation !== this.generation) return;
       const line = sheet.lines.find(line => line.id === lineId);
-      const label = line ? `${line.brand} ${line.product} · ${line.specification} · ${line.unit}` : '本客户全部明细';
+      const label = line ? `${productLabel(line)} · ${line.unit}` : '本客户全部明细';
       this.setData({ sheetAction: 'delivery', changePreview: {
         id: preview.previewId, title: `${label} → ${deliveryLabel[status]}`, rows: this.sheetBalanceChange(preview.before, preview.after),
       } });
@@ -737,7 +776,7 @@ Page({
     const replacementLines = items.flatMap(item => {
       const old = originals.get(item.id);
       return old?.status === 'delivered' && pickingKey(old) !== pickingKey(item)
-        ? [{ id: item.id, status: statuses[item.id] ?? '', label: `${item.brand} ${item.product} · ${item.specification} · ${item.unit}` }] : [];
+        ? [{ id: item.id, status: statuses[item.id] ?? '', label: `${productLabel(item)} · ${item.unit}` }] : [];
     });
     const replacements = Object.fromEntries(replacementLines.filter(line => line.status).map(line => [line.id, line.status]));
     this.setData({ amendment: items, amendmentForm: formLines(items), replacements, replacementLines });

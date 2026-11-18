@@ -1,4 +1,4 @@
-import { isObject } from '../miniprogram/core/orders';
+import { isObject, unitPrice } from '../miniprogram/core/orders';
 import { parseAmount } from '../miniprogram/core/settlement';
 import { HttpError } from './http-error';
 
@@ -63,6 +63,23 @@ export function readDeliveryInput(value: unknown) {
     throw new HttpError(400, 'invalid_delivery', '请选择要更新的货品和配送状态');
   }
   return { ...basis, lineId, status } as const;
+}
+
+export function readDeliveryEdit(value: unknown) {
+  const basis = readReviewInput(value);
+  const { lineId, receivedQuantity, price } = value as Record<string, unknown>;
+  if (!validSheetKey(lineId) || typeof receivedQuantity !== 'string' || !/^(0|[1-9]\d*)$/.test(receivedQuantity)
+      || !Number.isSafeInteger(Number(receivedQuantity))) {
+    throw new HttpError(400, 'invalid_delivery_quantity', '实收数量须为零或正整数，且在可计算范围内');
+  }
+  if (price !== null && (typeof price !== 'string' || price.length > 40 || !price.trim())) {
+    throw new HttpError(400, 'invalid_delivery_price', '请输入有效单价，待补价请留空');
+  }
+  try {
+    return { ...basis, lineId, edit: { receivedQuantity: Number(receivedQuantity), unitPriceCents: unitPrice(price) } };
+  } catch (error) {
+    throw new HttpError(400, 'invalid_delivery_price', (error as Error).message);
+  }
 }
 
 function readLedgerAmount(value: unknown, label: string) {

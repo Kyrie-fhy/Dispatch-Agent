@@ -8,7 +8,7 @@ import { DeliveryStore } from './delivery';
 import { LedgerStore } from './ledger';
 import { MaterialStore, readMaterialInput } from './materials';
 import { TripStore } from './trips';
-import { readConfirmInput, readDeliveryInput, readNextInput, readOpeningInput, readPreviewInput, readReceiptInput,
+import { readConfirmInput, readDeliveryEdit, readDeliveryInput, readNextInput, readOpeningInput, readPreviewInput, readReceiptInput,
   readReviewInput, uuidPattern, validRevision, validSheetKey } from './request-input';
 import { HttpError } from './http-error';
 import { configuredWechatLogin, readWechatCode, WechatLogin } from './wechat-login';
@@ -205,7 +205,7 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
     return;
   }
 
-  const sheetRoute = /^\/v1\/trips\/([^/]+)\/sheets\/([^/]+)(?:\/(delivery(?:\/(?:preview|confirm))?|review|ledger|(?:opening|receipt|amendment)\/(?:preview|confirm)))?$/.exec(path);
+  const sheetRoute = /^\/v1\/trips\/([^/]+)\/sheets\/([^/]+)(?:\/(delivery(?:\/(?:preview|confirm|line|complete))?|review|ledger|(?:opening|receipt|amendment)\/(?:preview|confirm)))?$/.exec(path);
   if (sheetRoute && uuidPattern.test(sheetRoute[1])) {
     const [, sheetTripId, key, action] = sheetRoute;
     let sheetId: string;
@@ -240,6 +240,8 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
         sendJson(response, 200, { preview });
       } else {
         const sheet = action === 'review' ? await delivery.review(account, sheetTripId, sheetId, readReviewInput(body))
+          : action === 'delivery/line' ? await delivery.editLine(account, sheetTripId, sheetId, readDeliveryEdit(body))
+          : action === 'delivery/complete' ? await delivery.complete(account, sheetTripId, sheetId, readReviewInput(body))
           : action === 'delivery/confirm' ? await delivery.confirm(account, sheetTripId, sheetId, readConfirmInput(body))
           : await delivery.setDelivery(account, sheetTripId, sheetId, readDeliveryInput(body));
         sendJson(response, 200, { sheet });

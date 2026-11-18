@@ -602,3 +602,133 @@ test('a receipt opened from a newer sheet pays earlier reviewed sheets of that p
   assert.equal((await newer()).data.sheet.amounts.remaining, 12800);
   assert.equal((await newer('ledger')).data.ledger.otherRemainingCents, 0);
 });
+
+test('amending a settled historical sheet preserves allocations and leaves current picking on the current trip', { timeout: 20_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  let api = await start(db);
+  const a = await login(api, 'a');
+  const b = await login(api, 'b');
+  const formal = await formalExample(api, a);
+  const id = formal.trip.id;
+  const older = sheetEndpoint(api, a, id, 'sheet-a');
+  const checked = await deliverAndReview(older, 'older');
+  const payment = await older('receipt/preview', { requestId: 'pay-preview', amount: '164' });
+  assert.equal(payment.status, 200);
+  const paid = await older('receipt/confirm', { requestId: 'pay-confirm', previewId: payment.data.preview.id });
+  assert.equal(paid.status, 200);
+
+  const fresh = await tripCommand(api, a, 'next-draft', { requestId: 'next', draftId: id });
+  assert.equal(fresh.status, 200);
+  const [customer] = exampleCustomers();
+  const draft = await putCustomers(api, a, fresh.data.draft, 'save-next', [{
+    ...customer, partyId: checked.partyId, items: [line('line-next', '安井', '箱', '1', '50')],
+  }]);
+  const next = await preview(api, a, draft, 'preview-next');
+  assert.equal(next.status, 200);
+  const current = await confirm(api, a, next.data.preview.previewId, 'confirm-next');
+  assert.equal(current.status, 200);
+  const newer = sheetEndpoint(api, a, draft.id, 'sheet-a');
+  await deliverAndReview(newer, 'newer');
+
+  const base = { version: 1, statusRevision: checked.statusRevision, items: [line('line-a', '安井', '箱', '2', '110')] };
+  const foreign = sheetEndpoint(api, b, id, 'sheet-a');
+  assert.equal((await foreign('amendment/preview', { ...base, requestId: 'foreign' })).status, 404);
+  const edited = await older('amendment/preview', { ...base, requestId: 'change-price' });
+  assert.equal(edited.status, 200, JSON.stringify(edited.data));
+  const { preview: correction } = edited.data;
+  assert.deepEqual(correction.orderCents, { before: 16400, after: 22000 });
+  assert.deepEqual(correction.before, { due: 16400, paid: 16400, remaining: 0, excess: 0 });
+  assert.deepEqual(correction.after, { due: 22000, paid: 16400, remaining: 5600, excess: 0 });
+  assert.deepEqual(correction.picking, []);
+  assert.equal(correction.changes[0].afterStatus, 'delivered');
+  const parked = (await older()).data.sheet;
+  assert.equal(parked.version, 1);
+  assert.equal(parked.amounts.remaining, 0);
+
+  const apply = { requestId: 'apply-amendment', previewId: correction.previewId };
+  assert.equal((await foreign('amendment/confirm', apply)).status, 404);
+  assert.equal((await newer('amendment/confirm', apply)).status, 404);
+  const saved = await older('amendment/confirm', apply);
+  assert.equal(saved.status, 200, JSON.stringify(saved.data));
+  assert.equal(saved.data.version.version, 2);
+  assert.equal(saved.data.version.totalCents, 59500);
+  assert.deepEqual(await older('amendment/confirm', apply), saved);
+  assert.deepEqual(await older('amendment/confirm', { ...apply, requestId: 'confirm-already-saved' }), saved);
+
+  await api.stop();
+  api = await start(db);
+  const resumed = await login(api, 'a');
+  const original = (await api.request(`/v1/trips/${id}`, { token: resumed })).data;
+  assert.deepEqual(original.trip.versions, [formal.trip.versions[0], saved.data.version]);
+  assert.deepEqual(original.picking, formal.picking);
+  const oldSheet = sheetEndpoint(api, resumed, id, 'sheet-a');
+  assert.deepEqual((await oldSheet()).data.sheet.amounts, correction.after);
+  assert.deepEqual((await oldSheet('ledger')).data.ledger.receipts, [paid.data.receipt]);
+  const latest = (await api.request('/v1/workspace', { token: resumed })).data;
+  assert.deepEqual(latest.currentTrip, { id: draft.id, totalCents: 5000, version: 1 });
+  const nextTrip = (await api.request(`/v1/trips/${draft.id}`, { token: resumed })).data;
+  assert.deepEqual(nextTrip.picking, current.data.picking);
+  assert.equal((await sheetEndpoint(api, resumed, draft.id, 'sheet-a')('ledger')).data.ledger.otherRemainingCents, 5600);
+});
+
+test('amendment rejects changed delivery and receipts and writes the new version atomically', { timeout: 20_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const api = await start(db);
+  const a = await login(api, 'a');
+  const { trip: { id } } = await formalExample(api, a);
+  const sheet = sheetEndpoint(api, a, id, 'sheet-a');
+  const sheetB = sheetEndpoint(api, a, id, 'sheet-b');
+  const checked = await deliverAndReview(sheet, 'review-a');
+  const basis = { version: 1, statusRevision: checked.statusRevision };
+  const replacement = [line('line-a', '三全', '箱', '2', '50'), line('line-extra', '安井', '袋', '1', '10')];
+  const edit = { ...basis, items: replacement, replacementStatuses: { 'line-a': 'pending' } };
+  const requiresChoice = await sheet('amendment/preview', { ...edit, requestId: 'missing-choice', replacementStatuses: {} });
+  assert.equal(requiresChoice.status, 400);
+  assert.match(requiresChoice.data.message, /替换货品的配送状态/);
+  const repeatedLine = await sheet('amendment/preview', { ...edit, requestId: 'foreign-line-id',
+    items: [replacement[0], line('line-b-box', '安井', '袋', '1', '10')] });
+  assert.equal(repeatedLine.status, 400);
+  const deliveryStale = await sheet('amendment/preview', { ...edit, requestId: 'will-change-delivery' });
+  assert.equal(deliveryStale.status, 200);
+  const b = await deliverAndReview(sheetB, 'review-b', basis.statusRevision);
+  const applyStale = preview => sheet('amendment/confirm', { requestId: 'stale-amendment', previewId: preview.data.preview.previewId });
+  assert.equal((await applyStale(deliveryStale)).data.error, 'amendment_changed');
+
+  const next = { ...edit, statusRevision: b.statusRevision };
+  const receiptStale = await sheet('amendment/preview', { ...next, requestId: 'will-change-receipt' });
+  assert.equal(receiptStale.status, 200);
+  const paying = await sheet('receipt/preview', { requestId: 'planned-payment', amount: '90' });
+  assert.equal(paying.status, 200);
+  assert.equal((await sheet('receipt/confirm', { requestId: 'record-payment', previewId: paying.data.preview.id })).status, 200);
+  assert.equal((await applyStale(receiptStale)).data.error, 'amendment_changed');
+
+  const original = (await api.request(`/v1/trips/${id}`, { token: a })).data;
+  const fresh = await sheet('amendment/preview', { ...next, requestId: 'fresh-amendment' });
+  assert.equal(fresh.status, 200);
+  assert.deepEqual(fresh.data.preview.after, { due: 0, paid: 9000, remaining: 0, excess: 9000 });
+  assert.equal(fresh.data.preview.picking.length, 3);
+  const sameBase = await sheet('amendment/preview', { ...next, requestId: 'competing-amendment',
+    replacementStatuses: { 'line-a': 'delivered' } });
+  assert.equal(sameBase.status, 200);
+  const submit = { requestId: 'save-amendment', previewId: fresh.data.preview.previewId };
+  await db.admin.query("ALTER TABLE dispatch.request_results ADD CONSTRAINT test_amendment_failed CHECK (request_id <> 'save-amendment')");
+  assert.equal((await sheet('amendment/confirm', submit)).status, 500);
+  assert.deepEqual((await api.request(`/v1/trips/${id}`, { token: a })).data, original);
+  await db.admin.query('ALTER TABLE dispatch.request_results DROP CONSTRAINT test_amendment_failed');
+
+  const results = await Promise.all([
+    sheet('amendment/confirm', submit),
+    sheet('amendment/confirm', { ...submit, requestId: 'same-amendment-concurrent' }),
+  ]);
+  assert.equal(results[0].status, 200, JSON.stringify(results[0].data));
+  assert.deepEqual(results[1], results[0]);
+  const staleVersion = await applyStale(sameBase);
+  assert.equal(staleVersion.status, 409);
+  assert.equal(staleVersion.data.error, 'amendment_changed');
+  const amended = (await api.request(`/v1/trips/${id}`, { token: a })).data;
+  assert.equal(amended.trip.versions.length, 2);
+  assert.equal(amended.trip.statuses['line-a'], 'pending');
+  assert.equal(amended.trip.statuses['line-extra'], 'pending');
+  assert.equal(amended.trip.statuses['line-b-box'], 'delivered');
+  assert.deepEqual((await sheet()).data.sheet.amounts, fresh.data.preview.after);
+});

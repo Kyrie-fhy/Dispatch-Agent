@@ -9,7 +9,7 @@ import { readConfirmInput, readDeliveryInput, readReviewInput, validRevision } f
 type ReviewBasis = Omit<ReturnType<typeof readReviewInput>, 'requestId'>;
 type DeliveryChange = Omit<ReturnType<typeof readDeliveryInput>, 'requestId'>;
 type SheetRow = Account & ReviewBasis & { statuses: Trip['statuses']; customers: CustomerOrder[]; paid: string };
-type SheetState = Omit<SheetRow, 'customers' | 'paid'> & { customer: CustomerOrder; paid: number };
+type SheetState = Omit<SheetRow, 'paid'> & { customer: CustomerOrder; paid: number };
 
 interface DeliveryPreview {
   previewId: string;
@@ -51,16 +51,37 @@ function planDelivery(state: SheetState, change: DeliveryChange) {
   };
 }
 
+export async function readFormalSheet(client: PoolClient, accountId: string, tripId: string, sheetId: string): Promise<SheetState> {
+  const { rows: [row] } = await client.query<SheetRow>(`
+    SELECT s.trip_id AS "tripId", s.id AS "sheetId", s.party_id AS "partyId", s.reviewed,
+           t.statuses, t.status_revision AS "statusRevision", v.version, v.customers,
+           COALESCE((SELECT sum(cents) FROM dispatch.receipt_allocations
+             WHERE account_id = s.account_id AND trip_id = s.trip_id AND sheet_id = s.id), 0)::text AS paid
+    FROM dispatch.sheets s
+    JOIN dispatch.trips t ON t.account_id = s.account_id AND t.id = s.trip_id
+    JOIN LATERAL (
+      SELECT version, customers FROM dispatch.trip_versions
+      WHERE account_id = s.account_id AND trip_id = s.trip_id ORDER BY version DESC LIMIT 1
+    ) v ON true
+    WHERE s.account_id = $1 AND s.trip_id = $2 AND s.id = $3
+  `, [accountId, tripId, sheetId]);
+  if (!row) throw new HttpError(404, 'sheet_not_found', '未找到客户单');
+  const customer = row.customers.find(entry => entry.id === sheetId);
+  if (!customer) throw new Error('正式版本缺少客户明细');
+  return { ...row, customer, paid: Number(row.paid) };
+}
+
+
 export class DeliveryStore {
   constructor(private readonly pool: Pool) {}
 
   sheet(accountId: string, tripId: string, sheetId: string) {
-    return readAccount(this.pool, accountId, async client => sheetDetails(await this.readSheet(client, accountId, tripId, sheetId)));
+    return readAccount(this.pool, accountId, async client => sheetDetails(await readFormalSheet(client, accountId, tripId, sheetId)));
   }
 
   setDelivery(accountId: string, tripId: string, sheetId: string, { requestId, ...change }: ReturnType<typeof readDeliveryInput>) {
     return writeAccount(this.pool, accountId, requestId, { action: 'set-delivery', tripId, sheetId, change }, async client => {
-      const state = await this.readSheet(client, accountId, tripId, sheetId);
+      const state = await readFormalSheet(client, accountId, tripId, sheetId);
       const plan = planDelivery(state, change);
       if (state.reviewed && plan.changed) throw new HttpError(409, 'delivery_preview_required', '本单已核对，请先预览配送与账目变化');
       return this.applyDelivery(client, accountId, state, plan);
@@ -69,7 +90,7 @@ export class DeliveryStore {
 
   preview(accountId: string, tripId: string, sheetId: string, { requestId, ...change }: ReturnType<typeof readDeliveryInput>) {
     return writeAccount(this.pool, accountId, requestId, { action: 'preview-delivery', tripId, sheetId, change }, async client => {
-      const state = await this.readSheet(client, accountId, tripId, sheetId);
+      const state = await readFormalSheet(client, accountId, tripId, sheetId);
       const plan = planDelivery(state, change);
       const preview: DeliveryPreview = {
         previewId: randomUUID(), change, before: amounts(state), after: amounts(state, plan.statuses),
@@ -89,7 +110,7 @@ export class DeliveryStore {
         WHERE account_id = $1 AND id = $2 AND trip_id = $3 AND sheet_id = $4
       `, [accountId, previewId, tripId, sheetId]);
       if (!stored) throw new HttpError(404, 'preview_not_found', '未找到本客户的配送预览，请重新生成');
-      const state = await this.readSheet(client, accountId, tripId, sheetId);
+      const state = await readFormalSheet(client, accountId, tripId, sheetId);
       if (state.paid !== stored.preview.before.paid) {
         throw new HttpError(409, 'delivery_changed', '本单实收已变化，请重新预览配送与账目变化');
       }
@@ -99,7 +120,7 @@ export class DeliveryStore {
 
   review(accountId: string, tripId: string, sheetId: string, { requestId, ...basis }: ReturnType<typeof readReviewInput>) {
     return writeAccount(this.pool, accountId, requestId, { action: 'review-sheet', tripId, sheetId, ...basis }, async client => {
-      const state = await this.readSheet(client, accountId, tripId, sheetId);
+      const state = await readFormalSheet(client, accountId, tripId, sheetId);
       checkBasis(state, basis);
       if (state.customer.items.some(item => state.statuses[item.id] === 'unrecorded')) {
         throw new HttpError(409, 'unrecorded_delivery', '请先标记所有未记录的明细');
@@ -111,27 +132,6 @@ export class DeliveryStore {
       }
       return sheetDetails({ ...state, reviewed: true });
     });
-  }
-
-  private async readSheet(client: PoolClient, accountId: string, tripId: string, sheetId: string): Promise<SheetState> {
-    const { rows: [row] } = await client.query<SheetRow>(`
-      SELECT s.trip_id AS "tripId", s.id AS "sheetId", s.party_id AS "partyId", s.reviewed,
-             t.statuses, t.status_revision AS "statusRevision", v.version, v.customers,
-             COALESCE((SELECT sum(cents) FROM dispatch.receipt_allocations
-               WHERE account_id = s.account_id AND trip_id = s.trip_id AND sheet_id = s.id), 0)::text AS paid
-      FROM dispatch.sheets s
-      JOIN dispatch.trips t ON t.account_id = s.account_id AND t.id = s.trip_id
-      JOIN LATERAL (
-        SELECT version, customers FROM dispatch.trip_versions
-        WHERE account_id = s.account_id AND trip_id = s.trip_id ORDER BY version DESC LIMIT 1
-      ) v ON true
-      WHERE s.account_id = $1 AND s.trip_id = $2 AND s.id = $3
-    `, [accountId, tripId, sheetId]);
-    if (!row) throw new HttpError(404, 'sheet_not_found', '未找到客户单');
-    const { customers, paid, ...state } = row;
-    const customer = customers.find(entry => entry.id === sheetId);
-    if (!customer) throw new Error('正式版本缺少客户明细');
-    return { ...state, customer, paid: Number(paid) };
   }
 
   private async applyDelivery(client: PoolClient, accountId: string, state: SheetState, plan: ReturnType<typeof planDelivery>) {

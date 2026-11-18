@@ -30,7 +30,7 @@ type TripRow = {
   statusRevision: number;
 };
 
-type VersionRow = Omit<TripVersion, 'totalCents' | 'savedAt'> & { totalCents: string; savedAt: Date };
+type VersionRow = Omit<TripVersion, 'totalCents' | 'savedAt' | 'amendmentId'> & { totalCents: string; savedAt: Date; amendmentId: string | null };
 
 function draftChanged(): HttpError {
   return new HttpError(409, 'draft_changed', '草稿已变化，请按最新草稿重新预览');
@@ -173,12 +173,13 @@ export class TripStore {
     const row = known ?? await this.tripRow(client, accountId, tripId);
     if (!row) throw missingTrip();
     const { rows } = await client.query<VersionRow>(`
-      SELECT version, customers, total_cents AS "totalCents", saved_at AS "savedAt"
+      SELECT version, customers, total_cents AS "totalCents", saved_at AS "savedAt", amendment_id AS "amendmentId"
       FROM dispatch.trip_versions WHERE account_id = $1 AND trip_id = $2 ORDER BY version
     `, [accountId, tripId]);
     if (!rows.length) throw new Error('正式单缺少版本快照');
     const versions = rows.map(row => ({
       version: row.version, customers: row.customers, totalCents: Number(row.totalCents), savedAt: row.savedAt.toISOString(),
+      ...(row.amendmentId ? { amendmentId: row.amendmentId } : {}),
     }));
     const trip: Trip = { id: tripId, origin: 's2', versions, statuses: row.statuses, statusRevision: row.statusRevision };
     const { rows: sheets } = await client.query<Account>(`

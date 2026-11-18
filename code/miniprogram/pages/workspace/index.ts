@@ -15,6 +15,7 @@ import { AmendmentPreview, balanceChange, DeliveryMark, DeliveryPreview, ServerL
 type Section = 'draft' | 'picking' | 'delivery' | 'materials';
 type VoiceFile = { id: string; revision: number; path: string };
 type VoicePhase = '' | 'starting' | 'recording' | 'stopping' | 'transcribing';
+const draftConflictCodes = ['draft_changed', 'draft_confirmed', 'draft_not_found'];
 type PreviewView = ReturnType<typeof tripView> & { previewId: string; identities: string[] };
 type FormalView = ReturnType<typeof tripView> & {
   id: string;
@@ -343,7 +344,7 @@ Page({
       return saved;
     } catch (error) {
       if (generation !== this.generation) return null;
-      if (error instanceof WorkspaceError && ['draft_changed', 'draft_confirmed', 'draft_not_found'].includes(error.code)) {
+      if (error instanceof WorkspaceError && draftConflictCodes.includes(error.code)) {
         const conflict = await this.readWorkspace(token);
         if (generation === this.generation) this.setData({ conflict });
       }
@@ -459,7 +460,7 @@ Page({
       const combined = orderText.trim() ? `${orderText}\n${text}` : text;
       if (combined.length > textOrderLimit) {
         this.setData({ section: 'draft' });
-        throw new Error('文字框内容过长，请先整理已有文字后重试转写。');
+        throw new Error('合并后的文字超出字数限制，请缩短文字框中的内容后再用原录音重试。');
       }
       this.voiceFile = null;
       this.setData({ section: 'draft', orderText: combined, textNotice: '转写已填入，请编辑核对后再整理到草稿。' });
@@ -470,8 +471,24 @@ Page({
         }
         this.setData({ voiceRetry: this.voiceFile === file });
       }
+      await this.recoverMaterialDraft(generation, token, error);
+    }
+  },
+
+  async recoverMaterialDraft(generation: number, token: string, error: unknown): Promise<never> {
+    if (generation !== this.generation || !(error instanceof WorkspaceError) || !draftConflictCodes.includes(error.code)) {
       throw error;
     }
+    const latest = await this.readWorkspace(token);
+    if (generation !== this.generation) throw error;
+    if (this.data.dirty) {
+      this.setData({ conflict: latest, section: 'draft' });
+      throw new Error('草稿已变化，请先核对工作区的最新草稿。');
+    }
+    const sameTrip = latest.draft.id === this.data.draft?.id;
+    await this.restore(generation, token, latest);
+    throw new Error(!sameTrip ? '已切换到新一趟。请为当前趟重新录入材料。'
+      : latest.draftConfirmed ? '本趟已确认，请开始下一趟。' : '已刷新草稿，请核对最新明细后重试。');
   },
 
   acceptOrganizedDraft(before: TripDraft, after: unknown, source: '文字' | '图片') {
@@ -497,7 +514,8 @@ Page({
         const saved = await this.persist(generation, token, draft);
         if (!saved || generation !== this.generation) return;
         const result = await this.command<{ draft: TripDraft }>('POST', '/text-orders', token,
-          { draftId: saved.id, revision: saved.revision, text }, 25_000);
+          { draftId: saved.id, revision: saved.revision, text }, 25_000)
+          .catch(error => this.recoverMaterialDraft(generation, token, error));
         if (generation !== this.generation) return;
         this.acceptOrganizedDraft(saved, result?.draft, '文字');
         this.setData({ orderText: '' });
@@ -806,10 +824,12 @@ Page({
     const row = this.data.materialRows.find(item => item.id === event.currentTarget.dataset.id);
     if (!deliveryMvp || !draft || draftConfirmed || dirty || conflict || preview || !this.token || !row?.canOrganize) return;
     return this.run(async generation => {
+      const token = this.token;
       this.setData({ organizingImage: row.name, materialNotice: '' });
       try {
-        const result = await this.command<{ draft: TripDraft }>('POST', '/image-orders', this.token,
-          { draftId: draft.id, revision: draft.revision, materialId: row.id }, 25_000);
+        const result = await this.command<{ draft: TripDraft }>('POST', '/image-orders', token,
+          { draftId: draft.id, revision: draft.revision, materialId: row.id }, 25_000)
+          .catch(error => this.recoverMaterialDraft(generation, token, error));
         if (generation !== this.generation) return;
         this.acceptOrganizedDraft(draft, result?.draft, '图片');
         this.setData({ section: 'draft' });

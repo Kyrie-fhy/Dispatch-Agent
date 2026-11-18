@@ -30,7 +30,7 @@ npm run build
 
 上述命令构建配送 MVP。用微信开发者工具导入项目根目录，运行目录为 `code/dist`。把测试号 AppID 填入本地 `project.private.config.json`，仓库里的 `touristappid` 用于占位。启动服务时配置 PostgreSQL、微信会话和 DeepSeek。迁移、模型配置及同网手机预览从 [S7b 启动和验收](docs/S7b语音录单.md#启动和验收)进入。
 
-`npm run build:s4` 构建 S4 本地模拟原型。`npm run build:s5` 和 `npm run build:s6` 均为配送 MVP 默认构建的兼容别名。各命令共用 `code/dist`，运行 `npm run build` 可从 S4 切回配送 MVP。
+`npm run build:s4` 构建 S4 本地模拟原型。`npm run build:s5` 构建含对账与收款入口的 S5 工作区。`npm run build:s6` 是配送 MVP 默认构建的兼容别名。各命令共用 `code/dist`，运行 `npm run build` 可切回配送 MVP。
 
 使用开发者工具 CLI 或自动化时，在项目窗口的 macOS 菜单栏进入「设置 → 安全设置」，开启「服务端口」。也可按 `⌘ + ,` 打开设置后切到「安全」。重置演示数据会清除当前设备的本地原型数据，由用户在页面弹窗中确认。
 

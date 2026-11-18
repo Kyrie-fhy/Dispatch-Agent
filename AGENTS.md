@@ -10,7 +10,7 @@
 
 小程序源码在 `code/miniprogram`，共用业务规则在其 `core` 目录。工作区 TypeScript 服务和 PostgreSQL 迁移在 `code/server`。启动与检查见 [README](README.md)。`code/dist` 和 `code/server-dist` 均为构建产物。
 
-`npm run build` 默认构建当前配送 MVP，`build:s5` 和 `build:s6` 为兼容别名。`npm run build:s4` 用于 S4 本地模拟原型。`npm run check` 保留 S4 编译检查，之后构建配送 MVP 并运行测试，成功后 `code/dist` 留存配送 MVP。
+`npm run build` 默认构建当前配送 MVP，`build:s6` 为兼容别名。`npm run build:s4` 用于 S4 本地模拟原型，`npm run build:s5` 用于含对账与收款入口的 S5 工作区。`npm run check` 保留 S4 编译检查，之后构建配送 MVP 并运行测试，成功后 `code/dist` 留存配送 MVP。
 
 ## 实现与验证
 

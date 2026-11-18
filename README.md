@@ -2,7 +2,7 @@
 
 面向速冻食品配送员的微信原生 TypeScript 小程序。当前 MVP 聚焦录单、取货、按客户送货和本次应收。
 
-接手请先读[开发任务](docs/开发任务.md)，确认分支、验收范围和下一步。配送 MVP 使用微信会话和 PostgreSQL 工作区，支持文字、图片和可编辑语音转写录单。
+接手请先读[开发任务](docs/开发任务.md)，确认分支、验收范围和下一步。配送 MVP 使用微信会话和 PostgreSQL 工作区，支持文字、图片和可编辑语音转写录单。可先出待补价单，到店按实收数量补价并锁定应收。
 
 ## 文档入口
 
@@ -28,7 +28,7 @@ npm run check
 npm run build
 ```
 
-上述命令构建配送 MVP。用微信开发者工具导入项目根目录，运行目录为 `code/dist`。把测试号 AppID 填入本地 `project.private.config.json`，仓库里的 `touristappid` 用于占位。启动服务时配置 PostgreSQL、微信会话和 DeepSeek。迁移、模型配置及同网手机预览从 [S7b 启动和验收](docs/S7b语音录单.md#启动和验收)进入。
+上述命令构建配送 MVP。用微信开发者工具导入项目根目录，运行目录为 `code/dist`。把测试号 AppID 填入本地 `project.private.config.json`，仓库里的 `touristappid` 用于占位。启动服务时配置 PostgreSQL、微信会话和 DeepSeek。启用 S7d 配送 API 前应用迁移 009。模型配置及同网手机预览从 [S7b 启动和验收](docs/S7b语音录单.md#启动和验收)进入。
 
 `npm run build:s4` 构建 S4 本地模拟原型。`npm run build:s5` 构建含对账与收款入口的 S5 工作区。`npm run build:s6` 是配送 MVP 默认构建的兼容别名。各命令共用 `code/dist`，运行 `npm run build` 可切回配送 MVP。
 
@@ -50,4 +50,4 @@ scripts/              构建和文档链接检查
 
 ## 协作
 
-`main` 已合入截至 S7c 的配送 MVP。PR #19 作为独立的账务扩展草稿保留。当前分支基线和待验事项见[开发任务](docs/开发任务.md#远端与试用)，PR 交付要求见[项目约定](AGENTS.md#git-与交付)。
+主线与账务扩展的当前状态见[开发任务](docs/开发任务.md#远端与试用)，PR 交付要求见[项目约定](AGENTS.md#git-与交付)。

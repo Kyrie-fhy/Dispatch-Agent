@@ -1297,7 +1297,8 @@ test('S7a organizes a private image once, retries failures and protects newer dr
 
 test('S7b transcribes WAV without changing a draft and rejects stale results', { timeout: 20_000 }, async t => {
   const db = await isolatedDatabase(t);
-  const wave = Buffer.alloc(44 + 320);
+  const pcmSize = 640_000;
+  const wave = Buffer.alloc(44 + pcmSize);
   wave.write('RIFF', 0);
   wave.writeUInt32LE(wave.length - 8, 4);
   wave.write('WAVEfmt ', 8);
@@ -1309,7 +1310,7 @@ test('S7b transcribes WAV without changing a draft and rejects stale results', {
   wave.writeUInt16LE(2, 32);
   wave.writeUInt16LE(16, 34);
   wave.write('data', 36);
-  wave.writeUInt32LE(320, 40);
+  wave.writeUInt32LE(pcmSize, 40);
 
   const originalFetch = global.fetch;
   const calls = [];
@@ -1341,14 +1342,19 @@ test('S7b transcribes WAV without changing a draft and rejects stale results', {
   const transcribe = (token, basis, chunk = wave) => api.request(`/v1/drafts/${basis.id}/transcription`, {
     method: 'POST', token, chunk, headers: { 'content-type': 'audio/wav', 'x-draft-revision': String(basis.revision) },
   });
+  const transcribeJson = (token, basis, audio = wave.toString('base64')) => api.request(`/v1/drafts/${basis.id}/transcription`, {
+    method: 'POST', token, body: { wave: audio }, headers: { 'x-draft-revision': String(basis.revision) },
+  });
   assert.equal((await transcribe('', draft)).status, 401);
   assert.equal((await transcribe(b, draft)).status, 404);
   assert.equal((await transcribe(a, draft, Buffer.from('invalid'))).data.error, 'invalid_voice');
+  assert.equal((await transcribe(a, draft, wave.subarray(0, wave.length - 44))).data.error, 'invalid_voice');
+  assert.equal((await transcribeJson(a, draft, 'AAAA?')).data.error, 'invalid_voice');
   const oversized = await transcribe(a, draft, Buffer.alloc(8 * 1024 * 1024 + 1));
   assert.equal(oversized.status, 413);
   assert.equal(calls.length, 0);
   assert.equal((await transcribe(a, draft)).data.error, 'voice_model_failed');
-  assert.deepEqual(await transcribe(a, draft), {
+  assert.deepEqual(await transcribeJson(a, draft), {
     status: 200, data: { draftId: draft.id, revision: 0, text: '老王需要两箱安井水饺。' },
   });
   assert.deepEqual(await read(api, a), draft);

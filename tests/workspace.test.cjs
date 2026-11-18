@@ -556,6 +556,7 @@ test('S7b handles permission, interruption and retry before submitting editable 
       allowed = true;
       success({ authSetting: { 'scope.record': true } });
     },
+    arrayBufferToBase64: bytes => Buffer.from(bytes).toString('base64'),
     getRecorderManager: () => ({
       onStart: listener => { callbacks.start = listener; },
       onStop: listener => { callbacks.stop = listener; },
@@ -598,7 +599,7 @@ test('S7b handles permission, interruption and retry before submitting editable 
   const failed = page.recordOrderVoice();
   page.stopOrderVoice();
   const first = await take('POST', `/drafts/${tripId}/transcription`, tokenA);
-  const wave = Buffer.from(first.data);
+  const wave = Buffer.from(first.data.wave, 'base64');
   assert.equal(wave.toString('ascii', 0, 4), 'RIFF');
   assert.equal(wave.readUInt32LE(4), wave.length - 8);
   assert.equal(wave.toString('ascii', 8, 16), 'WAVEfmt ');
@@ -610,7 +611,7 @@ test('S7b handles permission, interruption and retry before submitting editable 
   assert.equal(wave.toString('ascii', 36, 40), 'data');
   assert.equal(wave.readUInt32LE(40), audio.byteLength);
   assert.deepEqual(wave.subarray(44), Buffer.from(audio));
-  assert.equal(first.header['Content-Type'], 'audio/wav');
+  assert.equal(first.header['Content-Type'], 'application/json');
   assert.equal(first.header['X-Draft-Revision'], '2');
   first.respond(502, { message: '语音转写暂未完成' });
   await failed;

@@ -12,7 +12,7 @@
 
 ## 服务边界
 
-`POST /v1/drafts/{id}/transcription` 使用工作区凭证、`X-Draft-Revision` 和 `Content-Type: audio/wav`。服务校验单声道 16 位 PCM WAV、音频时长和 8 MiB 请求上限。音频以 multipart 的 `file` 字段发给 DeepSeek，返回 `{draftId, revision, text}`。模型前后重新校验会话、当前趟和草稿修订。录音与转写仅在处理请求和当前页面时使用，草稿由下一次文字整理请求写入。现有材料上传仍用于图片。[DeepSeek Speech to Text](https://api-docs.deepseek.com/guides/asr/)
+`POST /v1/drafts/{id}/transcription` 使用工作区凭证、`X-Draft-Revision` 和 JSON `{wave}`，其中 `wave` 为完整 WAV 的 Base64 编码。服务也接受 `audio/wav` 二进制请求。服务校验单声道 16 位 PCM WAV、音频时长和 8 MiB 音频上限。音频以 multipart 的 `file` 字段发给 DeepSeek，返回 `{draftId, revision, text}`。模型前后重新校验会话、当前趟和草稿修订。录音与转写仅在处理请求和当前页面时使用，草稿由下一次文字整理请求写入。现有材料上传仍用于图片。[DeepSeek Speech to Text](https://api-docs.deepseek.com/guides/asr/)
 
 ## 执行记录
 
@@ -20,9 +20,9 @@
 |---|---|
 | TypeScript 和配送 MVP 构建 | 通过 |
 | 业务和页面事件模拟 | 36 项。覆盖麦克风拒绝后恢复、系统和切后台中断、原录音重试、已有文字保留、编辑后提交和旧会话回包 |
-| 隔离 PostgreSQL 17.4 | 19 项。新增验证跨账号拒绝、无效与过大 WAV、供应商失败和重试、修订变化后丢弃回包、转写不写入草稿或正式单 |
-| 微信开发者工具 | 使用 `d15e` 测试号编译原版及 PCM 封装修复版，生成同网预览码 |
+| 隔离 PostgreSQL 17.4 | 19 项。覆盖跨账号拒绝、无效、截短及过大 WAV、Base64 解码后字节一致、供应商失败和重试、修订变化后丢弃回包、转写期间保持草稿和正式单 |
+| 微信开发者工具 | 使用 `d15e` 测试号编译并生成同网预览码，覆盖 PCM 封装版和 JSON 传输版 |
 | DeepSeek 真实 ASR | 4.085 秒的本机合成单声道 16 kHz PCM WAV 通过。输出「给老王送两箱安井水饺，每箱82元。」，草稿保持原修订 |
-| 安卓真机 | 首次同网试用成功登录。原生 WAV 上传两次，服务返回格式错误。修复版录制 PCM，由小程序封装 WAV。本地事件测试已核对 WAV 文件头和原始 PCM 字节，等待真机复测 |
+| 安卓真机 | 首轮原生 WAV 被拒。小程序封装 WAV 后，真机诊断确认文件头为单声道 16 kHz、16 位 PCM。文件头声明完整文件 221,484 字节，二进制请求体实收 221,440 字节，少 44 字节，触发完整性校验。新版以 Base64 随 JSON 发送，等待真机复测 |
 
 真实 ASR 合成样本运行 ID 为 `7e2aaea6-b614-4528-ae61-a72cfe0aa7ab`，供应商请求 ID 为 `6a8b7ad5-1d13-4c02-b317-f16ba72f061a`。模型耗时 1,046 ms，接口耗时 1,063 ms。对照语句与识别结果的品牌、货品、数量、单位和价格一致。

@@ -16,15 +16,15 @@ import { isObject } from '../miniprogram/core/orders';
 import { materialChunkBytes } from '../miniprogram/core/materials';
 import { configuredImageModel, configuredTextModel, ImageModel, TextModel } from './text-model';
 import { readImageOrder, readTextOrder, TextOrders } from './text-orders';
-import { configuredSpeechModel, readTranscript, SpeechModel, validateWave, voiceMaxBytes } from './voice';
+import { configuredSpeechModel, decodeWave, readTranscript, SpeechModel, validateWave, voiceMaxBytes, voiceMaxJsonBytes } from './voice';
 
 const bodyLimit = 512 * 1024;
 
-async function readJson(request: IncomingMessage, response: ServerResponse): Promise<unknown> {
+async function readJson(request: IncomingMessage, response: ServerResponse, limit = bodyLimit, message = '草稿请求过大'): Promise<unknown> {
   if (request.headers['content-type']?.split(';')[0].trim().toLowerCase() !== 'application/json') {
     throw new HttpError(415, 'invalid_content_type', '请使用 JSON 请求');
   }
-  const payload = await readBody(request, response, bodyLimit, '草稿请求过大');
+  const payload = await readBody(request, response, limit, message);
   try {
     return JSON.parse(payload.toString('utf8'));
   } catch {
@@ -119,12 +119,16 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
     const header = request.headers['x-draft-revision'];
     const revision = typeof header === 'string' && /^\d{1,10}$/.test(header) ? Number(header) : NaN;
     if (!validRevision(revision)) throw new HttpError(400, 'invalid_draft', '请提供有效的草稿版本');
-    if (request.headers['content-type']?.split(';')[0].trim().toLowerCase() !== 'audio/wav') {
-      throw new HttpError(415, 'invalid_content_type', '请发送 WAV 录音');
+    const contentType = request.headers['content-type']?.split(';')[0].trim().toLowerCase();
+    if (contentType !== 'audio/wav' && contentType !== 'application/json') {
+      throw new HttpError(415, 'invalid_content_type', '请以 JSON 或 WAV 发送录音');
     }
     await store.checkVoiceDraft(account, voiceDraftId, revision);
     if (!speechModel) throw new HttpError(503, 'voice_model_unavailable', '语音转写暂未开启，可以手动输入。');
-    const wave = await readBody(request, response, voiceMaxBytes, '录音文件过大，请分段录音');
+    const tooLarge = '录音文件过大，请分段录音';
+    const wave = contentType === 'application/json'
+      ? decodeWave(await readJson(request, response, voiceMaxJsonBytes, tooLarge))
+      : await readBody(request, response, voiceMaxBytes, tooLarge);
     validateWave(wave);
     await store.accountFor(token, wechat?.appId);
     await store.checkVoiceDraft(account, voiceDraftId, revision);

@@ -3,9 +3,22 @@ import { textOrderLimit } from '../miniprogram/core/text-order';
 import { HttpError } from './http-error';
 
 export const voiceMaxBytes = 8 * 1024 * 1024;
+export const voiceMaxJsonBytes = 4 * Math.ceil(voiceMaxBytes / 3) + 64;
 const sampleRates = [8000, 16000, 22050, 24000, 32000, 44100, 48000];
 
 export type SpeechModel = (wave: Buffer) => Promise<unknown>;
+
+export function decodeWave(value: unknown): Buffer {
+  const wave = isObject(value) ? value.wave : undefined;
+  if (typeof wave !== 'string' || !wave) throw new HttpError(400, 'invalid_voice', '录音内容缺失，请重新录音。');
+  if (wave.length > 4 * Math.ceil(voiceMaxBytes / 3)) {
+    throw new HttpError(413, 'body_too_large', '录音文件过大，请分段录音');
+  }
+  const data = Buffer.from(wave, 'base64');
+  if (data.length > voiceMaxBytes) throw new HttpError(413, 'body_too_large', '录音文件过大，请分段录音');
+  if (data.toString('base64') !== wave) throw new HttpError(400, 'invalid_voice', '录音编码不完整，请重新录音。');
+  return data;
+}
 
 export function validateWave(wave: Buffer) {
   const invalid = () => new HttpError(400, 'invalid_voice', '录音格式无法识别，请重新录音或手动输入。');

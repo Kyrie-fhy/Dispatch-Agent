@@ -1123,6 +1123,7 @@ test('S6 Harness: fixed trip from text through draft, picking and delivery', { t
   const extract = async (name, draft, text, status) => {
     step = name;
     const response = await sendText(api, token, draft, name, text);
+    if (response.status !== status) diagnostic({ step, apiError: response.data.error, apiMessage: response.data.message });
     check('text_order_status', response.status, status);
     return response.data.draft;
   };
@@ -1213,6 +1214,7 @@ for (const kind of ['text', 'image']) {
       extracted = await api.request('/v1/image-orders', { method: 'POST', token,
         body: { draftId: blank.id, revision: blank.revision, materialId, requestId: 's7d-extract' } });
     }
+    if (extracted.status !== 200) diagnostic({ apiError: extracted.data.error, apiMessage: extracted.data.message });
     check('order_status', extracted.status, 200);
     const draft = await read(api, token);
     const rows = customers => customers.flatMap(({ customer, items }) => items.map(item => [customer,

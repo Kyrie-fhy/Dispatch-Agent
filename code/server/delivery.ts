@@ -55,8 +55,10 @@ export async function readFormalSheet(client: PoolClient, accountId: string, tri
   const { rows: [row] } = await client.query<SheetRow>(`
     SELECT s.trip_id AS "tripId", s.id AS "sheetId", s.party_id AS "partyId", s.reviewed,
            t.statuses, t.status_revision AS "statusRevision", v.version, v.customers,
-           COALESCE((SELECT sum(cents) FROM dispatch.receipt_allocations
-             WHERE account_id = s.account_id AND trip_id = s.trip_id AND sheet_id = s.id), 0)::text AS paid
+           COALESCE((SELECT sum(a.cents) FROM dispatch.receipt_allocations a
+             WHERE a.account_id = s.account_id AND a.trip_id = s.trip_id AND a.sheet_id = s.id
+               AND NOT EXISTS (SELECT 1 FROM dispatch.receipt_reversals r
+                 WHERE r.account_id = a.account_id AND r.original_receipt_id = a.receipt_id)), 0)::text AS paid
     FROM dispatch.sheets s
     JOIN dispatch.trips t ON t.account_id = s.account_id AND t.id = s.trip_id
     JOIN LATERAL (

@@ -1,4 +1,16 @@
 <import src="../order-templates.wxml" />
+<template name="delivery-trip">
+  <view class="section-title">{{title}} · 第 {{summary.version}} 版</view>
+  <view wx:for="{{summary.customers}}" wx:for-item="customer" wx:key="id" class="card">
+    <view class="section-title">{{customer.customer}}</view>
+    <view wx:for="{{customer.items}}" wx:for-item="line" wx:key="id" class="line">
+      <template is="order-line" data="{{line: line}}" />
+      <view class="muted">{{summary.statuses[line.id] || '未记录'}}</view>
+    </view>
+    <view class="subtotal">订单金额 ¥{{customer.total}}</view>
+    <button bindtap="openSheet" data-trip-id="{{summary.id}}" data-sheet-id="{{customer.id}}" disabled="{{busy}}">打开客户单</button>
+  </view>
+</template>
 <view class="container">
   <view class="title">配送工作区</view>
   <view wx:if="{{error}}" class="error" role="alert">{{error}}</view>
@@ -20,9 +32,10 @@
     </view>
     <block wx:else>
       <view class="workspace-actions" wx:if="{{!sheetTarget}}">
-        <button size="mini" class="{{section === 'draft' ? 'option-active' : ''}}" data-section="draft" bindtap="selectSection">录单</button>
-        <button size="mini" class="{{section === 'picking' ? 'option-active' : ''}}" data-section="picking" bindtap="selectSection">取货</button>
-        <button size="mini" class="{{section === 'delivery' ? 'option-active' : ''}}" data-section="delivery" bindtap="selectSection">送货单</button>
+        <button size="mini" class="{{section === 'draft' ? 'option-active' : ''}}" data-section="draft" bindtap="selectSection" disabled="{{busy}}">录单</button>
+        <button size="mini" class="{{section === 'picking' ? 'option-active' : ''}}" data-section="picking" bindtap="selectSection" disabled="{{busy}}">取货</button>
+        <button size="mini" class="{{section === 'delivery' ? 'option-active' : ''}}" data-section="delivery" bindtap="selectSection" disabled="{{busy}}">送货单</button>
+        <button size="mini" class="{{section === 'materials' ? 'option-active' : ''}}" data-section="materials" bindtap="selectSection" disabled="{{busy}}">材料</button>
       </view>
 
       <block wx:if="{{sheetTarget}}">
@@ -110,19 +123,32 @@
         </block>
       </block>
 
+      <block wx:elif="{{section === 'materials'}}">
+        <include src="./materials.wxml" />
+      </block>
+
       <block wx:else>
-        <view wx:if="{{!formal}}" class="card">还没有正式送货单。</view>
-        <block wx:else>
-          <view class="section-title">本趟送货单 · 第 {{formal.version}} 版</view>
-          <view wx:for="{{formal.customers}}" wx:for-item="customer" wx:key="id" class="card">
-            <view class="section-title">{{customer.customer}}</view>
-            <view wx:for="{{customer.items}}" wx:for-item="line" wx:key="id" class="line">
-              <template is="order-line" data="{{line: line}}" />
-              <view class="muted">{{formal.statuses[line.id] || '未记录'}}</view>
-            </view>
-            <view class="subtotal">订单金额 ¥{{customer.total}}</view>
-            <button bindtap="openSheet" data-trip-id="{{formal.id}}" data-sheet-id="{{customer.id}}" disabled="{{busy}}">打开客户单</button>
+        <block wx:if="{{historyTrip}}">
+          <button bindtap="closeHistoryTrip" disabled="{{busy}}">返回历史送货单</button>
+          <template is="delivery-trip" data="{{summary: historyTrip, title: '历史送货单', busy: busy}}" />
+        </block>
+        <view wx:elif="{{historyOpen}}" class="card">
+          <button bindtap="closeHistory" disabled="{{busy}}">返回本趟送货单</button>
+          <view class="section-title">历史送货单</view>
+          <view wx:if="{{historyLoaded && !historyRows.length}}" class="hint">还没有历史送货单。</view>
+          <view wx:for="{{historyRows}}" wx:key="id" class="line">
+            <view class="product">{{item.customers}}</view>
+            <view>{{item.date}} · 第 {{item.version}} 版 · ¥{{item.total}}</view>
+            <button size="mini" data-id="{{item.id}}" bindtap="openHistoryTrip" disabled="{{busy}}">打开历史单</button>
           </view>
+          <button wx:if="{{!historyLoaded || historyCursor}}" bindtap="loadHistory" disabled="{{busy}}" loading="{{busy}}">
+            {{historyLoaded ? '加载更多' : (busy ? '正在读取' : '重试读取')}}
+          </button>
+        </view>
+        <block wx:else>
+          <button bindtap="openHistory" disabled="{{busy}}">历史送货单</button>
+          <view wx:if="{{!formal}}" class="card">还没有正式送货单。</view>
+          <template wx:else is="delivery-trip" data="{{summary: formal, title: '本趟送货单', busy: busy}}" />
         </block>
       </block>
     </block>

@@ -1,6 +1,6 @@
 <import src="../order-templates.wxml" />
 <view class="workspace-actions">
-  <button size="mini" bindtap="closeSheet" disabled="{{busy || sheetRetry}}">返回本趟送货单</button>
+  <button size="mini" bindtap="closeSheet" disabled="{{busy || sheetRetry}}">{{historyTrip ? '返回历史送货单' : '返回本趟送货单'}}</button>
 </view>
 
 <view wx:if="{{sheetRetry}}" class="card">
@@ -56,14 +56,32 @@
   </view>
 
   <view wx:elif="{{paymentPreview}}" class="card">
-    <view class="section-title">{{sheetAction === 'opening' ? '旧欠款预览' : '收款分配预览'}}</view>
+    <view class="section-title">{{paymentPreview.correction ? '冲销重记预览' : (sheetAction === 'opening' ? '旧欠款预览' : '收款分配预览')}}</view>
+    <view wx:if="{{paymentPreview.correction}}">原收款 ¥{{paymentPreview.correction.original}} → 正确收款</view>
     <view class="amount">¥{{paymentPreview.total}}</view>
     <view wx:if="{{paymentPreview.day}}">{{paymentPreview.day}} {{paymentPreview.source}}</view>
     <view class="line" wx:for="{{paymentPreview.allocations}}" wx:key="debtId">
       <view>{{item.label}}</view>
-      <view>抵扣 ¥{{item.amount}} · 剩余 ¥{{item.balance}}</view>
+      <view>抵扣 ¥{{item.amount}}<block wx:if="{{!paymentPreview.correction}}"> · 剩余 ¥{{item.balance}}</block></view>
     </view>
-    <button class="primary" bindtap="confirmSheetPreview" disabled="{{busy}}" loading="{{busy}}">确认{{sheetAction === 'opening' ? '补录' : '收款'}}</button>
+    <view wx:if="{{paymentPreview.pendingAmount}}">超额待处理 ¥{{paymentPreview.pendingAmount}}</view>
+    <block wx:if="{{paymentPreview.correction}}">
+      <view wx:if="{{paymentPreview.correction.impacts.length}}" class="section-title">受影响的单据</view>
+      <view class="line" wx:for="{{paymentPreview.correction.impacts}}" wx:key="debtId">
+        <view>{{item.label}}</view>
+        <view>已收 ¥{{item.beforePaid}} → ¥{{item.afterPaid}} · 欠款 ¥{{item.beforeRemaining}} → ¥{{item.afterRemaining}}</view>
+      </view>
+      <block wx:if="{{!paymentPreview.correction.canConfirm}}">
+        <view class="hint">以下后续收款的分配会变化。待确认处理规则后才能冲销。</view>
+        <view class="line" wx:for="{{paymentPreview.correction.laterChanges}}" wx:key="id">
+          <view>{{item.date}} · 收款 ¥{{item.amount}}</view>
+          <view>原分配 {{item.before}}</view>
+          <view>预计分配 {{item.after}}</view>
+        </view>
+      </block>
+    </block>
+    <button wx:if="{{!paymentPreview.correction || paymentPreview.correction.canConfirm}}"
+      class="primary" bindtap="confirmSheetPreview" disabled="{{busy}}" loading="{{busy}}">确认{{paymentPreview.correction ? '冲销重记' : (sheetAction === 'opening' ? '补录' : '收款')}}</button>
     <button bindtap="backFromSheetPreview" disabled="{{busy}}">返回修改</button>
   </view>
 
@@ -93,10 +111,11 @@
     <button bindtap="cancelSheetAction" disabled="{{busy}}">取消更正</button>
   </view>
 
-  <view wx:elif="{{sheetAction === 'opening' || sheetAction === 'receipt'}}" class="card">
-    <view class="section-title">{{sheetAction === 'opening' ? '补录旧欠款' : '记收款'}}</view>
+  <view wx:elif="{{sheetAction === 'opening' || sheetAction === 'receipt' || sheetAction === 'receipt-correction'}}" class="card">
+    <view class="section-title">{{correctionReceipt ? '冲销重记' : (sheetAction === 'opening' ? '补录旧欠款' : '记收款')}}</view>
+    <view wx:if="{{correctionReceipt}}">原收款 ¥{{correctionReceipt.total}}</view>
     <view wx:if="{{sheetAction === 'receipt'}}" class="hint">当前可抵扣 ¥{{sheet.available}}</view>
-    <label for="sheet-amount">金额（元）</label>
+    <label for="sheet-amount">{{correctionReceipt ? '正确收款金额' : '金额'}}（元）</label>
     <input id="sheet-amount" type="digit" value="{{payment.amount}}" maxlength="14" data-field="amount" bindinput="editPayment" disabled="{{busy}}" />
     <block wx:if="{{sheetAction === 'opening'}}">
       <picker mode="date" value="{{payment.day}}" data-field="day" bindchange="editPayment" disabled="{{busy}}">
@@ -105,7 +124,7 @@
       <label for="sheet-source">来源（选填）</label>
       <input id="sheet-source" value="{{payment.source}}" maxlength="200" data-field="source" bindinput="editPayment" disabled="{{busy}}" />
     </block>
-    <button class="primary" bindtap="previewPayment" disabled="{{busy || !payment.amount}}" loading="{{busy}}">预览{{sheetAction === 'opening' ? '补录' : '分配'}}</button>
+    <button class="primary" bindtap="previewPayment" disabled="{{busy || !payment.amount}}" loading="{{busy}}">预览{{correctionReceipt ? '冲销' : (sheetAction === 'opening' ? '补录' : '分配')}}</button>
     <button bindtap="cancelSheetAction" disabled="{{busy}}">取消</button>
   </view>
 
@@ -126,7 +145,8 @@
     </view>
     <view wx:if="{{sheet.reviewed}}" class="card">
       <view class="section-title">客户账目</view>
-      <button wx:if="{{sheet.canReceive}}" class="primary" data-action="receipt" bindtap="beginSheetAction" disabled="{{busy}}">记收款</button>
+      <view wx:if="{{sheet.pendingAmount}}" class="hint">客户待处理款 ¥{{sheet.pendingAmount}}</view>
+      <button class="primary" data-action="receipt" bindtap="beginSheetAction" disabled="{{busy}}">记收款</button>
       <button data-action="opening" bindtap="beginSheetAction" disabled="{{busy}}">补录旧欠款</button>
       <view wx:for="{{sheet.debts}}" wx:key="id" class="line">
         <view>{{item.label}}</view>
@@ -137,8 +157,10 @@
       <block wx:if="{{sheet.receipts.length}}">
         <view class="section-title">收款记录</view>
         <view wx:for="{{sheet.receipts}}" wx:for-item="receipt" wx:key="id" class="line">
-          <view>{{receipt.date}} · 收到 ¥{{receipt.total}}</view>
+          <view>{{receipt.date}} · 收到 ¥{{receipt.total}}{{receipt.reversed ? ' · 已冲销' : (receipt.replacement ? ' · 冲销重记' : '')}}</view>
           <view wx:for="{{receipt.allocations}}" wx:key="debtId">{{item.label}} · ¥{{item.amount}}</view>
+          <view wx:if="{{receipt.pendingAmount}}">超额待处理 ¥{{receipt.pendingAmount}}</view>
+          <button wx:if="{{!receipt.reversed}}" size="mini" data-id="{{receipt.id}}" bindtap="beginReceiptCorrection" disabled="{{busy}}">冲销重记</button>
         </view>
       </block>
     </view>

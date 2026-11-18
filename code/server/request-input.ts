@@ -81,6 +81,11 @@ export function readReceiptInput(value: unknown) {
   return readLedgerAmount(value, '收款金额');
 }
 
+export function readReceiptCorrectionInput(value: unknown) {
+  const { receiptId } = readCommand(value);
+  return { ...readLedgerAmount(value, '正确收款金额'), receiptId: readId(receiptId, '收款编号') };
+}
+
 export function readOpeningInput(value: unknown) {
   const amount = readLedgerAmount(value, '旧欠款金额');
   const { day, source = '' } = value as Record<string, unknown>;

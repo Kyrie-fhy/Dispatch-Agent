@@ -6,12 +6,14 @@ import { AmendmentStore } from './amendments';
 import { DraftStore } from './drafts';
 import { DeliveryStore } from './delivery';
 import { LedgerStore } from './ledger';
+import { MaterialStore, readMaterialInput } from './materials';
 import { TripStore } from './trips';
-import { readConfirmInput, readDeliveryInput, readNextInput, readOpeningInput, readPreviewInput, readReceiptInput,
+import { readConfirmInput, readDeliveryInput, readId, readNextInput, readOpeningInput, readPreviewInput, readReceiptCorrectionInput, readReceiptInput,
   readReviewInput, uuidPattern, validSheetKey } from './request-input';
 import { HttpError } from './http-error';
 import { configuredWechatLogin, readWechatCode, WechatLogin } from './wechat-login';
 import { isObject } from '../miniprogram/core/orders';
+import { materialChunkBytes } from '../miniprogram/core/materials';
 
 const bodyLimit = 512 * 1024;
 
@@ -19,22 +21,27 @@ async function readJson(request: IncomingMessage, response: ServerResponse): Pro
   if (request.headers['content-type']?.split(';')[0].trim().toLowerCase() !== 'application/json') {
     throw new HttpError(415, 'invalid_content_type', '请使用 JSON 请求');
   }
+  const payload = await readBody(request, response, bodyLimit, '草稿请求过大');
+  try {
+    return JSON.parse(payload.toString('utf8'));
+  } catch {
+    throw new HttpError(400, 'invalid_json', '请求内容不是有效的 JSON');
+  }
+}
+
+async function readBody(request: IncomingMessage, response: ServerResponse, limit: number, message: string): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let bytes = 0;
   // Leave the socket open long enough to return 413, then let the response close it.
   for await (const chunk of request.iterator({ destroyOnReturn: false })) {
     bytes += chunk.length;
-    if (bytes > bodyLimit) {
+    if (bytes > limit) {
       response.setHeader('Connection', 'close');
-      throw new HttpError(413, 'body_too_large', '草稿请求过大');
+      throw new HttpError(413, 'body_too_large', message);
     }
     chunks.push(chunk);
   }
-  try {
-    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
-  } catch {
-    throw new HttpError(400, 'invalid_json', '请求内容不是有效的 JSON');
-  }
+  return Buffer.concat(chunks, bytes);
 }
 
 function sendJson(response: ServerResponse, status: number, payload: unknown) {
@@ -53,7 +60,7 @@ function resourceId(path: string, collection: 'drafts' | 'trips'): string | null
 }
 
 async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery: DeliveryStore, ledger: LedgerStore, amendments: AmendmentStore,
-  request: IncomingMessage, response: ServerResponse, wechat?: WechatLogin): Promise<void> {
+  materials: MaterialStore, request: IncomingMessage, response: ServerResponse, wechat?: WechatLogin): Promise<void> {
   const host = request.headers.host ?? '';
   if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host)) {
     throw new HttpError(400, 'invalid_host', '请通过本机地址访问草稿服务');
@@ -102,6 +109,38 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
     sendJson(response, 200, await trips.workspace(account));
     return;
   }
+  if (path === '/v1/materials') {
+    if (method === 'GET') {
+      sendJson(response, 200, { materials: await materials.list(account) });
+      return;
+    }
+    if (method === 'POST') {
+      const input = readMaterialInput(await readJson(request, response));
+      sendJson(response, 201, { material: await materials.begin(account, input) });
+      return;
+    }
+  }
+  const materialRoute = /^\/v1\/materials\/([^/]+)(?:\/(chunks))?$/.exec(path);
+  if (materialRoute && uuidPattern.test(materialRoute[1])) {
+    const [, id, chunks] = materialRoute;
+    if (method === 'GET' && !chunks) {
+      sendJson(response, 200, { material: await materials.read(account, id) });
+      return;
+    }
+    if (method === 'PUT' && chunks) {
+      if (request.headers['content-type']?.split(';')[0].trim().toLowerCase() !== 'application/octet-stream') {
+        throw new HttpError(415, 'invalid_content_type', '请发送文件分块');
+      }
+      const offset = request.headers['x-material-offset'];
+      if (typeof offset !== 'string' || !/^\d{1,8}$/.test(offset)) {
+        throw new HttpError(400, 'invalid_chunk', '文件分块位置无效');
+      }
+      await materials.read(account, id);
+      const content = await readBody(request, response, materialChunkBytes, '文件分块过大');
+      sendJson(response, 200, { material: await materials.append(account, id, Number(offset), content) });
+      return;
+    }
+  }
   if (method === 'GET' && draftId) {
     sendJson(response, 200, { draft: await store.draft(account, draftId) });
     return;
@@ -126,12 +165,17 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
     sendJson(response, 200, { draft: await trips.nextDraft(account, input) });
     return;
   }
+  if (method === 'GET' && path === '/v1/trips') {
+    const cursor = new URLSearchParams(request.url?.split('?')[1]).get('cursor');
+    sendJson(response, 200, await trips.history(account, cursor === null ? null : readId(cursor, '历史分页位置')));
+    return;
+  }
   if (method === 'GET' && tripId) {
     sendJson(response, 200, await trips.trip(account, tripId));
     return;
   }
 
-  const sheetRoute = /^\/v1\/trips\/([^/]+)\/sheets\/([^/]+)(?:\/(delivery(?:\/(?:preview|confirm))?|review|ledger|(?:opening|receipt|amendment)\/(?:preview|confirm)))?$/.exec(path);
+  const sheetRoute = /^\/v1\/trips\/([^/]+)\/sheets\/([^/]+)(?:\/(delivery(?:\/(?:preview|confirm))?|review|ledger|(?:opening|receipt|receipt-correction|amendment)\/(?:preview|confirm)))?$/.exec(path);
   if (sheetRoute && uuidPattern.test(sheetRoute[1])) {
     const [, sheetTripId, key, action] = sheetRoute;
     let sheetId: string;
@@ -157,6 +201,10 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
         sendJson(response, 200, { preview: await ledger.previewReceipt(account, sheetKey, readReceiptInput(body)) });
       } else if (action === 'receipt/confirm') {
         sendJson(response, 200, { receipt: await ledger.confirmReceipt(account, sheetKey, readConfirmInput(body)) });
+      } else if (action === 'receipt-correction/preview') {
+        sendJson(response, 200, { preview: await ledger.previewCorrection(account, sheetKey, readReceiptCorrectionInput(body)) });
+      } else if (action === 'receipt-correction/confirm') {
+        sendJson(response, 200, { receipt: await ledger.confirmCorrection(account, sheetKey, readConfirmInput(body)) });
       } else if (action === 'amendment/preview') {
         sendJson(response, 200, { preview: await amendments.preview(account, sheetKey, readAmendmentInput(body)) });
       } else if (action === 'amendment/confirm') {
@@ -184,8 +232,9 @@ export async function startLocalServer(pool: Pool, port: number, wechat?: Wechat
   const delivery = new DeliveryStore(pool);
   const ledger = new LedgerStore(pool);
   const amendments = new AmendmentStore(pool);
+  const materials = new MaterialStore(pool);
   const server = createServer({ requestTimeout: 15_000 }, (request, response) => {
-    void handle(pool, store, trips, delivery, ledger, amendments, request, response, wechat).catch(error => {
+    void handle(pool, store, trips, delivery, ledger, amendments, materials, request, response, wechat).catch(error => {
       if (response.destroyed) return;
       if (error instanceof HttpError) {
         sendJson(response, error.status, { error: error.code, message: error.message });

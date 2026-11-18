@@ -2,19 +2,22 @@ import { randomUUID } from 'node:crypto';
 import { Pool, PoolClient } from 'pg';
 import {
   Account, checkOpening, customerDebts, Ledger, OpeningDebt, openingDebtId, OpeningPreview,
-  orderDebtId, planReceipt, Receipt, ReceiptPreview, Sheet, sumCents,
+  orderDebtId, planReceipt, ReceiptCorrectionPreview, ServerReceipt, ServerReceiptPreview, Sheet, sumCents,
 } from '../miniprogram/core/settlement';
 import { CustomerOrder, Trip } from '../miniprogram/core/trips';
 import { readAccount, writeAccount } from './account-workspace';
 import { HttpError } from './http-error';
+import { effectiveReceipts, planCorrection, receiptBasis } from './receipt-correction';
 
 type LedgerInput = { requestId: string; cents: number };
 type OpeningInput = LedgerInput & Pick<OpeningDebt, 'day' | 'source'>;
 type ConfirmInput = { requestId: string; previewId: string };
-type LedgerState = { ledger: Ledger; trips: Trip[] };
+type CorrectionInput = LedgerInput & { receiptId: string };
+type LedgerState = { ledger: Ledger; trips: Trip[]; history: ServerReceipt[] };
+type StoredReceiptPreview = ServerReceiptPreview & { ledgerBasis?: string };
 type OpeningRow = Omit<OpeningDebt, 'cents'> & { cents: string };
-type ReceiptRow = Omit<Receipt, 'cents' | 'savedAt' | 'allocations'> & {
-  cents: string; savedAt: Date;
+type ReceiptRow = Omit<ServerReceipt, 'cents' | 'savedAt' | 'allocations' | 'pendingCents' | 'reversedBy' | 'replaces'> & {
+  cents: string; savedAt: Date; pendingCents: string; reversedBy: string | null; replaces: string | null;
   allocations: ({ cents: number } & ({ openingId: string } | Sheet))[];
 };
 
@@ -44,20 +47,26 @@ async function openingDebts(client: PoolClient, accountId: string, partyId: stri
   return rows.map(row => ({ ...row, cents: Number(row.cents) }));
 }
 
-async function receipts(client: PoolClient, accountId: string, partyId: string, id: string | null = null): Promise<Receipt[]> {
+async function receipts(client: PoolClient, accountId: string, partyId: string, id: string | null = null): Promise<ServerReceipt[]> {
   const { rows } = await client.query<ReceiptRow>(`
-    SELECT r.id, r.party_id AS "partyId", r.cents, r.saved_at AS "savedAt",
-      jsonb_agg(jsonb_build_object(
+    SELECT r.id, r.party_id AS "partyId", r.cents, r.saved_at AS "savedAt", r.pending_cents AS "pendingCents",
+      rev.replacement_receipt_id AS "reversedBy", replaced.original_receipt_id AS replaces,
+      COALESCE(jsonb_agg(jsonb_build_object(
         'cents', a.cents
       ) || CASE WHEN a.opening_id IS NOT NULL THEN jsonb_build_object('openingId', a.opening_id)
-        ELSE jsonb_build_object('tripId', a.trip_id, 'sheetId', a.sheet_id) END ORDER BY a.position) AS allocations
+        ELSE jsonb_build_object('tripId', a.trip_id, 'sheetId', a.sheet_id) END ORDER BY a.position)
+        FILTER (WHERE a.receipt_id IS NOT NULL), '[]') AS allocations
     FROM dispatch.receipts r
-    JOIN dispatch.receipt_allocations a ON a.account_id = r.account_id AND a.receipt_id = r.id
+    LEFT JOIN dispatch.receipt_allocations a ON a.account_id = r.account_id AND a.receipt_id = r.id
+    LEFT JOIN dispatch.receipt_reversals rev ON rev.account_id = r.account_id AND rev.original_receipt_id = r.id
+    LEFT JOIN dispatch.receipt_reversals replaced ON replaced.account_id = r.account_id AND replaced.replacement_receipt_id = r.id
     WHERE r.account_id = $1 AND r.party_id = $2 AND ($3::uuid IS NULL OR r.id = $3)
-    GROUP BY r.account_id, r.id ORDER BY r.saved_at, r.id
+    GROUP BY r.account_id, r.id, rev.replacement_receipt_id, replaced.original_receipt_id ORDER BY r.saved_at, r.id
   `, [accountId, partyId, id]);
-  return rows.map(row => ({
+  return rows.map(({ pendingCents, reversedBy, replaces, ...row }) => ({
     ...row, cents: Number(row.cents), savedAt: row.savedAt.toISOString(),
+    ...(Number(pendingCents) ? { pendingCents: Number(pendingCents) } : {}),
+    ...(reversedBy ? { reversedBy } : {}), ...(replaces ? { replaces } : {}),
     allocations: row.allocations.map(target => ({
       debtId: 'openingId' in target ? openingDebtId(target.openingId) : orderDebtId(target), cents: target.cents,
     })),
@@ -66,7 +75,7 @@ async function receipts(client: PoolClient, accountId: string, partyId: string, 
 
 async function ledgerState(client: PoolClient, accountId: string, partyId: string): Promise<LedgerState> {
   const opening = await openingDebts(client, accountId, partyId);
-  const payments = await receipts(client, accountId, partyId);
+  const history = await receipts(client, accountId, partyId);
   const { rows } = await client.query<Account & {
     statuses: Trip['statuses']; statusRevision: number; version: number; customers: CustomerOrder[]; issuedAt: Date;
   }>(`
@@ -91,10 +100,10 @@ async function ledgerState(client: PoolClient, accountId: string, partyId: strin
     const versions = row.version === 1 ? [current] : [{ ...current, version: 1 }, current];
     return { id: row.tripId, origin: 's2', statuses: row.statuses, statusRevision: row.statusRevision, versions };
   });
-  return { trips, ledger: { accounts, opening, receipts: payments, parties: [] } };
+  return { trips, history, ledger: { accounts, opening, receipts: effectiveReceipts(history), parties: [] } };
 }
 
-async function savePreview(client: PoolClient, accountId: string, sheet: Sheet, kind: string, preview: OpeningPreview | ReceiptPreview) {
+async function savePreview<T extends { id: string }>(client: PoolClient, accountId: string, sheet: Sheet, kind: string, preview: T) {
   await client.query(`
     INSERT INTO dispatch.ledger_previews (account_id, id, trip_id, sheet_id, kind, payload)
     VALUES ($1, $2, $3, $4, $5, $6)
@@ -109,6 +118,23 @@ async function loadPreview<T>(client: PoolClient, accountId: string, sheet: Shee
   `, [accountId, id, sheet.tripId, sheet.sheetId, kind]);
   if (!row) throw new HttpError(404, 'preview_not_found', '未找到本客户单的账目预览');
   return row.payload;
+}
+
+function ledgerChanged() {
+  return new HttpError(409, 'ledger_changed', '客户账目已变化，请重新读取并预览');
+}
+
+function confirmResult({ reversedBy, ...receipt }: ServerReceipt): ServerReceipt {
+  return receipt;
+}
+
+function pendingBalance(history: ServerReceipt[], added = 0, excluding?: string) {
+  try {
+    return sumCents([added, ...history.filter(receipt => !receipt.reversedBy && receipt.id !== excluding)
+      .map(receipt => receipt.pendingCents ?? 0)]);
+  } catch {
+    throw new HttpError(409, 'pending_limit', '客户待处理款超出可计算范围，请核对收款金额');
+  }
 }
 
 function validateOpening(account: Account, opening: OpeningDebt[], preview: OpeningPreview): void {
@@ -129,7 +155,9 @@ export class LedgerStore {
       const debts = customerDebts(state, account.partyId, businessDay);
       const remainingCents = sumCents(debts.map(debt => debt.remaining));
       const current = debts.find(debt => debt.id === orderDebtId(sheet));
-      return { partyId: account.partyId, debts, receipts: state.ledger.receipts, remainingCents,
+      const pendingCents = pendingBalance(state.history);
+      return { partyId: account.partyId, debts, receipts: state.history, remainingCents,
+        ...(pendingCents ? { pendingCents } : {}),
         otherRemainingCents: remainingCents - (current?.remaining ?? 0) };
     });
   }
@@ -164,41 +192,77 @@ export class LedgerStore {
       const account = await sheetAccount(client, accountId, sheet);
       if (!account.reviewed) throw new HttpError(409, 'sheet_not_reviewed', '请先确认对账');
       const state = await ledgerState(client, accountId, account.partyId);
-      let preview: ReceiptPreview;
+      let preview: ServerReceiptPreview;
       try {
-        preview = planReceipt(state, sheet, cents, randomUUID(), businessDay);
+        preview = planReceipt(state, sheet, cents, randomUUID(), businessDay, true);
       } catch (error) {
         throw new HttpError(409, 'receipt_rejected', (error as Error).message);
       }
-      return savePreview(client, accountId, sheet, 'receipt', preview);
+      pendingBalance(state.history, preview.pendingCents);
+      return savePreview(client, accountId, sheet, 'receipt', { ...preview, ledgerBasis: receiptBasis(state.history) });
     });
   }
 
   confirmReceipt(accountId: string, sheet: Sheet, { requestId, previewId }: ConfirmInput) {
     return writeAccount(this.pool, accountId, requestId, { action: 'confirm-receipt', sheet, previewId }, async client => {
-      const preview = await loadPreview<ReceiptPreview>(client, accountId, sheet, previewId, 'receipt');
+      const preview = await loadPreview<StoredReceiptPreview>(client, accountId, sheet, previewId, 'receipt');
       const account = await sheetAccount(client, accountId, sheet);
       const [previous] = await receipts(client, accountId, account.partyId, previewId);
-      if (previous) return previous;
+      if (previous) return confirmResult(previous);
       const state = await ledgerState(client, accountId, account.partyId);
-      const changed = () => new HttpError(409, 'ledger_changed', '客户账目已变化，请重新预览收款');
-      let current: ReceiptPreview;
+      let current: ServerReceiptPreview;
       try {
-        current = planReceipt(state, sheet, preview.cents, previewId, businessDay);
+        current = planReceipt(state, sheet, preview.cents, previewId, businessDay, true);
       } catch {
-        throw changed();
+        throw ledgerChanged();
       }
-      if (current.partyId !== preview.partyId || current.basis !== preview.basis) throw changed();
+      if (current.partyId !== preview.partyId || current.basis !== preview.basis ||
+          (preview.ledgerBasis && preview.ledgerBasis !== receiptBasis(state.history))) throw ledgerChanged();
       return this.saveReceipt(client, accountId, state, current);
     });
   }
 
-  private async saveReceipt(client: PoolClient, accountId: string, state: LedgerState, preview: ReceiptPreview): Promise<Receipt> {
-    const { id, partyId, cents } = preview;
+  previewCorrection(accountId: string, sheet: Sheet, { requestId, receiptId, cents }: CorrectionInput) {
+    return writeAccount(this.pool, accountId, requestId, { action: 'preview-receipt-correction', sheet, receiptId, cents }, async client => {
+      const account = await sheetAccount(client, accountId, sheet);
+      if (!account.reviewed) throw new HttpError(409, 'sheet_not_reviewed', '请先确认对账');
+      const state = await ledgerState(client, accountId, account.partyId);
+      const preview = planCorrection(state, state.history, sheet, account.partyId, receiptId, cents, randomUUID(), businessDay);
+      if (preview.canConfirm) pendingBalance(state.history, preview.pendingCents, receiptId);
+      return savePreview(client, accountId, sheet, 'receipt-correction', preview);
+    });
+  }
+
+  confirmCorrection(accountId: string, sheet: Sheet, { requestId, previewId }: ConfirmInput) {
+    return writeAccount(this.pool, accountId, requestId, { action: 'confirm-receipt-correction', sheet, previewId }, async client => {
+      const preview = await loadPreview<ReceiptCorrectionPreview>(client, accountId, sheet, previewId, 'receipt-correction');
+      const account = await sheetAccount(client, accountId, sheet);
+      if (!account.reviewed || account.partyId !== preview.partyId) throw ledgerChanged();
+      const state = await ledgerState(client, accountId, account.partyId);
+      const previous = state.history.find(receipt => receipt.id === previewId && receipt.replaces === preview.originalReceiptId);
+      if (previous) return confirmResult(previous);
+      const current = planCorrection(state, state.history, sheet, account.partyId, preview.originalReceiptId, preview.cents, previewId, businessDay);
+      if (current.basis !== preview.basis) throw ledgerChanged();
+      if (!current.canConfirm) throw new HttpError(409, 'later_receipt_change', '本次冲销会改变后续收款分配，待确认处理规则');
+      const receipt = await this.saveReceipt(client, accountId, state, current);
+      await client.query(`
+        INSERT INTO dispatch.receipt_reversals (account_id, party_id, original_receipt_id, replacement_receipt_id)
+        VALUES ($1, $2, $3, $4)
+      `, [accountId, account.partyId, current.originalReceiptId, receipt.id]);
+      return { ...receipt, replaces: current.originalReceiptId };
+    });
+  }
+
+  private async saveReceipt(client: PoolClient, accountId: string, state: LedgerState,
+    preview: ServerReceiptPreview | ReceiptCorrectionPreview): Promise<ServerReceipt> {
+    const { id, partyId, cents, pendingCents = 0 } = preview;
+    pendingBalance(state.history, pendingCents, 'originalReceiptId' in preview ? preview.originalReceiptId : undefined);
     const allocations = preview.allocations.map(({ debtId, cents }) => ({ debtId, cents }));
     const { rows: [saved] } = await client.query<{ savedAt: Date }>(`
-      INSERT INTO dispatch.receipts (account_id, id, party_id, cents) VALUES ($1, $2, $3, $4) RETURNING saved_at AS "savedAt"
-    `, [accountId, id, partyId, cents]);
+      INSERT INTO dispatch.receipts (account_id, id, party_id, cents, pending_cents, saved_at)
+      VALUES ($1, $2, $3, $4, $5, clock_timestamp())
+      RETURNING saved_at AS "savedAt"
+    `, [accountId, id, partyId, cents, pendingCents]);
     const openIds = new Map(state.ledger.opening.map(debt => [openingDebtId(debt.id), debt.id]));
     const sheets = new Map(state.ledger.accounts.map(sheet => [orderDebtId(sheet), sheet]));
     const targets = allocations.map(({ debtId }) => ({ opening: openIds.get(debtId), sheet: sheets.get(debtId) }));
@@ -208,6 +272,6 @@ export class LedgerStore {
       FROM unnest($4::bigint[], $5::uuid[], $6::uuid[], $7::text[]) WITH ORDINALITY a(cents, opening_id, trip_id, sheet_id, ordinality)
     `, [accountId, id, partyId, allocations.map(allocation => allocation.cents), targets.map(target => target.opening ?? null),
       targets.map(target => target.sheet?.tripId ?? null), targets.map(target => target.sheet?.sheetId ?? null)]);
-    return { id, partyId, cents, savedAt: saved.savedAt.toISOString(), allocations };
+    return { id, partyId, cents, savedAt: saved.savedAt.toISOString(), allocations, ...(pendingCents ? { pendingCents } : {}) };
   }
 }

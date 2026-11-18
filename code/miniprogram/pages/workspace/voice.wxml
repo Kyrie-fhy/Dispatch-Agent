@@ -1,0 +1,11 @@
+<view class="workspace-actions">
+  <button wx:if="{{voicePhase === 'recording'}}" size="mini" bindtap="stopOrderVoice">结束并转写</button>
+  <button wx:else size="mini" bindtap="recordOrderVoice" disabled="{{busy || !!conflict}}">
+    {{voiceRetry ? '重新录音' : '录音转文字'}}
+  </button>
+  <button wx:if="{{voiceRetry}}" size="mini" bindtap="retryOrderVoice" disabled="{{busy || !!conflict}}">用原录音重试</button>
+  <button wx:if="{{voicePermission}}" size="mini" bindtap="openVoiceSettings" disabled="{{busy}}">打开麦克风设置</button>
+</view>
+<view wx:if="{{voicePhase}}" class="hint" role="status">
+  {{voicePhase === 'recording' ? '正在录音，最长 60 秒' : voicePhase === 'starting' ? '正在打开麦克风…' : voicePhase === 'stopping' ? '正在结束录音…' : '正在转写…'}}
+</view>

@@ -2,7 +2,7 @@
 
 面向速冻食品配送员的微信原生 TypeScript 小程序。当前 MVP 聚焦录单、取货、按客户送货和本次应收。
 
-接手请先读[开发任务](docs/开发任务.md)，确认分支、验收范围和下一步。配送 MVP 使用微信会话和 PostgreSQL 工作区，支持文字和图片录单。
+接手请先读[开发任务](docs/开发任务.md)，确认分支、验收范围和下一步。配送 MVP 使用微信会话和 PostgreSQL 工作区，支持文字、图片和可编辑语音转写录单。
 
 ## 文档入口
 
@@ -10,7 +10,7 @@
 - 工程结构和本地规则见[技术方案](docs/技术方案.md)及[项目约定](AGENTS.md)。
 - S5 按用途查[本地 API 联调](docs/S5本地联调.md)、[微信真机验收](docs/S5微信试用.md#手机验收)或[异地 HTTPS 部署](docs/S5试用部署.md)。
 - S6 查[文字录单与评测](docs/S6文字录单.md)，包括模型配置、评测运行和验收证据。
-- S7a 查[图片录单](docs/S7a图片录单.md)，包括支持格式、识别接口和验收步骤。
+- S7 查[图片录单](docs/S7a图片录单.md)和[录音转写](docs/S7b语音录单.md)，包括各自的入口、接口和验收。
 - 历史操作验收见 [S1](docs/S1验收.md)、[S2](docs/S2验收.md)、[S3](docs/S3验收.md)和 [S4](docs/S4验收.md)。
 
 ## 本地检查
@@ -28,7 +28,7 @@ npm run check
 npm run build:s6
 ```
 
-上述命令构建含文字和图片录单的配送 MVP。用微信开发者工具导入项目根目录，运行目录为 `code/dist`。把测试号 AppID 填入本地 `project.private.config.json`，仓库里的 `touristappid` 用于占位。数据库迁移、服务端模型配置和同网手机预览见 [S7a 运行和验收](docs/S7a图片录单.md#运行和验收)。
+上述命令构建配送 MVP。用微信开发者工具导入项目根目录，运行目录为 `code/dist`。把测试号 AppID 填入本地 `project.private.config.json`，仓库里的 `touristappid` 用于占位。启动服务时配置 PostgreSQL、微信会话和 DeepSeek。迁移、模型配置及同网手机预览从 [S7b 启动和验收](docs/S7b语音录单.md#启动和验收)进入。
 
 `npm run build` 构建 S4 本地演示，`npm run build:s5` 构建含收款和对账入口的 S5 工作区。`npm run check` 会重建 S4。检查完成后要预览配送 MVP，重新运行 `npm run build:s6`，再在开发者工具中编译。
 

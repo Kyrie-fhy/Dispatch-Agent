@@ -53,6 +53,7 @@
         <block wx:else>
           <view wx:if="{{deliveryMvp}}" class="card">
             <view class="section-title">文字录单</view>
+            <include src="./voice.wxml" />
             <textarea class="order-text" value="{{orderText}}" maxlength="{{textOrderLimit}}" bindinput="editOrderText"
               disabled="{{busy || !!conflict}}" placeholder="例如：老王要两箱安井水饺 500g" />
             <view wx:if="{{textNotice}}" class="hint" role="status">{{textNotice}}</view>

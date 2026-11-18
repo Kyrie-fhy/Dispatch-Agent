@@ -14,6 +14,10 @@
   </view>
   <view wx:if="{{organizingImage}}" class="hint" role="status">正在识别 {{organizingImage}}…</view>
   <view wx:if="{{materialNotice}}" class="hint" role="status">{{materialNotice}}</view>
+  <block wx:if="{{deliveryMvp && !draftConfirmed && selectedImage}}">
+    <image class="selected-order-image" src="{{selectedImage}}" mode="aspectFit" aria-label="已选订单图片" />
+    <include src="./voice.wxml" />
+  </block>
 </view>
 
 <view class="card">

@@ -5,6 +5,7 @@ import { textOrderLimit, textOrderQuestions } from '../../core/text-order';
 import { CustomerDraft, emptyCustomer, isTripDraft, latest, PickingChange, PickingLine, pickingChanges, pickingKey, TripDraft } from '../../core/trips';
 import { newId } from '../../services/ids';
 import { chooseMaterial, forgetStaged, materialInfo, readChunk, sameMaterial, stagedMaterials, stageMaterial, uploadChunk } from '../../services/materials';
+import { readVoiceFile, startVoiceRecording, transcribeVoice, VoiceFileError, VoicePermissionError } from '../../services/voice';
 import { FormalTrip, revokeSession, TripPreview, wechatCode, Workspace, WorkspaceError, workspaceRequest } from '../../services/workspace';
 import { deliveryMvp } from '../../services/workspace-config';
 import { deliveryLabel, editLines, errorMessage, formLines, lineView, tripView } from '../order-view';
@@ -12,6 +13,8 @@ import { AmendmentPreview, balanceChange, DeliveryMark, DeliveryPreview, ServerL
   SheetAction, sheetPath, sheetView } from './sheet-view';
 
 type Section = 'draft' | 'picking' | 'delivery' | 'materials';
+type VoiceFile = { id: string; revision: number; path: string };
+type VoicePhase = '' | 'starting' | 'recording' | 'stopping' | 'transcribing';
 type PreviewView = ReturnType<typeof tripView> & { previewId: string; identities: string[] };
 type FormalView = ReturnType<typeof tripView> & {
   id: string;
@@ -56,6 +59,7 @@ function initialData() {
     signedIn: false, busy: false, error: '', revokeFailed: false, section: 'draft' as Section,
     deliveryMvp, textOrderLimit, orderText: '', organizingText: false, textSaved: false, textNotice: '',
     textQuestions: [] as ReturnType<typeof textOrderQuestions>,
+    voicePhase: '' as VoicePhase, voiceRetry: false, voicePermission: false, selectedImage: '',
     draft: null as TripDraft | null, draftConfirmed: false, active: null as CustomerDraft | null,
     form: [] as ReturnType<typeof formLines>, parties: [] as { id: string; name: string; label: string }[],
     partyLabel: '', dirty: false, preview: null as PreviewView | null, formal: null as FormalView | null,
@@ -77,6 +81,8 @@ Page({
   unresolvedSheetWrite: null as { route: string; input: object } | null,
   materials: [] as Material[],
   materialTransfer: null as { paused: boolean } | null,
+  voiceCapture: null as ReturnType<typeof startVoiceRecording> | null,
+  voiceFile: null as VoiceFile | null,
 
   async run(action: (generation: number) => Promise<void>) {
     if (this.data.busy) return;
@@ -103,6 +109,9 @@ Page({
     this.unresolvedSheetWrite = null;
     this.materialTransfer = null;
     this.materials = [];
+    this.voiceCapture?.cancel();
+    this.voiceCapture = null;
+    this.voiceFile = null;
     this.setData({ ...initialData(), error, revokeFailed: this.retiredTokens.length > 0 });
     return token;
   },
@@ -116,11 +125,15 @@ Page({
     this.unresolvedSheetWrite = null;
     this.materialTransfer = null;
     this.materials = [];
+    this.voiceCapture?.cancel();
+    this.voiceCapture = null;
+    this.voiceFile = null;
     for (const token of tokens) void revokeSession(token).catch(() => {});
   },
 
   onHide() {
     this.pauseMaterial();
+    this.voiceCapture?.cancel();
   },
 
   login() {
@@ -190,12 +203,13 @@ Page({
       : null;
     if (generation !== this.generation) return;
     const current = this.data.draft?.id === workspace.draft.id ? this.data.active?.id : undefined;
+    const sameTrip = this.data.draft?.id === workspace.draft.id;
     this.pending = null;
     this.setData({
       parties: workspace.parties.map((party, index) => ({ ...party, label: `${party.name} · 客户 ${index + 1}` })),
       draftConfirmed: workspace.draftConfirmed, formal: formal ? this.formalView(formal) : null,
       dirty: false, conflict: null, preview: null,
-      ...(this.data.draft?.id === workspace.draft.id ? {} : { orderText: '', textSaved: false, textNotice: '', textQuestions: [] }),
+      ...(sameTrip ? {} : { orderText: '', textSaved: false, textNotice: '', textQuestions: [], selectedImage: '' }),
     });
     this.showDraft(workspace.draft, current);
     if (this.data.section === 'materials') await this.loadMaterials(generation, token);
@@ -218,6 +232,10 @@ Page({
   },
 
   showDraft(draft: TripDraft, id?: string) {
+    if (this.voiceFile && (this.voiceFile.id !== draft.id || this.voiceFile.revision !== draft.revision)) {
+      this.voiceFile = null;
+      this.setData({ voiceRetry: false });
+    }
     const active = draft.customers.find(customer => customer.id === id) ?? draft.customers[0];
     this.setData({ draft, active, form: formLines(active.items),
       ...(this.data.textSaved ? { textQuestions: textOrderQuestions(draft) } : {}),
@@ -359,6 +377,101 @@ Page({
 
   editOrderText(event: WechatMiniprogram.TextareaInput) {
     if (!this.data.busy) this.setData({ orderText: event.detail.value, textNotice: '', error: '' });
+  },
+
+  voiceDraft() {
+    const { draft, deliveryMvp, draftConfirmed, conflict, preview, section, sheetTarget } = this.data;
+    if (deliveryMvp && this.token && draft && !draftConfirmed && !conflict && !preview && !sheetTarget &&
+        (section === 'draft' || section === 'materials')) return draft;
+  },
+
+  recordOrderVoice() {
+    const draft = this.voiceDraft();
+    if (!draft) return;
+    return this.run(async generation => {
+      this.voiceFile = null;
+      this.setData({ voicePhase: 'starting', voiceRetry: false, voicePermission: false });
+      try {
+        this.voiceCapture = startVoiceRecording(() => {
+          if (generation === this.generation) this.setData({ voicePhase: 'recording' });
+        });
+        const path = await this.voiceCapture.done;
+        if (generation !== this.generation) return;
+        this.voiceCapture = null;
+        const file = { id: draft.id, revision: draft.revision, path };
+        this.voiceFile = file;
+        await this.applyVoiceTranscript(generation, file);
+      } catch (error) {
+        if (error instanceof VoicePermissionError && generation === this.generation) this.setData({ voicePermission: true });
+        throw error;
+      } finally {
+        if (generation === this.generation) {
+          this.voiceCapture = null;
+          this.setData({ voicePhase: '' });
+        }
+      }
+    });
+  },
+
+  stopOrderVoice() {
+    if (this.data.voicePhase !== 'recording') return;
+    this.setData({ voicePhase: 'stopping' });
+    this.voiceCapture?.stop();
+  },
+
+  openVoiceSettings() {
+    if (!this.voiceDraft() || this.data.busy) return;
+    const generation = this.generation;
+    wx.openSetting({ success: ({ authSetting }) => {
+      if (generation === this.generation && authSetting['scope.record']) this.setData({ error: '', voicePermission: false });
+    } });
+  },
+
+  retryOrderVoice() {
+    const draft = this.voiceDraft();
+    const file = this.voiceFile;
+    if (!draft || !file || file.id !== draft.id || file.revision !== draft.revision) return;
+    return this.run(async generation => {
+      try { await this.applyVoiceTranscript(generation, file); }
+      finally {
+        if (generation === this.generation) this.setData({ voicePhase: '' });
+      }
+    });
+  },
+
+  async applyVoiceTranscript(generation: number, file: VoiceFile) {
+    const { orderText } = this.data;
+    const token = this.token;
+    this.setData({ voicePhase: 'transcribing', voiceRetry: false });
+    try {
+      const bytes = await readVoiceFile(file.path);
+      if (generation !== this.generation) return;
+      const result = await transcribeVoice(file, bytes, token);
+      if (generation !== this.generation) return;
+      const draft = this.voiceDraft();
+      if (!draft || draft.id !== file.id || draft.revision !== file.revision ||
+          result?.draftId !== file.id || result.revision !== file.revision || this.data.orderText !== orderText) {
+        this.voiceFile = null;
+        throw new Error('录单内容已变化，请核对后重新录音。');
+      }
+      const text = typeof result.text === 'string' ? result.text.trim() : '';
+      if (!text) throw new Error('语音转写暂未完成，可用原录音重试。');
+      const combined = orderText.trim() ? `${orderText}\n${text}` : text;
+      if (combined.length > textOrderLimit) {
+        this.setData({ section: 'draft' });
+        throw new Error('文字框内容过长，请先整理已有文字后重试转写。');
+      }
+      this.voiceFile = null;
+      this.setData({ section: 'draft', orderText: combined, textNotice: '转写已填入，请编辑核对后再整理到草稿。' });
+    } catch (error) {
+      if (generation === this.generation) {
+        if (error instanceof VoiceFileError || (error instanceof WorkspaceError && error.status >= 400 && error.status < 500)) {
+          this.voiceFile = null;
+        }
+        this.setData({ voiceRetry: this.voiceFile === file });
+      }
+      throw error;
+    }
   },
 
   acceptOrganizedDraft(before: TripDraft, after: unknown, source: '文字' | '图片') {
@@ -728,6 +841,7 @@ Page({
       };
       await stageMaterial(source, selected.path);
       if (generation !== this.generation) return;
+      if (this.data.deliveryMvp && source.draftId === draft?.id) this.setData({ selectedImage: selected.path });
       this.showMaterials();
       await this.transferMaterial(generation, token, source, original?.id);
     });

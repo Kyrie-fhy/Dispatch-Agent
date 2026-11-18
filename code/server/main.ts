@@ -9,13 +9,14 @@ import { LedgerStore } from './ledger';
 import { MaterialStore, readMaterialInput } from './materials';
 import { TripStore } from './trips';
 import { readConfirmInput, readDeliveryInput, readNextInput, readOpeningInput, readPreviewInput, readReceiptInput,
-  readReviewInput, uuidPattern, validSheetKey } from './request-input';
+  readReviewInput, uuidPattern, validRevision, validSheetKey } from './request-input';
 import { HttpError } from './http-error';
 import { configuredWechatLogin, readWechatCode, WechatLogin } from './wechat-login';
 import { isObject } from '../miniprogram/core/orders';
 import { materialChunkBytes } from '../miniprogram/core/materials';
 import { configuredImageModel, configuredTextModel, ImageModel, TextModel } from './text-model';
 import { readImageOrder, readTextOrder, TextOrders } from './text-orders';
+import { configuredSpeechModel, readTranscript, SpeechModel, validateWave, voiceMaxBytes } from './voice';
 
 const bodyLimit = 512 * 1024;
 
@@ -62,7 +63,8 @@ function resourceId(path: string, collection: 'drafts' | 'trips'): string | null
 }
 
 async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery: DeliveryStore, ledger: LedgerStore, amendments: AmendmentStore,
-  materials: MaterialStore, textOrders: TextOrders, request: IncomingMessage, response: ServerResponse, wechat?: WechatLogin): Promise<void> {
+  materials: MaterialStore, textOrders: TextOrders, request: IncomingMessage, response: ServerResponse,
+  wechat?: WechatLogin, speechModel?: SpeechModel): Promise<void> {
   const host = request.headers.host ?? '';
   if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host)) {
     throw new HttpError(400, 'invalid_host', '请通过本机地址访问草稿服务');
@@ -109,6 +111,27 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
 
   if (method === 'GET' && path === '/v1/workspace') {
     sendJson(response, 200, await trips.workspace(account));
+    return;
+  }
+  const voiceRoute = /^\/v1\/drafts\/([^/]+)\/transcription$/.exec(path);
+  if (method === 'POST' && voiceRoute && uuidPattern.test(voiceRoute[1])) {
+    const voiceDraftId = voiceRoute[1];
+    const header = request.headers['x-draft-revision'];
+    const revision = typeof header === 'string' && /^\d{1,10}$/.test(header) ? Number(header) : NaN;
+    if (!validRevision(revision)) throw new HttpError(400, 'invalid_draft', '请提供有效的草稿版本');
+    if (request.headers['content-type']?.split(';')[0].trim().toLowerCase() !== 'audio/wav') {
+      throw new HttpError(415, 'invalid_content_type', '请发送 WAV 录音');
+    }
+    await store.checkVoiceDraft(account, voiceDraftId, revision);
+    if (!speechModel) throw new HttpError(503, 'voice_model_unavailable', '语音转写暂未开启，可以手动输入。');
+    const wave = await readBody(request, response, voiceMaxBytes, '录音文件过大，请分段录音');
+    validateWave(wave);
+    await store.accountFor(token, wechat?.appId);
+    await store.checkVoiceDraft(account, voiceDraftId, revision);
+    const result = await speechModel(wave);
+    await store.accountFor(token, wechat?.appId);
+    await store.checkVoiceDraft(account, voiceDraftId, revision);
+    sendJson(response, 200, { draftId: voiceDraftId, revision, text: readTranscript(result) });
     return;
   }
   if (method === 'POST' && (path === '/v1/text-orders' || path === '/v1/image-orders')) {
@@ -225,7 +248,7 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
 }
 
 export async function startLocalServer(pool: Pool, port: number, wechat?: WechatLogin, textModel?: TextModel,
-  imageModel?: ImageModel): Promise<Server> {
+  imageModel?: ImageModel, speechModel?: SpeechModel): Promise<Server> {
   await requireApplicationRole(pool);
   const store = new DraftStore(pool);
   const trips = new TripStore(pool);
@@ -235,7 +258,7 @@ export async function startLocalServer(pool: Pool, port: number, wechat?: Wechat
   const materials = new MaterialStore(pool);
   const textOrders = new TextOrders(pool, textModel, imageModel);
   const server = createServer({ requestTimeout: 15_000 }, (request, response) => {
-    void handle(pool, store, trips, delivery, ledger, amendments, materials, textOrders, request, response, wechat).catch(error => {
+    void handle(pool, store, trips, delivery, ledger, amendments, materials, textOrders, request, response, wechat, speechModel).catch(error => {
       if (response.destroyed) return;
       if (error instanceof HttpError) {
         sendJson(response, error.status, { error: error.code, message: error.message });
@@ -264,7 +287,8 @@ async function main(): Promise<void> {
   const pool = new Pool(databaseOptions('DISPATCH_DB_URL'));
   pool.on('error', () => console.error('PostgreSQL 空闲连接已断开，后续请求会重新连接'));
   try {
-    const server = await startLocalServer(pool, port, wechat, configuredTextModel(process.env), configuredImageModel(process.env));
+    const server = await startLocalServer(pool, port, wechat, configuredTextModel(process.env),
+      configuredImageModel(process.env), configuredSpeechModel(process.env));
     const stop = () => {
       server.close(() => { void pool.end(); });
       server.closeIdleConnections();

@@ -69,6 +69,15 @@ export class DraftStore {
     });
   }
 
+  async checkVoiceDraft(accountId: string, draftId: string, revision: number): Promise<void> {
+    await readAccount(this.pool, accountId, async client => {
+      const workspace = await readWorkspace(client, accountId);
+      if (workspace.id !== draftId) throw missingDraft();
+      if (workspace.currentTripId === draftId) throw new HttpError(409, 'draft_confirmed', '本趟已确认，请开始下一趟');
+      if (workspace.revision !== revision) throw new HttpError(409, 'draft_changed', '草稿已更新，请刷新后重新录音。');
+    });
+  }
+
   async save(accountId: string, input: SaveDraftInput): Promise<TripDraft> {
     const { draft, requestId } = input;
     return writeAccount(this.pool, accountId, requestId, { action: 'save-draft', draft }, async (client, current) => {

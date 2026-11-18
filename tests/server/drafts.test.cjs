@@ -10,6 +10,7 @@ const { migrate } = require('../../code/server-dist/server/migrate');
 const { startLocalServer } = require('../../code/server-dist/server/main');
 const { configuredWechatLogin } = require('../../code/server-dist/server/wechat-login');
 const { configuredImageModel, configuredTextModel, textPromptVersion } = require('../../code/server-dist/server/text-model');
+const { configuredSpeechModel } = require('../../code/server-dist/server/voice');
 const { HttpError } = require('../../code/server-dist/server/http-error');
 const s6 = require('../fixtures/s6-text-cases.cjs');
 const { materialChunkBytes } = require('../../code/server-dist/miniprogram/core/materials');
@@ -71,11 +72,11 @@ function runPostgresClient(tool, database, args, input) {
   return result.stdout;
 }
 
-async function start(db, wechat, textModel, imageModel) {
+async function start(db, wechat, textModel, imageModel, speechModel) {
   const pool = db.pool();
   let server;
   try {
-    server = await startLocalServer(pool, 0, wechat, textModel, imageModel);
+    server = await startLocalServer(pool, 0, wechat, textModel, imageModel, speechModel);
   } catch (error) {
     await pool.end();
     throw error;
@@ -92,13 +93,13 @@ async function start(db, wechat, textModel, imageModel) {
 
   return {
     origin,
-    async request(path, { method = 'GET', token, body, chunk, offset } = {}) {
-      const headers = {};
+    async request(path, { method = 'GET', token, body, chunk, offset, headers: extraHeaders } = {}) {
+      const headers = { ...extraHeaders };
       if (token) headers.authorization = `Bearer ${token}`;
       if (body !== undefined) headers['content-type'] = 'application/json';
       if (chunk) {
-        headers['content-type'] = 'application/octet-stream';
-        headers['x-material-offset'] = String(offset);
+        headers['content-type'] ??= 'application/octet-stream';
+        if (offset !== undefined) headers['x-material-offset'] = String(offset);
       }
       const response = await fetch(origin + path, {
         method, headers, body: chunk ?? (body === undefined ? undefined : JSON.stringify(body)),
@@ -1292,4 +1293,74 @@ test('S7a organizes a private image once, retries failures and protects newer dr
   assert.deepEqual(items.slice(0, 2).map(item => item.unit), ['箱', '袋']);
   assert.deepEqual([items[39].product, items[39].quantity, items[39].unit, items[39].price], ['', '2', '件', '']);
   assert.equal((await preview(api, a, continued.data.draft, 'handwritten-needs-review')).status, 400);
+});
+
+test('S7b transcribes WAV without changing a draft and rejects stale results', { timeout: 20_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const wave = Buffer.alloc(44 + 320);
+  wave.write('RIFF', 0);
+  wave.writeUInt32LE(wave.length - 8, 4);
+  wave.write('WAVEfmt ', 8);
+  wave.writeUInt32LE(16, 16);
+  wave.writeUInt16LE(1, 20);
+  wave.writeUInt16LE(1, 22);
+  wave.writeUInt32LE(16000, 24);
+  wave.writeUInt32LE(32000, 28);
+  wave.writeUInt16LE(2, 32);
+  wave.writeUInt16LE(16, 34);
+  wave.write('data', 36);
+  wave.writeUInt32LE(320, 40);
+
+  const originalFetch = global.fetch;
+  const calls = [];
+  let entered;
+  let release;
+  const started = new Promise(resolve => { entered = resolve; });
+  const finish = new Promise(resolve => { release = resolve; });
+  t.after(() => { release(); global.fetch = originalFetch; });
+  global.fetch = async (url, options) => {
+    if (url !== 'https://api.deepseek.com/v1/tools/asr') return originalFetch(url, options);
+    calls.push(options);
+    assert.equal(options.headers.Authorization, 'Bearer fixture');
+    const file = options.body.get('file');
+    assert.equal(file.name, 'recording.wav');
+    assert.equal(file.type, 'audio/wav');
+    assert.deepEqual(Buffer.from(await file.arrayBuffer()), wave);
+    if (calls.length === 1) return new Response('{}', { status: 503 });
+    if (calls.length === 3) {
+      entered();
+      await finish;
+    }
+    return Response.json({ request_id: 'asr-fixture', text: '老王需要两箱安井水饺。', duration_ms: 10 });
+  };
+
+  const api = await start(db, undefined, undefined, undefined, configuredSpeechModel({ DISPATCH_TEXT_MODEL_KEY: 'fixture' }));
+  const a = await login(api, 'a');
+  const b = await login(api, 'b');
+  const draft = await read(api, a);
+  const transcribe = (token, basis, chunk = wave) => api.request(`/v1/drafts/${basis.id}/transcription`, {
+    method: 'POST', token, chunk, headers: { 'content-type': 'audio/wav', 'x-draft-revision': String(basis.revision) },
+  });
+  assert.equal((await transcribe('', draft)).status, 401);
+  assert.equal((await transcribe(b, draft)).status, 404);
+  assert.equal((await transcribe(a, draft, Buffer.from('invalid'))).data.error, 'invalid_voice');
+  const oversized = await transcribe(a, draft, Buffer.alloc(8 * 1024 * 1024 + 1));
+  assert.equal(oversized.status, 413);
+  assert.equal(calls.length, 0);
+  assert.equal((await transcribe(a, draft)).data.error, 'voice_model_failed');
+  assert.deepEqual(await transcribe(a, draft), {
+    status: 200, data: { draftId: draft.id, revision: 0, text: '老王需要两箱安井水饺。' },
+  });
+  assert.deepEqual(await read(api, a), draft);
+  assert.equal((await api.request(`/v1/trips/${draft.id}`, { token: a })).status, 404);
+  assert.deepEqual((await api.request('/v1/materials', { token: a })).data, { materials: [] });
+
+  const late = transcribe(a, draft);
+  await started;
+  const saved = await save(api, a, draft, 'newer-draft', '用户新编辑').finally(release);
+  assert.equal(saved.status, 200);
+  assert.equal((await late).data.error, 'draft_changed');
+  assert.equal((await transcribe(a, draft)).data.error, 'draft_changed');
+  assert.equal(calls.length, 3);
+  assert.deepEqual(await read(api, a), saved.data.draft);
 });

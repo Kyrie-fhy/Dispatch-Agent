@@ -538,3 +538,102 @@ test('S7a image action keeps uploads on failure and returns to the editable draf
   assert.equal(page.data.formal, null);
   assertIdle();
 });
+
+test('S7b handles permission, interruption and retry before submitting editable voice text', async () => {
+  const { page, take, login, assertIdle } = setup(true);
+  const start = data('老王', 2);
+  const callbacks = {};
+  const audio = new ArrayBuffer(44);
+  let allowed = false;
+  let stopCount = 0;
+  Object.assign(wx, {
+    authorize({ scope, success, fail }) {
+      assert.equal(scope, 'scope.record');
+      if (allowed) success();
+      else fail();
+    },
+    openSetting({ success }) {
+      allowed = true;
+      success({ authSetting: { 'scope.record': true } });
+    },
+    getRecorderManager: () => ({
+      onStart: listener => { callbacks.start = listener; },
+      onStop: listener => { callbacks.stop = listener; },
+      onError: listener => { callbacks.error = listener; },
+      onInterruptionBegin: listener => { callbacks.interrupt = listener; },
+      start(options) {
+        assert.equal(options.format, 'wav');
+        assert.equal(options.numberOfChannels, 1);
+        callbacks.start();
+      },
+      stop() {
+        stopCount += 1;
+        callbacks.stop({ tempFilePath: 'voice.wav', duration: 1000 });
+      },
+    }),
+    getFileSystemManager: () => ({
+      readFile: ({ filePath, success }) => {
+        assert.equal(filePath, 'voice.wav');
+        success({ data: audio });
+      },
+    }),
+  });
+  await login('s7b-code', tokenA, start);
+  page.editOrderText(input({}, '老王的订单'));
+  await page.recordOrderVoice();
+  assert.equal(page.data.voicePermission, true);
+  assert.match(page.data.error, /麦克风/);
+  page.openVoiceSettings();
+  assert.equal(page.data.voicePermission, false);
+
+  const interrupted = page.recordOrderVoice();
+  assert.equal(page.data.voicePhase, 'recording');
+  callbacks.interrupt();
+  await interrupted;
+  assert.equal(stopCount, 1);
+  assert.match(page.data.error, /已中断/);
+  assertIdle();
+
+  const failed = page.recordOrderVoice();
+  page.stopOrderVoice();
+  const first = await take('POST', `/drafts/${tripId}/transcription`, tokenA, audio);
+  assert.equal(first.header['Content-Type'], 'audio/wav');
+  assert.equal(first.header['X-Draft-Revision'], '2');
+  first.respond(502, { message: '语音转写暂未完成' });
+  await failed;
+  assert.equal(page.data.voiceRetry, true);
+  assert.equal(page.data.orderText, '老王的订单');
+
+  const retry = page.retryOrderVoice();
+  (await take('POST', `/drafts/${tripId}/transcription`, tokenA, audio))
+    .respond(200, { draftId: tripId, revision: 2, text: '两箱安井水饺，每箱八十元' });
+  await retry;
+  assert.equal(page.data.voiceRetry, false);
+  assert.equal(page.data.orderText, '老王的订单\n两箱安井水饺，每箱八十元');
+  assert.deepEqual(page.data.draft, start.draft);
+  assertIdle();
+  page.editOrderText(input({}, '老王两箱安井水饺，每箱八十二元'));
+  const organized = page.organizeText();
+  const text = await take('POST', '/text-orders', tokenA);
+  assert.equal(text.data.text, '老王两箱安井水饺，每箱八十二元');
+  text.respond(200, { draft: data('老王', 3).draft });
+  await organized;
+  assert.equal(page.data.formal, null);
+
+  const hidden = page.recordOrderVoice();
+  page.onHide();
+  await hidden;
+  assert.match(page.data.error, /已中断/);
+  const late = page.recordOrderVoice();
+  page.stopOrderVoice();
+  const request = await take('POST', `/drafts/${tripId}/transcription`, tokenA);
+  const logout = page.logout();
+  (await take('DELETE', '/session', tokenA)).respond(204);
+  await logout;
+  await login('next-login', tokenB, data('新账号'));
+  request.respond(200, { draftId: tripId, revision: 3, text: '旧账号录音' });
+  await late;
+  assert.equal(page.data.orderText, '');
+  assert.equal(page.data.voiceRetry, false);
+  assertIdle();
+});

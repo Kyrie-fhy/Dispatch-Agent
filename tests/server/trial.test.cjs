@@ -5,6 +5,7 @@ const { tmpdir } = require('node:os');
 const { join, resolve } = require('node:path');
 const { rootCertificates } = require('node:tls');
 const { test } = require('node:test');
+const { Client } = require('pg');
 const { databaseOptions } = require('../../code/server-dist/server/database');
 
 test('non-loopback database requires explicit trial mode and verified TLS', t => {
@@ -28,8 +29,39 @@ test('non-loopback database requires explicit trial mode and verified TLS', t =>
   assert.deepEqual(databaseOptions(variable, trial).ssl, { ca, rejectUnauthorized: true });
   assert.throws(() => databaseOptions(variable, { ...trial, [variable]: url + '?sslmode=disable' }), /TLS/);
   assert.throws(() => databaseOptions(variable, { ...trial, [variable]: url + '?host=elsewhere' }), /TLS/);
+  assert.throws(() => databaseOptions(variable, { ...trial, [variable]: url + '#fragment' }), /TLS/);
   assert.deepEqual(databaseOptions(variable, { [variable]: 'postgresql://localhost/dispatch?sslmode=disable' }),
     { connectionString: 'postgresql://localhost/dispatch?sslmode=disable', connectionTimeoutMillis: 5000 });
+});
+
+test('trial loopback permits plaintext only without a configured CA', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'dispatch-trial-ca-'));
+  t.after(() => rmSync(directory, { recursive: true }));
+  const caFile = join(directory, 'ca.pem');
+  const ca = rootCertificates[0];
+  const options = (url, extra = {}) => databaseOptions('DISPATCH_DB_URL', {
+    DISPATCH_SERVER_MODE: 'trial', DISPATCH_DB_URL: url, ...extra,
+  });
+
+  for (const hostname of ['127.0.0.1', 'localhost', '[::1]']) {
+    const url = `postgresql://dispatch_trial_api:example@${hostname}:5432/dispatch_trial`;
+    assert.equal(new Client(options(url)).ssl, false);
+    assert.equal(new Client(options(url + '?sslmode=disable')).ssl, false);
+    assert.throws(() => options(`postgresql://${hostname}/dispatch_trial`), /账号和库名/);
+    assert.throws(() => options(`postgresql://dispatch_trial_api@${hostname}/`), /账号和库名/);
+    for (const suffix of ['?', '?sslmode=require', '?sslmode=disable&sslmode=disable', '?sslmode=disable&host=other', '#', '#fragment']) {
+      assert.throws(() => options(url + suffix), /TLS/);
+    }
+  }
+
+  const url = 'postgresql://dispatch_trial_api@127.0.0.1/dispatch_trial?sslmode=disable';
+  const withCA = { DISPATCH_DB_CA_FILE: caFile };
+  assert.throws(() => options(url, { DISPATCH_DB_CA_FILE: '' }), /DISPATCH_DB_CA_FILE/);
+  assert.throws(() => options(url, withCA), { code: 'ENOENT' });
+  writeFileSync(caFile, ' \n');
+  assert.throws(() => options(url, withCA), /无 CA 证书/);
+  writeFileSync(caFile, ca);
+  assert.deepEqual(new Client(options(url, withCA)).ssl, { ca, rejectUnauthorized: true });
 });
 
 test('trial API startup fails closed without WeChat configuration', () => {

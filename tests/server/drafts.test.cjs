@@ -5,11 +5,13 @@ const http = require('node:http');
 const { readFile } = require('node:fs/promises');
 const { resolve } = require('node:path');
 const { test } = require('node:test');
+const { isDeepStrictEqual } = require('node:util');
 const { Pool } = require('pg');
+const { databaseOptions } = require('../../code/server-dist/server/database');
 const { migrate } = require('../../code/server-dist/server/migrate');
 const { startLocalServer } = require('../../code/server-dist/server/main');
 const { configuredWechatLogin } = require('../../code/server-dist/server/wechat-login');
-const { configuredImageModel, configuredTextModel, textPromptVersion } = require('../../code/server-dist/server/text-model');
+const { configuredImageModel, configuredTextModel, imagePromptVersion, textPromptVersion } = require('../../code/server-dist/server/text-model');
 const { configuredSpeechModel } = require('../../code/server-dist/server/voice');
 const { HttpError } = require('../../code/server-dist/server/http-error');
 const s6 = require('../fixtures/s6-text-cases.cjs');
@@ -44,7 +46,8 @@ async function isolatedDatabase(t, beforeMigrate) {
   url.username = name;
   url.password = password;
 
-  return { name, admin: migrationPool, services, pool: () => new Pool({ connectionString: url.href, connectionTimeoutMillis: 5000 }) };
+  return { name, appUrl: url.href, admin: migrationPool, services,
+    pool: () => new Pool({ connectionString: url.href, connectionTimeoutMillis: 5000 }) };
 }
 
 function runPostgresClient(tool, database, args, input) {
@@ -109,6 +112,29 @@ async function start(db, wechat, textModel, imageModel, speechModel) {
     stop,
   };
 }
+
+test('trial API uses local PostgreSQL with a restricted role and disables development login', { timeout: 20_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const url = new URL(db.appUrl);
+  url.search = '?sslmode=disable';
+  const env = { DISPATCH_SERVER_MODE: 'trial', DISPATCH_DB_URL: url.href,
+    DISPATCH_WECHAT_APP_ID: 'wx1111111111111111', DISPATCH_WECHAT_APP_SECRET: 'trial-test-secret' };
+  const pool = () => new Pool(databaseOptions('DISPATCH_DB_URL', env));
+  const api = await start({ ...db, pool }, configuredWechatLogin(env));
+  assert.deepEqual(await api.request('/healthz'), { status: 200, data: { status: 'ready' } });
+  const { rows } = await db.admin.query(`
+    SELECT ssl FROM pg_stat_ssl JOIN pg_stat_activity USING (pid) WHERE usename = $1 AND datname = $1`, [db.name]);
+  assert.deepEqual(rows, [{ ssl: false }]);
+  const hostStatus = await new Promise((resolve, reject) => {
+    http.get(`${api.origin}/healthz`, { headers: { Host: 'dispatch-api.example.com' } }, response => {
+      response.resume();
+      resolve(response.statusCode);
+    }).on('error', reject);
+  });
+  assert.equal(hostStatus, 400);
+  assert.equal((await api.request('/v1/session/development', { method: 'POST', body: { account: 'a' } })).status, 404);
+  assert.equal((await api.request('/v1/session/wechat', { method: 'POST', body: {} })).status, 400);
+});
 
 function materialInput(draft, payload, requestId) {
   return { draftId: draft.id, revision: draft.revision, requestId, name: '材料.png', size: payload.length,
@@ -1091,12 +1117,13 @@ test('S6 Harness: fixed trip from text through draft, picking and delivery', { t
   const token = await login(api, 'a');
   const blank = await read(api, token);
   const check = (rule, actual, expected) => {
-    diagnostic({ step, rule, score: Number(require('node:util').isDeepStrictEqual(actual, expected)), actual, expected });
+    diagnostic({ step, rule, score: Number(isDeepStrictEqual(actual, expected)), actual, expected });
     assert.deepEqual(actual, expected, rule);
   };
   const extract = async (name, draft, text, status) => {
     step = name;
     const response = await sendText(api, token, draft, name, text);
+    if (response.status !== status) diagnostic({ step, apiError: response.data.error, apiMessage: response.data.message });
     check('text_order_status', response.status, status);
     return response.data.draft;
   };
@@ -1145,6 +1172,69 @@ test('S6 Harness: fixed trip from text through draft, picking and delivery', { t
   check('partial_delivery_due_cents', marked.data.sheet?.amounts.due, s6.partialDueB);
   check('four_model_calls', calls, 4);
 });
+
+for (const kind of ['text', 'image']) {
+  test(`S6 Harness: S7d unpriced ${kind} order through confirmation and picking`, { timeout: 30_000 }, async t => {
+    const live = process.env.DISPATCH_S6_EVAL_LIVE === '1';
+    const runId = randomUUID();
+    const promptVersion = kind === 'text' ? textPromptVersion : imagePromptVersion;
+    const diagnostic = event => t.diagnostic(JSON.stringify({ runId, caseVersion: 's7d-unpriced-v1', promptVersion,
+      mode: live ? 'live' : 'fixture', ...event }));
+    const configure = kind === 'text' ? configuredTextModel : configuredImageModel;
+    const input = '老王来两箱水饺，小李也要三箱水饺。';
+    const png = kind === 'image' ? await readFile(resolve(__dirname, '../fixtures/s7d-unpriced-order.png')) : null;
+    const fixture = async context => {
+      if (kind === 'text') assert.equal(context.text, input);
+      else assert.deepEqual(context, { content: png, mime: 'image/png' });
+      diagnostic({ tool: `extract_${kind}`, model: 'fixture/s7d-unpriced-v1', outcome: 'received_json' });
+      return { operations: [
+        { action: 'add', customer: '老王', product: '水饺', unit: '箱', quantity: '2' },
+        { action: 'add', customer: '小李', product: '水饺', unit: '箱', quantity: '3', brand: '', specification: '', price: '' },
+      ] };
+    };
+    const model = live ? configure(process.env, diagnostic) : fixture;
+    assert.ok(model, '请在本机进程中配置 DISPATCH_TEXT_MODEL_KEY');
+    const db = await isolatedDatabase(t);
+    const api = await start(db, undefined, kind === 'text' ? model : undefined, kind === 'image' ? model : undefined);
+    const token = await login(api, 'a');
+    const blank = await read(api, token);
+    const check = (rule, actual, expected) => {
+      diagnostic({ rule, score: Number(isDeepStrictEqual(actual, expected)), actual, expected });
+      assert.deepEqual(actual, expected, rule);
+    };
+    let extracted;
+    if (kind === 'text') {
+      extracted = await sendText(api, token, blank, 's7d-extract', input);
+    } else {
+      const registered = await api.request('/v1/materials', { method: 'POST', token, body: materialInput(blank, png, 's7d-register') });
+      check('register_image_status', registered.status, 201);
+      const materialId = registered.data.material.id;
+      const uploaded = await api.request(`/v1/materials/${materialId}/chunks`, { method: 'PUT', token, chunk: png, offset: 0 });
+      check('image_ready', uploaded.data.material?.status, 'ready');
+      extracted = await api.request('/v1/image-orders', { method: 'POST', token,
+        body: { draftId: blank.id, revision: blank.revision, materialId, requestId: 's7d-extract' } });
+    }
+    if (extracted.status !== 200) diagnostic({ apiError: extracted.data.error, apiMessage: extracted.data.message });
+    check('order_status', extracted.status, 200);
+    const draft = await read(api, token);
+    const rows = customers => customers.flatMap(({ customer, items }) => items.map(item => [customer,
+      item.product, item.brand, item.specification, item.unit, item.quantity, item.price]));
+    const expected = [['老王', '水饺', '', '', '箱', '2', null], ['小李', '水饺', '', '', '箱', '3', null]];
+    check('persisted_draft_fields', rows(draft.customers), expected);
+    const reviewed = await preview(api, token, draft, 's7d-preview');
+    check('preview_status', reviewed.status, 200);
+    const prices = customers => customers.flatMap(({ items }) => items.map(item => [item.unitPriceCents, item.amountCents]));
+    check('preview_unpriced_items', prices(reviewed.data.preview.customers), [[null, null], [null, null]]);
+    check('preview_known_total_cents', reviewed.data.preview.totalCents, 0);
+    const confirmed = await confirm(api, token, reviewed.data.preview.previewId, 's7d-confirm');
+    check('confirm_status', confirmed.status, 200);
+    const formal = confirmed.data.trip.versions[0];
+    check('formal_fields', rows(formal.customers), expected);
+    check('formal_unpriced_items', prices(formal.customers), [[null, null], [null, null]]);
+    check('picking_merges_unbranded_and_unsized', confirmed.data.picking.map(line =>
+      [line.product, line.brand, line.specification, line.unit, line.quantity]), [['水饺', '', '', '箱', 5]]);
+  });
+}
 
 test('S6 rejects invalid results, cross-account drafts, revoked sessions and late results', { timeout: 20_000 }, async t => {
   const db = await isolatedDatabase(t);

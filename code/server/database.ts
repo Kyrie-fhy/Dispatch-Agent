@@ -63,18 +63,22 @@ export function databaseOptions(variable: string, env = process.env): PoolConfig
     throw new Error(`${variable} 需要是 PostgreSQL 连接网址`);
   }
   const base = { connectionString: value, connectionTimeoutMillis: 5000 };
+  const loopback = ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname);
   if (!trial) {
-    if (['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)
-        && [...url.searchParams.keys()].every(key => key === 'sslmode')) return base;
+    if (loopback && [...url.searchParams.keys()].every(key => key === 'sslmode')) return base;
     throw new Error(`${variable} 必须指向本机 PostgreSQL`);
   }
 
-  if (!url.hostname || !url.username || url.pathname.length < 2 || url.search || url.hash) {
+  const allowedQuery = !url.href.includes('?') || (loopback && url.search === '?sslmode=disable');
+  if (!url.hostname || !url.username || url.pathname.length < 2 || !allowedQuery || url.href.includes('#')) {
     throw new Error(`${variable} 须包含数据库地址、账号和库名，TLS 由 DISPATCH_DB_CA_FILE 配置`);
   }
   const caFile = env.DISPATCH_DB_CA_FILE;
+  if (loopback && caFile === undefined) return { ...base, ssl: false };
   if (!caFile) throw new Error('试用环境请设置 DISPATCH_DB_CA_FILE');
   const ca = readFileSync(caFile, 'utf8');
   if (!ca.trim()) throw new Error('DISPATCH_DB_CA_FILE 中无 CA 证书');
-  return { ...base, ssl: { ca, rejectUnauthorized: true } };
+  // pg lets sslmode in the connection string override the explicit SSL configuration.
+  url.search = '';
+  return { ...base, connectionString: url.href, ssl: { ca, rejectUnauthorized: true } };
 }

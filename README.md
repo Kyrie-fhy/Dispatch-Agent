@@ -2,21 +2,14 @@
 
 帮助速冻食品配送员完成录单、取货、送货与对账的微信原生 TypeScript 小程序。
 
-微信测试号的 S4 演示覆盖本地录单、取货、送货和对账。S5 微信工作区连接 S5 API，支持手动录单、正式出单和恢复本趟记录。交付进度见[开发任务](docs/开发任务.md)。
+接手请先读[开发任务](docs/开发任务.md)，从中确认使用的分支、已经验证的能力和下一项操作。S4 预览是本地演示。S5 微信工作区通过 API 支持手动录单、正式出单和恢复本趟记录。
 
 ## 文档入口
 
-- [开发 PRD](docs/PRD.md)
-- [当前技术方案](docs/技术方案.md)
-- [S1 操作验收](docs/S1验收.md)
-- [S2 操作验收](docs/S2验收.md)
-- [S3 操作验收](docs/S3验收.md)
-- [S4 操作验收](docs/S4验收.md)
-- [S5 本地服务联调](docs/S5本地联调.md)
-- [S5 微信试用与登录验收](docs/S5微信试用.md)
-- [开发里程碑](docs/Dispatch%20Agent%20开发里程碑.md)
-- [需求分析](docs/需求分析文档.md)
-- [项目级 Agent 约定](AGENTS.md)
+- 产品与阶段见[开发 PRD](docs/PRD.md)、[开发里程碑](docs/Dispatch%20Agent%20开发里程碑.md)和[需求分析](docs/需求分析文档.md)。
+- 工程结构和本地规则见[技术方案](docs/技术方案.md)及[项目约定](AGENTS.md)。
+- S5 按用途查[本地 API 联调](docs/S5本地联调.md)、[微信真机验收](docs/S5微信试用.md#手机验收)或[异地 HTTPS 部署](docs/S5试用部署.md)。
+- 历史操作验收见 [S1](docs/S1验收.md)、[S2](docs/S2验收.md)、[S3](docs/S3验收.md)和 [S4](docs/S4验收.md)。
 
 ## 本地检查
 
@@ -33,7 +26,7 @@ npm run check
 npm run build
 ```
 
-用微信开发者工具导入项目根目录，运行目录为 `code/dist`。上述命令构建独立的 S4 本地演示入口。试用微信工作区请运行 `npm run build:s5`，并按 [S5 正式页面本机联调](docs/S5微信试用.md#正式页面本机联调)启动服务。两个构建命令都写入 `code/dist`，切换后在工具里重新编译。用自己的微信小程序测试号预览，将 AppID 填入本地 `project.private.config.json`。仓库配置中的 `touristappid` 用于占位。
+用微信开发者工具导入项目根目录，运行目录为 `code/dist`。上述命令构建 S4 本地演示。S5 开发分支上运行 `npm run build:s5`，并按 [S5 正式页面本机联调](docs/S5微信试用.md#正式页面本机联调)启动服务。两个命令都写入 `code/dist`，切换后在工具里重新编译。`npm run check` 会重建 S4，检查后如需继续 S5 联调，重新运行 `npm run build:s5`。预览时把微信测试号 AppID 填入本地 `project.private.config.json`。仓库中的 `touristappid` 用于占位。
 
 使用开发者工具 CLI 或自动化时，在项目窗口的 macOS 菜单栏进入「设置 → 安全设置」，开启「服务端口」。也可按 `⌘ + ,` 打开设置后切到「安全」。重置演示数据会清除当前设备的本地原型数据，由用户在页面弹窗中确认。
 

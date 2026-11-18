@@ -1,0 +1,16 @@
+[Unit]
+Description=Dispatch Agent S5 trial API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=dispatch
+Group=dispatch
+WorkingDirectory=/opt/dispatch-agent/current
+EnvironmentFile=/etc/dispatch-agent/trial.env
+ExecStart=/usr/bin/env DISPATCH_SERVER_MODE=trial DISPATCH_API_PORT=8787 /usr/bin/node code/server-dist/server/main.js
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

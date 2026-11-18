@@ -2,7 +2,7 @@
 
 帮助速冻食品配送员完成录单、取货、送货与对账的微信原生 TypeScript 小程序。
 
-接手请先读[开发任务](docs/开发任务.md)，从中确认使用的分支、已经验证的能力和下一项操作。S4 预览是本地演示。S5 微信工作区通过 API 支持手动录单、正式出单和恢复本趟记录。
+接手请先读[开发任务](docs/开发任务.md)，确认应使用的分支、验收范围和下一步。S4 使用本地演示数据，S5 微信工作区通过 API 读写 PostgreSQL 数据。
 
 ## 文档入口
 
@@ -18,7 +18,7 @@ npm ci
 npm run check
 ```
 
-依赖版本由 `package-lock.json` 锁定。GitHub Actions 在 PostgreSQL 18 上运行 `npm run test:server`，覆盖账号隔离、正式单与账目流程及备份恢复。服务启动和本地检查见 [S5 本地联调](docs/S5本地联调.md)。
+依赖版本由 `package-lock.json` 锁定。GitHub Actions 在 PostgreSQL 18 上运行 `npm run test:server`。服务启动、检查范围和本地运行方式见 [S5 本地联调](docs/S5本地联调.md#5-运行集成检查)。
 
 ## 微信预览
 

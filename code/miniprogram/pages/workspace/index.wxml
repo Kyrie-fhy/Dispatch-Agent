@@ -20,9 +20,10 @@
     </view>
     <block wx:else>
       <view class="workspace-actions" wx:if="{{!sheetTarget}}">
-        <button size="mini" class="{{section === 'draft' ? 'option-active' : ''}}" data-section="draft" bindtap="selectSection">录单</button>
-        <button size="mini" class="{{section === 'picking' ? 'option-active' : ''}}" data-section="picking" bindtap="selectSection">取货</button>
-        <button size="mini" class="{{section === 'delivery' ? 'option-active' : ''}}" data-section="delivery" bindtap="selectSection">送货单</button>
+        <button size="mini" class="{{section === 'draft' ? 'option-active' : ''}}" data-section="draft" bindtap="selectSection" disabled="{{busy}}">录单</button>
+        <button size="mini" class="{{section === 'picking' ? 'option-active' : ''}}" data-section="picking" bindtap="selectSection" disabled="{{busy}}">取货</button>
+        <button size="mini" class="{{section === 'delivery' ? 'option-active' : ''}}" data-section="delivery" bindtap="selectSection" disabled="{{busy}}">送货单</button>
+        <button size="mini" class="{{section === 'materials' ? 'option-active' : ''}}" data-section="materials" bindtap="selectSection" disabled="{{busy}}">材料</button>
       </view>
 
       <block wx:if="{{sheetTarget}}">
@@ -108,6 +109,10 @@
             </view>
           </view>
         </block>
+      </block>
+
+      <block wx:elif="{{section === 'materials'}}">
+        <include src="./materials.wxml" />
       </block>
 
       <block wx:else>

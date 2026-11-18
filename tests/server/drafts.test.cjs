@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
-const { randomBytes, randomUUID } = require('node:crypto');
+const { createHash, randomBytes, randomUUID } = require('node:crypto');
+const http = require('node:http');
 const { readFile } = require('node:fs/promises');
 const { resolve } = require('node:path');
 const { test } = require('node:test');
@@ -8,6 +9,7 @@ const { Pool } = require('pg');
 const { migrate } = require('../../code/server-dist/server/migrate');
 const { startLocalServer } = require('../../code/server-dist/server/main');
 const { configuredWechatLogin } = require('../../code/server-dist/server/wechat-login');
+const { materialChunkBytes } = require('../../code/server-dist/miniprogram/core/materials');
 
 async function isolatedDatabase(t, beforeMigrate) {
   const url = new URL(process.env.DISPATCH_TEST_ADMIN_URL);
@@ -86,18 +88,94 @@ async function start(db, wechat) {
   db.services.add(stop);
 
   return {
-    async request(path, { method = 'GET', token, body } = {}) {
+    origin,
+    async request(path, { method = 'GET', token, body, chunk, offset } = {}) {
       const headers = {};
       if (token) headers.authorization = `Bearer ${token}`;
       if (body !== undefined) headers['content-type'] = 'application/json';
+      if (chunk) {
+        headers['content-type'] = 'application/octet-stream';
+        headers['x-material-offset'] = String(offset);
+      }
       const response = await fetch(origin + path, {
-        method, headers, body: body === undefined ? undefined : JSON.stringify(body),
+        method, headers, body: chunk ?? (body === undefined ? undefined : JSON.stringify(body)),
       });
       return { status: response.status, data: response.status === 204 ? null : await response.json() };
     },
     stop,
   };
 }
+
+function materialInput(draft, payload, requestId) {
+  return { draftId: draft.id, revision: draft.revision, requestId, name: '材料.png', size: payload.length,
+    digest: createHash('sha256').update(payload).digest('hex') };
+}
+
+test('materials resume after interruption and restart with account and draft revision checks', { timeout: 20_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  let api = await start(db);
+  let a = await login(api, 'a');
+  const b = await login(api, 'b');
+  const draft = await read(api, a);
+  const contents = randomBytes(2 * materialChunkBytes + 7);
+  const transfer = materialInput(draft, contents, 'material-a');
+  const begin = (token, body) => api.request('/v1/materials', { method: 'POST', token, body });
+  const rejected = await begin(a, { ...transfer, name: '材料.mp3' });
+  assert.equal(rejected.status, 400);
+  assert.equal(rejected.data.error, 'invalid_material');
+  assert.deepEqual((await api.request('/v1/materials', { token: a })).data, { materials: [] });
+  assert.equal((await begin(b, transfer)).status, 404);
+  const started = await begin(a, transfer);
+  assert.equal(started.status, 201);
+  assert.equal(started.data.material.draftCurrent, true);
+  assert.deepEqual(await begin(a, transfer), started);
+  assert.equal((await begin(a, { ...transfer, name: '换文件.png' })).data.error, 'request_conflict');
+  const path = `/v1/materials/${started.data.material.id}`;
+  const readMaterial = (token = a) => api.request(path, { token });
+  const put = (offset, chunk, token = a) => api.request(path + '/chunks', { method: 'PUT', token, offset, chunk });
+  const first = contents.subarray(0, materialChunkBytes);
+  const second = contents.subarray(materialChunkBytes, 2 * materialChunkBytes);
+  const last = contents.subarray(2 * materialChunkBytes);
+  assert.equal((await readMaterial(b)).status, 404);
+  assert.deepEqual((await api.request('/v1/materials', { token: b })).data, { materials: [] });
+  assert.equal((await put(0, first, b)).status, 404);
+  assert.equal((await put(materialChunkBytes, second)).data.error, 'material_offset');
+  const written = await put(0, first);
+  assert.equal(written.status, 200);
+  assert.equal(written.data.material.received, first.length);
+  assert.deepEqual(await put(0, first), written);
+  assert.equal((await put(0, Buffer.alloc(first.length))).data.error, 'material_chunk_conflict');
+
+  await new Promise((resolve, reject) => {
+    const request = http.request(api.origin + path + '/chunks', { method: 'PUT', headers: {
+      authorization: `Bearer ${a}`, 'content-type': 'application/octet-stream', 'content-length': second.length,
+      'x-material-offset': first.length,
+    } });
+    request.on('error', error => error.code === 'ECONNRESET' ? resolve() : reject(error));
+    request.on('close', resolve);
+    request.write(second.subarray(0, 350), () => request.destroy());
+  });
+  assert.deepEqual(await readMaterial(), written);
+  await api.stop();
+  api = await start(db);
+  a = await login(api, 'a');
+  assert.equal((await readMaterial()).data.material.received, first.length);
+  assert.equal((await save(api, a, draft, 'material-draft-edit', '材料保存后修改')).status, 200);
+  assert.equal((await begin(a, { ...transfer, requestId: 'old-revision' })).data.error, 'material_draft_changed');
+  assert.equal((await begin(a, transfer)).data.material.draftCurrent, false);
+  assert.equal((await put(first.length, second)).data.material.received, first.length + second.length);
+  assert.equal((await put(first.length + second.length, Buffer.alloc(last.length))).data.error, 'material_digest');
+  assert.equal((await readMaterial()).data.material.received, first.length + second.length);
+
+  const finish = await put(first.length + second.length, last);
+  assert.equal(finish.status, 200);
+  assert.equal(finish.data.material.status, 'ready');
+  assert.equal(finish.data.material.draftCurrent, false);
+  assert.deepEqual(await put(first.length + second.length, last), finish);
+  const { rows } = await db.admin.query('SELECT content FROM dispatch.material_chunks ORDER BY byte_offset');
+  assert.deepEqual(Buffer.concat(rows.map(row => row.content)), contents);
+  assert.equal((await read(api, a)).customers[0].customer, '材料保存后修改');
+});
 
 async function login(api, account) {
   const result = await api.request('/v1/session/development', { method: 'POST', body: { account } });
@@ -766,6 +844,13 @@ test('a logical backup restores the S5 ledger, account policies and confirmation
   const api = await start(source);
   const a = await login(api, 'a');
   const b = await login(api, 'b');
+  const bytes = Buffer.from('private material fixture');
+  const upload = await api.request('/v1/materials', { method: 'POST', token: a,
+    body: materialInput(await read(api, a), bytes, 'backup-material') });
+  assert.equal(upload.status, 201);
+  const materialPath = `/v1/materials/${upload.data.material.id}`;
+  const stored = await api.request(materialPath + '/chunks', { method: 'PUT', token: a, chunk: bytes, offset: 0 });
+  assert.equal(stored.data.material.status, 'ready');
   const formal = await formalExample(api, a);
   const ownB = await formalExample(api, b);
   const tripId = formal.trip.id;
@@ -832,6 +917,11 @@ test('a logical backup restores the S5 ledger, account policies and confirmation
   const recoveryApi = await start(restored);
   const recoveredA = await login(recoveryApi, 'a');
   const recoveredB = await login(recoveryApi, 'b');
+  assert.deepEqual(await recoveryApi.request(materialPath, { token: recoveredA }), {
+    status: 200, data: { material: { ...stored.data.material, draftCurrent: false } },
+  });
+  assert.equal((await recoveryApi.request(materialPath, { token: recoveredB })).status, 404);
+  assert.deepEqual((await restored.admin.query('SELECT content FROM dispatch.material_chunks')).rows, [{ content: bytes }]);
   assert.deepEqual(await snapshot(recoveryApi, recoveredA), before);
   const restoredB = await recoveryApi.request(`/v1/trips/${ownB.trip.id}`, { token: recoveredB });
   assert.deepEqual(restoredB, { status: 200, data: ownB });

@@ -27,7 +27,8 @@ function formal(workspace) {
     statuses: statusesFor(summary.customers, 'pending'), statusRevision: 0 }, picking: pickingList(summary.customers) };
 }
 
-function setup() {
+function setup(mvp = false) {
+  require('../code/dist/services/workspace-config').deliveryMvp = mvp;
   const queue = [];
   const credentials = [];
   global.wx = {
@@ -438,5 +439,64 @@ test('S5 keeps the screen clear if logout fails and retries with the retired tok
   (await take('DELETE', '/session', tokenA)).respond(401, { message: '请重新登录' });
   await retry;
   assert.equal(page.data.revokeFailed, false);
+  assertIdle();
+});
+
+test('S6 workspace keeps failed text for retry and confirms only after draft review', async () => {
+  const { page, take, login, assertIdle } = setup(true);
+  const start = data('');
+  start.draft.customers[0].items[0].price = '';
+  await login('s6-code', tokenA, start);
+  const text = '老王要两箱安井水饺500g';
+  page.editOrderText(input({}, text));
+  const failed = page.organizeText();
+  const first = await take('POST', '/text-orders', tokenA);
+  assert.equal(page.data.organizingText, true);
+  assert.equal(first.data.text, text);
+  first.respond(502, { message: '文字整理暂未完成' });
+  await failed;
+  assert.equal(page.data.orderText, text);
+  assert.match(page.data.error, /未完成/);
+  assert.deepEqual(page.data.draft, start.draft);
+
+  const missing = data('老王', 1);
+  missing.draft.customers[0].items[0].price = '';
+  const retry = page.organizeText();
+  (await take('POST', '/text-orders', tokenA, first.data)).respond(200, { draft: missing.draft });
+  await retry;
+  assert.equal(page.data.orderText, '');
+  assert.match(page.data.textQuestions[0].issues[0], /单价/);
+  assert.equal(page.data.formal, null);
+
+  const filled = data('老王', 2);
+  page.editOrderText(input({}, '单价82元一箱'));
+  const supplement = page.organizeText();
+  const fill = await take('POST', '/text-orders', tokenA);
+  assert.equal(fill.data.revision, 1);
+  fill.respond(200, { draft: filled.draft });
+  await supplement;
+  assert.deepEqual(page.data.textQuestions, []);
+  assert.equal(page.data.formal, null);
+
+  const formalResult = formal(filled);
+  const ready = page.showPreview();
+  const request = await take('POST', '/trips/preview', tokenA);
+  request.respond(200, { preview: { ...formalResult.trip.versions[0], previewId: 's6-preview', choices: [null] } });
+  await ready;
+  assert.equal(page.data.preview.total, '164.00');
+  assert.equal(page.data.formal, null);
+
+  const confirm = page.confirmTrip();
+  (await take('POST', '/trips/confirm', tokenA)).respond(200, formalResult);
+  await confirm;
+  page.selectSection(tap({ section: 'picking' }));
+  assert.equal(page.data.formal.picking[0].quantity, 2);
+  page.selectSection(tap({ section: 'delivery' }));
+  const stop = page.openSheet(tap({ tripId, sheetId: filled.draft.customers[0].id }));
+  const sheet = await take('GET', `/trips/${tripId}/sheets/${filled.draft.customers[0].id}`, tokenA);
+  sheet.respond(200, { sheet: { customer: '老王', orderCents: 16400, amounts: { due: 0, paid: 0, remaining: 0, excess: 0 },
+    lines: [], tripId, sheetId: filled.draft.customers[0].id } });
+  await stop;
+  assert.equal(page.data.sheet.balance.due, '0.00');
   assertIdle();
 });

@@ -2,13 +2,14 @@
 
 面向速冻食品配送员的微信原生 TypeScript 小程序。当前 MVP 聚焦录单、取货、按客户送货和本次应收。
 
-接手请先读[开发任务](docs/开发任务.md)，确认应使用的分支、验收范围和下一步。S4 使用本地演示数据，S5 微信工作区通过 API 读写 PostgreSQL 数据。
+接手请先读[开发任务](docs/开发任务.md)，确认应使用的分支、验收范围和下一步。S4 使用本地演示数据，S5 微信工作区通过 API 读写 PostgreSQL。S6 复用该工作区，加入文字录单和配送 MVP 入口。
 
 ## 文档入口
 
 - 当前交付范围见 [MVP 实施顺序](docs/Dispatch%20Agent%20开发里程碑.md#mvp-实施顺序)。历史业务规则与原型规划见[开发 PRD](docs/PRD.md)和[需求分析](docs/需求分析文档.md)。
 - 工程结构和本地规则见[技术方案](docs/技术方案.md)及[项目约定](AGENTS.md)。
 - S5 按用途查[本地 API 联调](docs/S5本地联调.md)、[微信真机验收](docs/S5微信试用.md#手机验收)或[异地 HTTPS 部署](docs/S5试用部署.md)。
+- S6 查[文字录单与评测](docs/S6文字录单.md)，包括模型配置、评测运行和验收证据。
 - 历史操作验收见 [S1](docs/S1验收.md)、[S2](docs/S2验收.md)、[S3](docs/S3验收.md)和 [S4](docs/S4验收.md)。
 
 ## 本地检查
@@ -26,7 +27,7 @@ npm run check
 npm run build
 ```
 
-用微信开发者工具导入项目根目录，运行目录为 `code/dist`。上述命令构建 S4 本地演示。S5 开发分支上运行 `npm run build:s5`，并按 [S5 正式页面本机联调](docs/S5微信试用.md#正式页面本机联调)启动服务。两个命令都写入 `code/dist`，切换后在工具里重新编译。`npm run check` 会重建 S4，检查后如需继续 S5 联调，重新运行 `npm run build:s5`。预览时把微信测试号 AppID 填入本地 `project.private.config.json`。仓库中的 `touristappid` 用于占位。
+用微信开发者工具导入项目根目录，运行目录为 `code/dist`。上述命令构建 S4 本地演示。`npm run build:s5` 构建原工作区，`npm run build:s6` 构建配送 MVP。工作区联调请按 [S5 本机联调](docs/S5微信试用.md#正式页面本机联调)启动服务，文字模型另见 [S6 本地配置](docs/S6文字录单.md#启动和验收)。切换构建后在工具中重新编译；`npm run check` 会重建 S4。预览时把微信测试号 AppID 填入本地 `project.private.config.json`。仓库中的 `touristappid` 用于占位。
 
 使用开发者工具 CLI 或自动化时，在项目窗口的 macOS 菜单栏进入「设置 → 安全设置」，开启「服务端口」。也可按 `⌘ + ,` 打开设置后切到「安全」。重置演示数据会清除当前设备的本地原型数据，由用户在页面弹窗中确认。
 
@@ -38,7 +39,7 @@ README.md             使用入口
 project.config.json   微信项目配置
 code/miniprogram/     TypeScript、WXML、WXSS 源码
 code/dist/            小程序构建结果，忽略提交
-code/server/          S5 本地服务及 PostgreSQL 迁移
+code/server/          工作区 API、DeepSeek 接入和 PostgreSQL 迁移
 docs/                 需求、方案、里程碑和验收
 tests/                业务、页面事件和 PostgreSQL 集成检查
 scripts/              构建和文档链接检查

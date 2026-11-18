@@ -9,6 +9,9 @@ const { Pool } = require('pg');
 const { migrate } = require('../../code/server-dist/server/migrate');
 const { startLocalServer } = require('../../code/server-dist/server/main');
 const { configuredWechatLogin } = require('../../code/server-dist/server/wechat-login');
+const { configuredTextModel, textPromptVersion } = require('../../code/server-dist/server/text-model');
+const { HttpError } = require('../../code/server-dist/server/http-error');
+const s6 = require('../fixtures/s6-text-cases.cjs');
 const { materialChunkBytes } = require('../../code/server-dist/miniprogram/core/materials');
 
 async function isolatedDatabase(t, beforeMigrate) {
@@ -68,11 +71,11 @@ function runPostgresClient(tool, database, args, input) {
   return result.stdout;
 }
 
-async function start(db, wechat) {
+async function start(db, wechat, textModel) {
   const pool = db.pool();
   let server;
   try {
-    server = await startLocalServer(pool, 0, wechat);
+    server = await startLocalServer(pool, 0, wechat, textModel);
   } catch (error) {
     await pool.end();
     throw error;
@@ -1048,4 +1051,150 @@ test('WeChat code exchange restores an app-scoped workspace and keeps developmen
   assert.equal(separate.status, 201);
   assert.notEqual((await read(api, separate.data.token)).id, saved.data.draft.id);
   assert.equal((await api.request(`/v1/trips/${aTrip.trip.id}`, { token: separate.data.token })).status, 404);
+});
+
+function sendText(api, token, draft, requestId, text) {
+  return api.request('/v1/text-orders', { method: 'POST', token, body: { requestId, draftId: draft.id, revision: draft.revision, text } });
+}
+
+function fixtureLine(customer, brand, unit, quantity, price = '') {
+  return { action: 'add', customer, product: '水饺', brand, specification: '500g', unit, quantity, price };
+}
+
+test('S6 Harness: fixed trip from text through draft, picking and delivery', { timeout: 105_000 }, async t => {
+  const live = process.env.DISPATCH_S6_EVAL_LIVE === '1';
+  const runId = randomUUID();
+  const diagnostic = event => t.diagnostic(JSON.stringify({ runId, caseVersion: s6.version, promptVersion: textPromptVersion,
+    mode: live ? 'live' : 'fixture', ...event }));
+  let calls = 0;
+  let step;
+  const liveModel = live && configuredTextModel(process.env, trace => diagnostic({ step, ...trace }));
+  if (live) assert.ok(liveModel, '请在本机进程中配置 DISPATCH_TEXT_MODEL_KEY');
+  const fixture = new Map([
+    [s6.initial, { operations: [fixtureLine('老王', '安井', '箱', '2')] }],
+    [s6.supplement, { operations: [{ action: 'fill', target: 1, price: '82' }] }],
+    [s6.ambiguous, { operations: [], question: '请确认是追加还是把数量改为三箱。' }],
+    [s6.remaining, { operations: [fixtureLine('小李', '安井', '箱', '3', '80'),
+      fixtureLine('小李', '安井', '袋', '3', '20'), fixtureLine('赵记', '三全', '箱', '1', '75')] }],
+  ]);
+  const model = async context => {
+    calls += 1;
+    if (liveModel) return liveModel(context);
+    const output = fixture.get(context.text);
+    diagnostic({ step, tool: 'extract_text', model: 'fixture/s6-v1', outcome: output ? 'received_json' : 'unmapped_input' });
+    assert.ok(output);
+    return output;
+  };
+  const db = await isolatedDatabase(t);
+  let api = await start(db, undefined, model);
+  const token = await login(api, 'a');
+  const blank = await read(api, token);
+  const check = (rule, actual, expected) => {
+    diagnostic({ step, rule, score: Number(require('node:util').isDeepStrictEqual(actual, expected)), actual, expected });
+    assert.deepEqual(actual, expected, rule);
+  };
+  const extract = async (name, draft, text, status) => {
+    step = name;
+    const response = await sendText(api, token, draft, name, text);
+    check('text_order_status', response.status, status);
+    return response.data.draft;
+  };
+  const missing = await extract('initial', blank, s6.initial, 200);
+  const { id, ...missingLine } = missing.customers[0].items[0];
+  check('missing_price', [missing.customers[0].customer, ...['product', 'brand', 'specification', 'unit', 'quantity', 'price']
+    .map(field => missingLine[field])], [...s6.expected[0].slice(0, -1), '']);
+  check('preview_requires_price', (await preview(api, token, missing, 'no-price')).status, 400);
+  await api.stop();
+  api = await start(db, undefined, model);
+  check('same_request_replays_after_restart', (await sendText(api, token, blank, 'initial', s6.initial)).data.draft, missing);
+  check('same_text_new_request_rejected', (await sendText(api, token, missing, 'duplicate', s6.initial)).data.error, 'duplicate_order_text');
+  check('duplicate_does_not_call_model', calls, 1);
+
+  const filled = await extract('supplement', missing, s6.supplement, 200);
+  check('supplement_preserves_line', filled.customers[0].items[0].id, id);
+  check('explicit_price', filled.customers[0].items[0].price, '82');
+  const earlierPreview = await preview(api, token, filled, 'old-preview');
+  check('initial_preview_cents', earlierPreview.data.preview?.totalCents, 16400);
+  await extract('ambiguous', filled, s6.ambiguous, 422);
+  check('ambiguity_leaves_draft_unchanged', await read(api, token), filled);
+  const full = await extract('remaining', filled, s6.remaining, 200);
+  const rows = customers => customers.flatMap(customer => customer.items.map(item => [customer.customer,
+    ...['product', 'brand', 'specification', 'unit', 'quantity', 'price'].map(field => item[field])]));
+  check('draft_fields', rows(full.customers), s6.expected);
+  check('prior_preview_no_longer_confirms', (await confirm(api, token, earlierPreview.data.preview.previewId, 'confirm-old')).status, 409);
+  const reviewed = await preview(api, token, full, 'eval-preview');
+  check('preview_amount_cents', reviewed.data.preview?.totalCents, s6.orderCents);
+  check('no_formal_trip_before_confirmation', (await api.request(`/v1/trips/${blank.id}`, { token })).status, 404);
+  step = 'formal';
+  const confirmed = await confirm(api, token, reviewed.data.preview.previewId, 'eval-confirm');
+  check('confirm_status', confirmed.status, 200);
+  const formal = confirmed.data.trip.versions[0];
+  check('formal_fields', rows(formal.customers), s6.expected);
+  check('formal_amount_cents', formal.totalCents, s6.orderCents);
+  check('customer_order_cents', formal.customers.map(customer => customer.totalCents), s6.customerOrderCents);
+  check('picking_separates_brand_and_unit', confirmed.data.picking.map(line => [line.brand, line.unit, line.quantity]), s6.picking);
+  const [a, b] = formal.customers;
+  const sheetA = sheetEndpoint(api, token, blank.id, a.id);
+  check('full_delivery_due_cents', (await deliverAndReview(sheetA, 'eval-a')).amounts.due, s6.dueA);
+  const sheetB = sheetEndpoint(api, token, blank.id, b.id);
+  const marked = await sheetB('delivery', { requestId: 'eval-b', version: 1, statusRevision: 1,
+    lineId: b.items[0].id, status: 'delivered' });
+  check('partial_delivery_due_cents', marked.data.sheet?.amounts.due, s6.partialDueB);
+  check('four_model_calls', calls, 4);
+});
+
+test('S6 rejects invalid results, cross-account drafts, revoked sessions and late results', { timeout: 20_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const started = new Map();
+  let attempts = 0;
+  const wait = key => new Promise(resolve => started.set(key, resolve));
+  let release;
+  const model = async ({ text }) => {
+    attempts += 1;
+    if (text === '失败' && attempts === 1) throw new HttpError(502, 'text_model_failed', '模型暂不可用');
+    if (text === '格式错误') return { operations: [fixtureLine('老王', '安井', '袋', '3.5', '20')] };
+    if (text === '有歧义的补价') return { operations: [{ action: 'fill', target: 1, price: '82' }] };
+    if (text === '超时' || text === '退出') {
+      await new Promise(resolve => {
+        release = resolve;
+        started.get(text)();
+      });
+    }
+    if (text === '两条待补价') return { operations: [fixtureLine('老王', '安井', '箱', '2'), fixtureLine('小李', '安井', '箱', '2')] };
+    return { operations: [fixtureLine('老王', '安井', '袋', '3', '20')] };
+  };
+  const disabled = await start(db);
+  const a = await login(disabled, 'a');
+  const b = await login(disabled, 'b');
+  const original = await read(disabled, a);
+  assert.equal((await sendText(disabled, a, original, 'disabled', '样例')).status, 503);
+  await disabled.stop();
+  const api = await start(db, undefined, model);
+  assert.equal((await sendText(api, b, original, 'cross-account', '样例')).status, 404);
+  assert.equal(attempts, 0);
+  assert.equal((await sendText(api, a, original, 'failed-model', '失败')).status, 502);
+  assert.deepEqual(await read(api, a), original);
+  assert.equal((await sendText(api, a, original, 'invalid-response', '格式错误')).status, 502);
+  assert.deepEqual(await read(api, a), original);
+  const beforeLate = wait('超时');
+  const late = sendText(api, a, original, 'late', '超时');
+  await beforeLate;
+  const newer = (await save(api, a, original, 'manual-first', '新版客户')).data.draft;
+  release();
+  assert.equal((await late).data.error, 'draft_changed');
+  assert.deepEqual(await read(api, a), newer);
+  const beforeLogout = wait('退出');
+  const logoutResult = sendText(api, a, newer, 'logged-out', '退出');
+  await beforeLogout;
+  await api.request('/v1/session', { method: 'DELETE', token: a });
+  release();
+  assert.equal((await logoutResult).status, 401);
+  const another = await login(api, 'a');
+  assert.deepEqual(await read(api, another), newer);
+  assert.equal((await sendText(api, another, newer, 'failed-model', '失败')).status, 200);
+  const other = await read(api, b);
+  const two = await sendText(api, b, other, 'two', '两条待补价');
+  assert.equal(two.status, 200);
+  assert.equal((await sendText(api, b, two.data.draft, 'ambiguous-fill', '有歧义的补价')).status, 422);
+  assert.deepEqual(await read(api, b), two.data.draft);
 });

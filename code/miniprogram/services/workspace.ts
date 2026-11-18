@@ -27,10 +27,10 @@ export class WorkspaceError extends Error {
 }
 
 export function workspaceRequest<T>(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, token = '', data?: object,
-  headers?: Record<string, string>): Promise<T> {
+  headers?: Record<string, string>, timeout = 10_000): Promise<T> {
   return new Promise((resolve, reject) => {
     wx.request({
-      url: `${apiOrigin}/v1${path}`, method, data, timeout: 10_000,
+      url: `${apiOrigin}/v1${path}`, method, data, timeout,
       header: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}), ...headers },
       success({ statusCode, data: result }) {
         if (statusCode >= 200 && statusCode < 300) { resolve(result as T); return; }

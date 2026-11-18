@@ -1,10 +1,12 @@
 import { emptyItem, ItemInput, money } from '../../core/orders';
 import { Material, materialImagePattern, MaterialSource } from '../../core/materials';
-import { localDay, OpeningPreview, ReceiptPreview, Sheet } from '../../core/settlement';
+import { deliveredBalance, localDay, OpeningPreview, ReceiptPreview, Sheet } from '../../core/settlement';
+import { textOrderLimit, textOrderQuestions } from '../../core/text-order';
 import { CustomerDraft, emptyCustomer, isTripDraft, latest, PickingChange, PickingLine, pickingChanges, pickingKey, TripDraft } from '../../core/trips';
 import { newId } from '../../services/ids';
 import { chooseMaterial, forgetStaged, materialInfo, readChunk, sameMaterial, stagedMaterials, stageMaterial, uploadChunk } from '../../services/materials';
 import { FormalTrip, revokeSession, TripPreview, wechatCode, Workspace, WorkspaceError, workspaceRequest } from '../../services/workspace';
+import { deliveryMvp } from '../../services/workspace-config';
 import { deliveryLabel, editLines, errorMessage, formLines, lineView, tripView } from '../order-view';
 import { AmendmentPreview, balanceChange, DeliveryMark, DeliveryPreview, ServerLedger, ServerSheet, settlementPreview,
   SheetAction, sheetPath, sheetView } from './sheet-view';
@@ -17,6 +19,7 @@ type FormalView = ReturnType<typeof tripView> & {
   statuses: Record<string, string>;
   picking: PickingLine[];
   changes: PickingChange[];
+  due: string[];
 };
 
 function sheetEditor() {
@@ -51,6 +54,8 @@ function amendmentChanges(result: AmendmentPreview) {
 function initialData() {
   return {
     signedIn: false, busy: false, error: '', revokeFailed: false, section: 'draft' as Section,
+    deliveryMvp, textOrderLimit, orderText: '', organizingText: false, textSaved: false, textNotice: '',
+    textQuestions: [] as ReturnType<typeof textOrderQuestions>,
     draft: null as TripDraft | null, draftConfirmed: false, active: null as CustomerDraft | null,
     form: [] as ReturnType<typeof formLines>, parties: [] as { id: string; name: string; label: string }[],
     partyLabel: '', dirty: false, preview: null as PreviewView | null, formal: null as FormalView | null,
@@ -190,6 +195,7 @@ Page({
       parties: workspace.parties.map((party, index) => ({ ...party, label: `${party.name} · 客户 ${index + 1}` })),
       draftConfirmed: workspace.draftConfirmed, formal: formal ? this.formalView(formal) : null,
       dirty: false, conflict: null, preview: null,
+      ...(this.data.draft?.id === workspace.draft.id ? {} : { orderText: '', textSaved: false, textNotice: '', textQuestions: [] }),
     });
     this.showDraft(workspace.draft, current);
     if (this.data.section === 'materials') await this.loadMaterials(generation, token);
@@ -200,6 +206,7 @@ Page({
     const previous = trip.versions[trip.versions.length - 2];
     const statuses = Object.fromEntries(Object.entries(trip.statuses).map(([id, status]) => [id, deliveryLabel[status]]));
     return { ...tripView(version), id: trip.id, version: version.version, picking, statuses,
+      due: version.customers.map(customer => money(deliveredBalance(customer, trip.statuses, 0).due)),
       changes: previous ? pickingChanges(previous.customers, version.customers) : [] };
   },
 
@@ -213,6 +220,7 @@ Page({
   showDraft(draft: TripDraft, id?: string) {
     const active = draft.customers.find(customer => customer.id === id) ?? draft.customers[0];
     this.setData({ draft, active, form: formLines(active.items),
+      ...(this.data.textSaved ? { textQuestions: textOrderQuestions(draft) } : {}),
       partyLabel: this.data.parties.find(party => party.id === active.partyId)?.label ?? '' });
   },
 
@@ -300,10 +308,10 @@ Page({
     }
   },
 
-  command<T>(method: 'POST' | 'PUT', path: string, token: string, input: object) {
+  command<T>(method: 'POST' | 'PUT', path: string, token: string, input: object, timeout?: number) {
     const key = JSON.stringify([method, path, input]);
     if (this.pending?.key !== key) this.pending = { key, requestId: newId() };
-    return workspaceRequest<T>(method, path, token, { ...input, requestId: this.pending.requestId });
+    return workspaceRequest<T>(method, path, token, { ...input, requestId: this.pending.requestId }, undefined, timeout);
   },
 
   async persist(generation: number, token: string, draft: TripDraft) {
@@ -346,6 +354,38 @@ Page({
       this.showDraft(amended, this.data.active?.id);
       this.setData({ conflict: null });
       await this.persist(generation, token, amended);
+    });
+  },
+
+  editOrderText(event: WechatMiniprogram.TextareaInput) {
+    if (!this.data.busy) this.setData({ orderText: event.detail.value, textNotice: '', error: '' });
+  },
+
+  organizeText() {
+    const { draft, draftConfirmed, conflict, preview, orderText } = this.data;
+    const text = orderText.trim();
+    if (!this.data.deliveryMvp || !this.token || !draft || draftConfirmed || conflict || preview || !text) return;
+    return this.run(async generation => {
+      const token = this.token;
+      this.setData({ organizingText: true, textNotice: '' });
+      try {
+        const saved = await this.persist(generation, token, draft);
+        if (!saved || generation !== this.generation) return;
+        const result = await this.command<{ draft: TripDraft }>('POST', '/text-orders', token,
+          { draftId: saved.id, revision: saved.revision, text }, 25_000);
+        if (generation !== this.generation) return;
+        if (!isTripDraft(result?.draft) || result.draft.id !== saved.id ||
+            result.draft.revision !== saved.revision + 1 || this.data.draft?.revision !== saved.revision) {
+          throw new Error('草稿已变化，请刷新工作区后核对。原文仍在。');
+        }
+        const questions = textOrderQuestions(result.draft);
+        this.pending = null;
+        this.setData({ orderText: '', textSaved: true,
+          textNotice: questions.length ? '已写入草稿，请补齐下列信息。' : '已写入草稿，请核对货品和单价。' });
+        this.showDraft(result.draft, questions[0]?.id ?? this.data.active?.id);
+      } finally {
+        if (generation === this.generation) this.setData({ organizingText: false });
+      }
     });
   },
 
@@ -418,13 +458,18 @@ Page({
     const path = sheetPath(target);
     const [details, account, formal] = await Promise.all([
       workspaceRequest<{ sheet: ServerSheet }>('GET', path, token),
-      workspaceRequest<{ ledger: ServerLedger }>('GET', path + '/ledger', token),
+      this.data.deliveryMvp ? null : workspaceRequest<{ ledger: ServerLedger }>('GET', path + '/ledger', token),
       refreshTrip && target.tripId === this.data.formal?.id
         ? workspaceRequest<FormalTrip>('GET', `/trips/${target.tripId}`, token) : null,
     ]);
     if (generation !== this.generation) return;
-    this.setData({ sheet: sheetView(details.sheet, account.ledger), sheetNeedsRefresh: false,
+    this.setData({ sheet: sheetView(details.sheet, account?.ledger), sheetNeedsRefresh: false,
       ...(formal ? { formal: this.formalView(formal) } : {}) });
+  },
+
+  sheetBalanceChange(before: DeliveryPreview['before'], after: DeliveryPreview['after']) {
+    const rows = balanceChange(before, after);
+    return this.data.deliveryMvp ? [{ ...rows[0], label: '本次应收' }] : rows;
   },
 
   refreshSheet() {
@@ -503,7 +548,7 @@ Page({
       const line = sheet.lines.find(line => line.id === lineId);
       const label = line ? `${line.brand} ${line.product} · ${line.specification} · ${line.unit}` : '本客户全部明细';
       this.setData({ sheetAction: 'delivery', changePreview: {
-        id: preview.previewId, title: `${label} → ${deliveryLabel[status]}`, rows: balanceChange(preview.before, preview.after),
+        id: preview.previewId, title: `${label} → ${deliveryLabel[status]}`, rows: this.sheetBalanceChange(preview.before, preview.after),
       } });
     });
   },
@@ -512,6 +557,7 @@ Page({
     const sheet = this.data.sheet;
     const action = event.currentTarget.dataset.action;
     if (!sheet || !this.sheetReady() || this.data.sheetAction) return;
+    if (this.data.deliveryMvp && (action === 'opening' || action === 'receipt')) return;
     if (action === 'review' && !sheet.reviewed) this.setData({ sheetAction: 'review' });
     if (action === 'opening' || action === 'receipt') {
       if (!sheet.reviewed || (action === 'receipt' && !sheet.canReceive)) return;
@@ -577,7 +623,7 @@ Page({
       this.setData({ changePreview: {
         id: preview.previewId, title: '正式单更正预览',
         rows: [{ label: '订单金额', before: money(preview.orderCents.before), after: money(preview.orderCents.after) },
-          ...balanceChange(preview.before, preview.after)],
+          ...this.sheetBalanceChange(preview.before, preview.after)],
         changes: amendmentChanges(preview), picking: preview.picking, unchecked: preview.unchecked.map(lineView),
       } });
     });

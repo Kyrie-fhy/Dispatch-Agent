@@ -4,7 +4,8 @@ const { execFileSync } = require('node:child_process');
 const root = path.resolve(__dirname, '..');
 const source = path.join(root, 'code/miniprogram');
 const target = path.join(root, 'code/dist');
-const s5 = process.argv.includes('--wechat-workspace');
+const s6 = process.argv.includes('--delivery-mvp');
+const s5 = s6 || process.argv.includes('--wechat-workspace');
 const configuredOrigin = s5 && process.env.DISPATCH_MINIPROGRAM_API_ORIGIN;
 let origin;
 if (configuredOrigin) {
@@ -34,11 +35,12 @@ if (s5) {
   app.pages = ['pages/workspace/index'];
   delete app.tabBar;
   fs.writeFileSync(path.join(target, 'app.json'), `${JSON.stringify(app, null, 2)}\n`);
-  if (origin) fs.writeFileSync(path.join(target, 'services/workspace-config.js'), `exports.apiOrigin = ${JSON.stringify(origin)};\n`);
+  if (s6 || origin) fs.writeFileSync(path.join(target, 'services/workspace-config.js'),
+    `exports.apiOrigin = ${JSON.stringify(origin ?? 'http://127.0.0.1:8787')};\nexports.deliveryMvp = ${s6};\n`);
 }
 for (const page of app.pages) {
   for (const extension of ['js', 'json', 'wxml', 'wxss']) {
     if (!fs.existsSync(path.join(target, `${page}.${extension}`))) throw new Error(`缺少页面文件 ${page}.${extension}`);
   }
 }
-console.log(`${s5 ? 'S5 微信工作区' : 'S4 本地演示'} TypeScript 编译及小程序页面资源检查通过。`);
+console.log(`${s6 ? 'S6 配送 MVP' : s5 ? 'S5 微信工作区' : 'S4 本地演示'} TypeScript 编译及小程序页面资源检查通过。`);

@@ -42,7 +42,7 @@ export function sheetPath({ tripId, sheetId }: Sheet) {
   return `/trips/${encodeURIComponent(tripId)}/sheets/${encodeURIComponent(sheetId)}`;
 }
 
-export function sheetView(sheet: ServerSheet, ledger: ServerLedger) {
+export function sheetView(sheet: ServerSheet, ledger: ServerLedger = { debts: [], receipts: [], remainingCents: 0, otherRemainingCents: 0 }) {
   const labels = new Map(ledger.debts.map(debt => [debt.id, debt.label]));
   return {
     ...sheet, balance: balanceView(sheet.amounts), total: money(sheet.orderCents),

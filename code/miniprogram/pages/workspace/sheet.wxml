@@ -1,0 +1,146 @@
+<import src="../order-templates.wxml" />
+<view class="workspace-actions">
+  <button size="mini" bindtap="closeSheet" disabled="{{busy || sheetRetry}}">返回本趟送货单</button>
+</view>
+
+<view wx:if="{{sheetRetry}}" class="card">
+  <button class="primary" bindtap="retrySheetWrite" disabled="{{busy}}" loading="{{busy}}">重试本次提交</button>
+</view>
+<view wx:elif="{{sheetNeedsRefresh || !sheet}}" class="card">
+  <view wx:if="{{busy}}">正在读取客户单…</view>
+  <button wx:else class="primary" bindtap="refreshSheet">重新读取客户单</button>
+</view>
+<block wx:else>
+  <view class="card">
+    <view class="section-title">{{sheet.customer}} · 第 {{sheet.version}} 版</view>
+    <view>订单金额 ¥{{sheet.total}}</view>
+    <view class="hint">{{sheet.reviewed ? '配送已核对' : '配送待核对，应收为预估'}}</view>
+    <view class="sheet-metrics">
+      <view>本单应收 ¥{{sheet.balance.due}}</view>
+      <view>本单实收 ¥{{sheet.balance.paid}}</view>
+      <view>本单欠款 ¥{{sheet.balance.remaining}}</view>
+      <view wx:if="{{sheet.balance.hasExcess}}">本单多收 ¥{{sheet.balance.excess}}</view>
+      <view>其他单据欠款 ¥{{sheet.otherRemaining}}</view>
+    </view>
+  </view>
+
+  <view wx:if="{{changePreview}}" class="card">
+    <view class="section-title">{{changePreview.title}}</view>
+    <view class="line" wx:for="{{changePreview.rows}}" wx:key="label">{{item.label}} ¥{{item.before}} → ¥{{item.after}}</view>
+    <view class="line" wx:for="{{changePreview.changes}}" wx:key="id" wx:for-item="change">
+      <block wx:if="{{change.before}}">
+        <view class="muted">更正前 · {{change.beforeStatus}}</view>
+        <template is="order-line" data="{{line: change.before}}" />
+      </block>
+      <block wx:if="{{change.after}}">
+        <view class="muted">更正后 · {{change.afterStatus}}</view>
+        <template is="order-line" data="{{line: change.after}}" />
+      </block>
+      <view wx:else class="muted">移除此明细</view>
+    </view>
+    <block wx:if="{{changePreview.picking}}">
+      <view class="section-title">取货变化</view>
+      <view wx:if="{{!changePreview.picking.length}}" class="hint">取货数量无变化</view>
+      <view wx:for="{{changePreview.picking}}" wx:key="id">
+        {{item.brand}} {{item.product}} · {{item.specification}} · {{item.before}} → {{item.after}} {{item.unit}}
+      </view>
+    </block>
+    <block wx:if="{{changePreview.unchecked.length}}">
+      <view class="section-title">更正后未送达明细</view>
+      <view wx:for="{{changePreview.unchecked}}" wx:key="id">
+        {{item.brand}} {{item.product}} · {{item.specification}} · {{item.quantity}} {{item.unit}}
+      </view>
+    </block>
+    <button class="primary" bindtap="confirmSheetPreview" disabled="{{busy}}" loading="{{busy}}">确认{{sheetAction === 'amendment' ? '更正' : '更新配送'}}</button>
+    <button bindtap="backFromSheetPreview" disabled="{{busy}}">{{sheetAction === 'amendment' ? '返回修改' : '取消'}}</button>
+  </view>
+
+  <view wx:elif="{{paymentPreview}}" class="card">
+    <view class="section-title">{{sheetAction === 'opening' ? '旧欠款预览' : '收款分配预览'}}</view>
+    <view class="amount">¥{{paymentPreview.total}}</view>
+    <view wx:if="{{paymentPreview.day}}">{{paymentPreview.day}} {{paymentPreview.source}}</view>
+    <view class="line" wx:for="{{paymentPreview.allocations}}" wx:key="debtId">
+      <view>{{item.label}}</view>
+      <view>抵扣 ¥{{item.amount}} · 剩余 ¥{{item.balance}}</view>
+    </view>
+    <button class="primary" bindtap="confirmSheetPreview" disabled="{{busy}}" loading="{{busy}}">确认{{sheetAction === 'opening' ? '补录' : '收款'}}</button>
+    <button bindtap="backFromSheetPreview" disabled="{{busy}}">返回修改</button>
+  </view>
+
+  <view wx:elif="{{sheetAction === 'review'}}" class="card">
+    <view class="section-title">核对配送明细</view>
+    <view wx:if="{{sheet.hasUnrecorded}}" class="hint">请返回配送明细，先标记状态未记录的货品。</view>
+    <view wx:elif="{{sheet.pending.length}}" class="hint">未送达的货品不计入本单应收。漏标的货品可返回补标。</view>
+    <view wx:else>全部货品已送达。</view>
+    <view class="line" wx:for="{{sheet.pending}}" wx:key="id">
+      <template is="order-line" data="{{line: item}}" />
+    </view>
+    <button class="primary" bindtap="confirmReview" disabled="{{busy || sheet.hasUnrecorded}}" loading="{{busy}}">确认对账</button>
+    <button bindtap="cancelSheetAction" disabled="{{busy}}">返回配送明细</button>
+  </view>
+
+  <view wx:elif="{{sheetAction === 'amendment'}}" class="card">
+    <view class="section-title">更正单据</view>
+    <template is="edit-lines" data="{{form: amendmentForm, locked: busy}}" />
+    <view class="line" wx:for="{{replacementLines}}" wx:key="id">
+      <view>{{item.label}} · 确认替换货品的配送状态</view>
+      <view class="workspace-actions">
+        <button size="mini" data-id="{{item.id}}" data-status="delivered" bindtap="chooseReplacement" class="{{item.status === 'delivered' ? 'option-active' : ''}}" disabled="{{busy}}">已送达</button>
+        <button size="mini" data-id="{{item.id}}" data-status="pending" bindtap="chooseReplacement" class="{{item.status === 'pending' ? 'option-active' : ''}}" disabled="{{busy}}">未配送</button>
+      </view>
+    </view>
+    <button class="primary" bindtap="previewAmendment" disabled="{{busy}}" loading="{{busy}}">预览更正</button>
+    <button bindtap="cancelSheetAction" disabled="{{busy}}">取消更正</button>
+  </view>
+
+  <view wx:elif="{{sheetAction === 'opening' || sheetAction === 'receipt'}}" class="card">
+    <view class="section-title">{{sheetAction === 'opening' ? '补录旧欠款' : '记收款'}}</view>
+    <view wx:if="{{sheetAction === 'receipt'}}" class="hint">当前可抵扣 ¥{{sheet.available}}</view>
+    <label for="sheet-amount">金额（元）</label>
+    <input id="sheet-amount" type="digit" value="{{payment.amount}}" maxlength="14" data-field="amount" bindinput="editPayment" disabled="{{busy}}" />
+    <block wx:if="{{sheetAction === 'opening'}}">
+      <picker mode="date" value="{{payment.day}}" data-field="day" bindchange="editPayment" disabled="{{busy}}">
+        <view class="link">发生日期 {{payment.day}}</view>
+      </picker>
+      <label for="sheet-source">来源（选填）</label>
+      <input id="sheet-source" value="{{payment.source}}" maxlength="200" data-field="source" bindinput="editPayment" disabled="{{busy}}" />
+    </block>
+    <button class="primary" bindtap="previewPayment" disabled="{{busy || !payment.amount}}" loading="{{busy}}">预览{{sheetAction === 'opening' ? '补录' : '分配'}}</button>
+    <button bindtap="cancelSheetAction" disabled="{{busy}}">取消</button>
+  </view>
+
+  <block wx:else>
+    <view class="card">
+      <view class="section-title">配送明细</view>
+      <view class="line" wx:for="{{sheet.lines}}" wx:key="id">
+        <template is="order-line" data="{{line: item}}" />
+        <view class="muted">{{item.statusLabel}}</view>
+        <view class="workspace-actions">
+          <button wx:if="{{item.status !== 'delivered'}}" size="mini" data-id="{{item.id}}" data-status="delivered" bindtap="markDelivery" disabled="{{busy}}">标记送达</button>
+          <button wx:if="{{item.status !== 'pending'}}" size="mini" data-id="{{item.id}}" data-status="pending" bindtap="markDelivery" disabled="{{busy}}">标记未配送</button>
+        </view>
+      </view>
+      <button wx:if="{{sheet.pending.length}}" bindtap="markDelivery" data-status="delivered" disabled="{{busy}}">本客户整单送达</button>
+      <button wx:if="{{!sheet.reviewed}}" class="primary" data-action="review" bindtap="beginSheetAction" disabled="{{busy}}">开始对账</button>
+      <button data-action="amendment" bindtap="beginSheetAction" disabled="{{busy}}">更正单据</button>
+    </view>
+    <view wx:if="{{sheet.reviewed}}" class="card">
+      <view class="section-title">客户账目</view>
+      <button wx:if="{{sheet.canReceive}}" class="primary" data-action="receipt" bindtap="beginSheetAction" disabled="{{busy}}">记收款</button>
+      <button data-action="opening" bindtap="beginSheetAction" disabled="{{busy}}">补录旧欠款</button>
+      <view wx:for="{{sheet.debts}}" wx:key="id" class="line">
+        <view>{{item.label}}</view>
+        <view>应收 ¥{{item.balance.due}} · 已收 ¥{{item.balance.paid}} · 剩余 ¥{{item.balance.remaining}}</view>
+        <view wx:if="{{item.balance.hasExcess}}">多收 ¥{{item.balance.excess}}</view>
+        <button wx:if="{{item.sheet}}" size="mini" bindtap="openSheet" data-trip-id="{{item.sheet.tripId}}" data-sheet-id="{{item.sheet.sheetId}}" disabled="{{busy}}">打开原单</button>
+      </view>
+      <block wx:if="{{sheet.receipts.length}}">
+        <view class="section-title">收款记录</view>
+        <view wx:for="{{sheet.receipts}}" wx:for-item="receipt" wx:key="id" class="line">
+          <view>{{receipt.date}} · 收到 ¥{{receipt.total}}</view>
+          <view wx:for="{{receipt.allocations}}" wx:key="debtId">{{item.label}} · ¥{{item.amount}}</view>
+        </view>
+      </block>
+    </view>
+  </block>
+</block>

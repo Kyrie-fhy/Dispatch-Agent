@@ -3,7 +3,7 @@ import { Pool, PoolClient } from 'pg';
 import { emptyItem, isObject, ItemInput } from '../miniprogram/core/orders';
 import { textFields, textOrderLimit, validTextField } from '../miniprogram/core/text-order';
 import { CustomerDraft, TripDraft } from '../miniprogram/core/trips';
-import { missingDraft, readAccount, readAccountResult, readParties, readWorkspace, Workspace, writeAccount } from './account-workspace';
+import { missingDraft, readAccount, readAccountResult, readParties, readWorkspace, Workspace, workspaceDraft, writeAccount } from './account-workspace';
 import { HttpError } from './http-error';
 import { readOrderImage } from './materials';
 import { readId, readPreviewInput, validRevision } from './request-input';
@@ -52,7 +52,7 @@ function fieldsOf(item: ItemInput): Fields {
 }
 
 function isPlaceholder(item: ItemInput) {
-  return (!item.unit || item.unit === '箱') && textFields.every(field => field === 'unit' || !item[field].trim());
+  return (!item.unit || item.unit === '箱') && textFields.every(field => field === 'unit' || !item[field]?.trim());
 }
 
 function safeFields(op: Record<string, unknown>, invalidModel: () => never) {
@@ -60,6 +60,7 @@ function safeFields(op: Record<string, unknown>, invalidModel: () => never) {
   for (const key of textFields) {
     if (!(key in op)) continue;
     const value = op[key];
+    if (value === null && (key === 'brand' || key === 'specification' || key === 'price')) continue;
     if (!readable(value, 200)) invalidModel();
     const field = value.trim();
     if (field && !validTextField(key, field)) invalidModel();
@@ -117,7 +118,7 @@ function mergeOrder(draft: TripDraft, output: unknown, partyNames: Set<string>, 
       const score = referenceScore(selected);
       if (alternatives.some(candidate => referenceScore(candidate) > score ||
           (referenceScore(candidate) === score && ((customer && !candidate.customer.customer.trim()) ||
-          textFields.some(field => fields[field] && !candidate.item[field].trim()))))) {
+          textFields.some(field => fields[field] && !candidate.item[field]?.trim()))))) {
         needsReview('有多条可能需要补充的明细，请写明客户和货品，或直接编辑。');
       }
       if (customer && !row.customer.customer.trim()) {
@@ -128,11 +129,13 @@ function mergeOrder(draft: TripDraft, output: unknown, partyNames: Set<string>, 
         row.customer.partyId = partyNames.has(normalized(customer)) ? undefined : null;
       }
       for (const field of textFields) {
-        if (!fields[field]) continue;
-        if (row.item[field].trim() && normalized(row.item[field]) !== normalized(fields[field])) {
+        const incoming = fields[field];
+        if (!incoming) continue;
+        const existing = row.item[field]?.trim();
+        if (existing && normalized(existing) !== normalized(incoming)) {
           needsReview('这段文字与草稿已填内容冲突，请在对应明细中手动核对。');
         }
-        if (!row.item[field].trim()) row.item[field] = fields[field];
+        if (!existing) row.item[field] = incoming;
       }
     } else {
       if (op.target !== undefined && op.target !== null) invalidModel();
@@ -153,11 +156,11 @@ function mergeOrder(draft: TripDraft, output: unknown, partyNames: Set<string>, 
       }
       if (image && !customer) unnamedImageCustomer = owner;
       if (product && owner.items.some(item => normalized(item.product) === normalized(product) &&
-          productFields.every(field => !item[field].trim() || !fields[field] || normalized(item[field]) === normalized(fields[field])))) {
+          productFields.every(field => !item[field]?.trim() || !fields[field] || normalized(item[field]) === normalized(fields[field] ?? '')))) {
         needsReview('草稿里有同款或相似货品，请补充规格和单位，或直接修改现有明细。');
       }
       const blank = owner.items.findIndex(isPlaceholder);
-      const item = { ...emptyItem(blank < 0 ? randomUUID() : owner.items[blank].id), unit: '', ...fields };
+      const item = { ...emptyItem(blank < 0 ? randomUUID() : owner.items[blank].id), unit: '', price: null, ...fields };
       if (blank < 0) owner.items.push(item);
       else owner.items[blank] = item;
     }
@@ -205,7 +208,7 @@ export class TextOrders {
         if (previous && current.currentTripId !== current.id && previous.result.draft.revision === current.revision) {
           return { replay: previous.result } as const;
         }
-        const draft = { id: current.id, revision: current.revision, customers: current.customers };
+        const draft = workspaceDraft(current);
         checkBasis(current, input);
         if (textDigest) await checkDuplicate(client, account, input.draftId, textDigest);
         const picture = image ? await readOrderImage(client, account, input.draftId, input.materialId) : null;

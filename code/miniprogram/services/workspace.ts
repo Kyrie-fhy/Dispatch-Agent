@@ -1,5 +1,6 @@
+import type { DeliveryEdits } from '../core/delivery-execution';
 import { isObject } from '../core/orders';
-import type { Party } from '../core/settlement';
+import type { Account, Party } from '../core/settlement';
 import type { PickingLine, Trip, TripDraft, TripVersion } from '../core/trips';
 import { apiOrigin } from './workspace-config';
 
@@ -13,6 +14,8 @@ export interface Workspace {
 export interface FormalTrip {
   trip: Trip;
   picking: PickingLine[];
+  deliveryEdits?: DeliveryEdits;
+  sheets?: Account[];
 }
 
 export type TripPreview = Pick<TripVersion, 'customers' | 'totalCents'> & {

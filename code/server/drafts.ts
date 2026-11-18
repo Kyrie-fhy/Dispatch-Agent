@@ -39,7 +39,7 @@ export class DraftStore {
       const draft = emptyTrip(randomUUID);
       await client.query(`INSERT INTO dispatch.workspaces (account_id, draft_id, draft_customers)
         VALUES ($1, $2, $3) ON CONFLICT (account_id) DO NOTHING`,
-      [account.id, draft.id, JSON.stringify(draft.customers)]);
+      [account.id, draft.id, JSON.stringify(workspaceDraft({ ...draft, currentTripId: null }).customers)]);
       await client.query('DELETE FROM dispatch.sessions WHERE account_id = $1 AND expires_at <= now()', [account.id]);
       await client.query('INSERT INTO dispatch.sessions (token_digest, account_id, expires_at) VALUES ($1, $2, $3)',
         [digest(token), account.id, expiresAt]);
@@ -95,7 +95,7 @@ export class DraftStore {
           throw new HttpError(400, 'invalid_customer', '未找到所选客户，请重新选择');
         }
       }
-      const saved = { ...draft, revision: current.revision + 1 };
+      const saved = workspaceDraft({ ...draft, revision: current.revision + 1, currentTripId: current.currentTripId });
       await client.query(`UPDATE dispatch.workspaces SET draft_revision = $2, draft_customers = $3
         WHERE account_id = $1`, [accountId, saved.revision, JSON.stringify(saved.customers)]);
       return saved;

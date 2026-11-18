@@ -88,7 +88,7 @@ function balance(due: number, paid: number) {
 }
 
 function deliveredAmount(customer: CustomerOrder, statuses: Record<string, DeliveryStatus>): number {
-  return sumCents(customer.items.filter(item => statuses[item.id] === 'delivered').map(item => item.amountCents));
+  return sumCents(customer.items.flatMap(item => statuses[item.id] === 'delivered' && item.amountCents !== null ? [item.amountCents] : []));
 }
 
 export function sheetBalance(ledger: Ledger, trip: Trip, customer: CustomerOrder, statuses: Record<string, DeliveryStatus> = trip.statuses) {

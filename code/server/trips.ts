@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { Pool, PoolClient } from 'pg';
+import { DeliveryEdits } from '../miniprogram/core/delivery-execution';
 import { Account, Party } from '../miniprogram/core/settlement';
 import {
   emptyTrip, latest, PickingLine, pickingList, previewTrip, resolveCustomerChoices, statusesFor,
@@ -22,10 +23,12 @@ interface FormalTrip {
   trip: Trip;
   sheets: Account[];
   picking: PickingLine[];
+  deliveryEdits: DeliveryEdits;
 }
 
 type TripRow = {
   sourcePreviewId: string;
+  deliveryEdits: DeliveryEdits;
   statuses: Trip['statuses'];
   statusRevision: number;
 };
@@ -83,7 +86,7 @@ export class TripStore {
       let summary: OrderSummary;
       let choices: (Party | null)[];
       try {
-        summary = previewTrip(draft);
+        summary = previewTrip(draft, true);
         choices = resolveCustomerChoices(draft, parties);
       } catch (error) {
         const message = error instanceof Error ? error.message : '请检查草稿内容';
@@ -119,7 +122,7 @@ export class TripStore {
       if (workspace.id !== draftId || workspace.currentTripId !== draftId) {
         throw new HttpError(409, 'draft_open', '请先确认当前草稿，再开始下一趟');
       }
-      const draft = emptyTrip(randomUUID);
+      const draft = workspaceDraft({ ...emptyTrip(randomUUID), currentTripId: workspace.currentTripId });
       await client.query(`
         UPDATE dispatch.workspaces SET draft_id = $2, draft_revision = $3, draft_customers = $4
         WHERE account_id = $1
@@ -163,7 +166,7 @@ export class TripStore {
 
   private async tripRow(client: PoolClient, accountId: string, tripId: string): Promise<TripRow | undefined> {
     const { rows: [row] } = await client.query<TripRow>(`
-      SELECT source_preview_id AS "sourcePreviewId", statuses, status_revision AS "statusRevision"
+      SELECT source_preview_id AS "sourcePreviewId", delivery_edits AS "deliveryEdits", statuses, status_revision AS "statusRevision"
       FROM dispatch.trips WHERE account_id = $1 AND id = $2
     `, [accountId, tripId]);
     return row;
@@ -186,6 +189,6 @@ export class TripStore {
       SELECT trip_id AS "tripId", id AS "sheetId", party_id AS "partyId", reviewed
       FROM dispatch.sheets WHERE account_id = $1 AND trip_id = $2 ORDER BY id
     `, [accountId, tripId]);
-    return { trip, sheets, picking: pickingList(latest(trip).customers) };
+    return { trip, sheets, deliveryEdits: row.deliveryEdits, picking: pickingList(latest(trip).customers) };
   }
 }

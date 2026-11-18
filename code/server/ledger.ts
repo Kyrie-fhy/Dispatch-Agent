@@ -1,3 +1,4 @@
+import { DeliveryEdits, deliveryLines } from '../miniprogram/core/delivery-execution';
 import { randomUUID } from 'node:crypto';
 import { Pool, PoolClient } from 'pg';
 import {
@@ -68,10 +69,10 @@ async function ledgerState(client: PoolClient, accountId: string, partyId: strin
   const opening = await openingDebts(client, accountId, partyId);
   const payments = await receipts(client, accountId, partyId);
   const { rows } = await client.query<Account & {
-    statuses: Trip['statuses']; statusRevision: number; version: number; customers: CustomerOrder[]; issuedAt: Date;
+    statuses: Trip['statuses']; edits: DeliveryEdits; statusRevision: number; version: number; customers: CustomerOrder[]; issuedAt: Date;
   }>(`
     SELECT s.trip_id AS "tripId", s.id AS "sheetId", s.party_id AS "partyId", s.reviewed,
-      t.statuses, t.status_revision AS "statusRevision", v.version, v.customers, issued.saved_at AS "issuedAt"
+      t.statuses, t.delivery_edits AS edits, t.status_revision AS "statusRevision", v.version, v.customers, issued.saved_at AS "issuedAt"
     FROM dispatch.sheets s
     JOIN dispatch.trips t ON t.account_id = s.account_id AND t.id = s.trip_id
     JOIN dispatch.trip_versions issued ON issued.account_id = s.account_id AND issued.trip_id = s.trip_id AND issued.version = 1
@@ -86,7 +87,7 @@ async function ledgerState(client: PoolClient, accountId: string, partyId: strin
     const customer = row.customers.find(item => item.id === row.sheetId);
     if (!customer) throw new Error('正式版本缺少客户明细');
     const savedAt = row.issuedAt.toISOString();
-    const current = { version: row.version, customers: [customer], totalCents: customer.totalCents, savedAt };
+    const current = { version: row.version, customers: [{ ...customer, items: deliveryLines(customer, row.edits) }], totalCents: customer.totalCents, savedAt };
     // The allocation order always uses the first issue time, including for amended sheets.
     const versions = row.version === 1 ? [current] : [{ ...current, version: 1 }, current];
     return { id: row.tripId, origin: 's2', statuses: row.statuses, statusRevision: row.statusRevision, versions };

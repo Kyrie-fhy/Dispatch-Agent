@@ -22,10 +22,17 @@ function changed() {
 
 function evaluate(state: SheetState, edit: Edit) {
   if (state.version !== edit.version || state.statusRevision !== edit.statusRevision) throw changed();
+  if (state.deliveryCompleted || state.customer.items.some(item => Object.prototype.hasOwnProperty.call(state.edits, item.id))) {
+    throw new HttpError(409, 'delivery_execution_exists', '本客户已有现场配送记录，请在配送明细处理');
+  }
   if (!validRevision(state.version, true)) throw new HttpError(409, 'version_limit', '正式单已达到版本上限');
   try {
-    return planAmendment(state, state.statuses, state.customer,
-      { id: state.sheetId, customer: state.customer.customer, items: edit.items }, edit.replacementStatuses, state.paid);
+    const plan = planAmendment(state, state.statuses, state.customer,
+      { id: state.sheetId, customer: state.customer.customer, items: edit.items }, edit.replacementStatuses, state.paid, true);
+    if (plan.customer.items.some(item => item.amountCents === null && (state.reviewed || plan.statuses[item.id] === 'delivered'))) {
+      throw new Error('已送达或已核对的货品须填写单价');
+    }
+    return plan;
   } catch (error) {
     throw new HttpError(400, 'invalid_amendment', (error as Error).message);
   }

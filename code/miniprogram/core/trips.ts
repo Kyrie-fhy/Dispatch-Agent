@@ -71,8 +71,8 @@ export function currentTrip(state: TripState): Trip | undefined {
   return last?.origin === 's2' ? last : undefined;
 }
 
-function customerOrder(customer: CustomerDraft): CustomerOrder {
-  const order = preview({ ...customer, revision: 0 });
+function customerOrder(customer: CustomerDraft, flexible = false): CustomerOrder {
+  const order = preview({ ...customer, revision: 0 }, flexible);
   return { id: customer.id, customer: order.customer, items: order.items, totalCents: order.totalCents };
 }
 
@@ -82,16 +82,17 @@ function sumOrders(customers: CustomerOrder[]): number {
   return total;
 }
 
-export function previewTrip(draft: TripDraft): Pick<TripVersion, 'customers' | 'totalCents'> {
+export function previewTrip(draft: TripDraft, flexible = false): Pick<TripVersion, 'customers' | 'totalCents'> {
   const customers = draft.customers.map((customer, index) => {
     try {
-      return customerOrder(customer);
+      return customerOrder(customer, flexible);
     } catch (error) {
       const name = customer.customer.trim();
       const detail = error instanceof Error ? error.message : '请检查明细';
       throw new Error(`第 ${index + 1} 位客户${name ? `（${name}）` : ''}：${detail}`);
     }
   });
+  if (flexible) pickingList(customers);
   return { customers, totalCents: sumOrders(customers) };
 }
 
@@ -113,7 +114,7 @@ export function resolveCustomerChoices(draft: TripDraft, parties: Party[]): (Par
 const pickingFields = ['product', 'brand', 'specification', 'unit'] as const;
 
 export function pickingKey(item: ItemInput): string {
-  return JSON.stringify(pickingFields.map(field => item[field].trim()));
+  return JSON.stringify(pickingFields.map(field => item[field]?.trim() || ''));
 }
 
 export function pickingList(customers: CustomerOrder[]): PickingLine[] {
@@ -121,8 +122,9 @@ export function pickingList(customers: CustomerOrder[]): PickingLine[] {
   for (const { items } of customers) {
     for (const item of items) {
       const id = pickingKey(item);
-      const { product, brand, specification, unit } = item;
+      const [product, brand, specification, unit] = pickingFields.map(field => item[field]?.trim() || '');
       const quantity = (entries.get(id)?.quantity ?? 0) + Number(item.quantity);
+      if (!Number.isSafeInteger(quantity)) throw new Error(`取货汇总中${product}的数量超出可计算范围`);
       entries.set(id, { id, product, brand, specification, unit, quantity });
     }
   }
@@ -156,8 +158,8 @@ function isCustomers(value: unknown): value is CustomerDraft[] {
 }
 
 export function planAmendment(previous: Pick<TripVersion, 'customers'>, beforeStatuses: Trip['statuses'],
-  original: CustomerOrder, customer: CustomerDraft, replacementStatuses: Amendment['replacementStatuses'], paid: number) {
-  const corrected = customerOrder({ ...customer, customer: original.customer });
+  original: CustomerOrder, customer: CustomerDraft, replacementStatuses: Amendment['replacementStatuses'], paid: number, flexible = false) {
+  const corrected = customerOrder({ ...customer, customer: original.customer }, flexible);
   const customers = previous.customers.map(customer => customer.id === corrected.id ? corrected : customer);
   if (!isCustomers(customers)) throw new Error('更正后的明细标识重复或不完整');
   const before = new Map(original.items.map(item => [item.id, item]));
@@ -200,7 +202,7 @@ function isVersion(value: unknown, index: number): value is TripVersion {
   if (index === 0 ? value.amendmentId !== undefined : typeof value.amendmentId !== 'string' || !value.amendmentId) return false;
   const customers = value.customers as CustomerOrder[];
   try {
-    const checked = customers.map(customerOrder);
+    const checked = customers.map(customer => customerOrder(customer));
     return value.totalCents === sumOrders(checked) && checked.every((expected, position) => {
       const actual = customers[position];
       return actual.totalCents === expected.totalCents && expected.items.every((item, line) => item.amountCents === actual.items[line].amountCents);

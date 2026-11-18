@@ -1,8 +1,9 @@
+import { DeliveryLine, deliverySummary } from '../../core/delivery-execution';
 import { money, OrderLine } from '../../core/orders';
 import { customerDebts, deliveredBalance, localDay, OpeningPreview, orderDebtId, Receipt, ReceiptPreview, Sheet } from '../../core/settlement';
 import { DeliveryStatus, LineChange, PickingChange } from '../../core/trips';
 import { balanceView } from '../delivery/settlement-view';
-import { deliveryLabel, lineView } from '../order-view';
+import { amountLabel, deliveryLabel, lineView } from '../order-view';
 
 type Amounts = ReturnType<typeof deliveredBalance>;
 export type DeliveryMark = 'pending' | 'delivered';
@@ -15,7 +16,9 @@ export interface ServerSheet extends Sheet {
   statusRevision: number;
   amounts: Amounts;
   orderCents: number;
-  lines: (OrderLine & { status: DeliveryStatus })[];
+  lines: (DeliveryLine & { status: DeliveryStatus })[];
+  execution: ReturnType<typeof deliverySummary>;
+  deliveryCompleted: boolean;
 }
 
 export interface ServerLedger {
@@ -44,9 +47,11 @@ export function sheetPath({ tripId, sheetId }: Sheet) {
 
 export function sheetView(sheet: ServerSheet, ledger: ServerLedger = { debts: [], receipts: [], remainingCents: 0, otherRemainingCents: 0 }) {
   const labels = new Map(ledger.debts.map(debt => [debt.id, debt.label]));
+  const execution = sheet.execution ?? deliverySummary(sheet.lines);
   return {
-    ...sheet, balance: balanceView(sheet.amounts), total: money(sheet.orderCents),
-    lines: sheet.lines.map(line => ({ ...lineView(line), status: line.status, statusLabel: deliveryLabel[line.status] })),
+    ...sheet, executionLabel: amountLabel(execution.totalCents, execution.pendingPrices, '预计应收'),
+    balance: balanceView(sheet.amounts), total: money(sheet.orderCents),
+    lines: sheet.lines.map(line => ({ ...line, ...lineView(line), statusLabel: deliveryLabel[line.status] })),
     pending: sheet.lines.filter(line => line.status !== 'delivered').map(lineView),
     hasUnrecorded: sheet.lines.some(line => line.status === 'unrecorded'),
     otherRemaining: money(ledger.otherRemainingCents),

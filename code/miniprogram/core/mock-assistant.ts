@@ -103,14 +103,14 @@ export function applyInput(state: TripState, intents: (Add | Fill | Quantity)[],
     if (intent.kind === 'add') {
       const key = JSON.stringify([found?.id ?? intent.name, ...fields.map(field => intent.line[field])]);
       const duplicate = found && (notes.draft.seen.some(entry => entry.key === key)
-        || found.items.some(item => fields.every(field => item[field].trim() === intent.line[field])));
+        || found.items.some(item => fields.every(field => item[field]?.trim() === intent.line[field])));
       if (!force && duplicate) { skipped.push(intent); continue; }
       const alias = knownAlias(state, intent.name);
       const empty = draft.customers.find(isBlank);
       const target = found ?? { id: empty?.id ?? id(), customer: alias?.name ?? intent.name, items: [], ...(alias ? { partyId: alias.id } : {}) };
       const item = { ...emptyItem(id()), ...intent.line };
       const customer = { ...target, items: [...target.items.filter(line =>
-        fields.some(field => field !== 'unit' && line[field].trim())), item] };
+        fields.some(field => field !== 'unit' && line[field]?.trim())), item] };
       notes.draft.seen.push({ key: JSON.stringify([customer.id, ...fields.map(field => intent.line[field])]), itemId: item.id });
       draft = draft.customers.some(entry => entry.id === customer.id) ? replaceCustomer(draft, customer)
         : { ...draft, customers: [...draft.customers, customer] };
@@ -148,10 +148,10 @@ export function linePrice(state: TripState, customer: CustomerDraft, item: ItemI
     const version = latest(trip);
     return version.customers.flatMap(sheet => {
       if (accountFor(state.ledger, { tripId: trip.id, sheetId: sheet.id })?.partyId !== customer.partyId) return [];
-      return sheet.items.filter(line => pickingKey(line) === pickingKey(item)).map(line => ({
+      return sheet.items.flatMap(line => line.price && pickingKey(line) === pickingKey(item) ? [{
         price: line.price, day: localDay(new Date(trip.versions[0].savedAt)), source: sheet.id,
         time: Date.parse(trip.versions[0].savedAt), mock: false,
-      }));
+      }] : []);
     });
   }).sort((a, b) => b.time - a.time);
   const first = sources[0];
@@ -169,11 +169,11 @@ export function questions(state: TripState) {
     const name = customer.customer || `第 ${index + 1} 位客户`;
     const identity = customer.partyId === undefined;
     const entries = customer.items.map(item => {
-      const missing = fields.slice(0, 4).filter(field => !item[field].trim()).map(field => labels[fields.indexOf(field)]);
+      const missing = fields.slice(0, 4).filter(field => !item[field]?.trim()).map(field => labels[fields.indexOf(field)]);
       if (!numeric.test(item.quantity) || !Number.isSafeInteger(Number(item.quantity))) missing.push('数量');
       const cents = yuanToCents(item.price);
       const priceMissing = !Number.isSafeInteger(cents) || cents <= 0;
-      const ready = fields.slice(0, 4).every(field => item[field].trim());
+      const ready = fields.slice(0, 4).every(field => item[field]?.trim());
       const history = priceMissing && ready && !identity ? linePrice(state, customer, item) : null;
       if (priceMissing && ready && !identity && !history) missing.push('单价');
       const quantity = notes.draft.quantities.find(entry => entry.itemId === item.id) ?? null;

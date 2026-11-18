@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { Pool, PoolClient } from 'pg';
+import { nullablePrice } from '../miniprogram/core/orders';
 import { Party } from '../miniprogram/core/settlement';
 import { TripDraft } from '../miniprogram/core/trips';
 import { setAccount, transaction } from './database';
@@ -21,7 +22,9 @@ export async function readWorkspace(client: PoolClient, accountId: string, lock 
 }
 
 export function workspaceDraft({ id, revision, customers }: Workspace): TripDraft {
-  return { id, revision, customers };
+  return { id, revision, customers: customers.map(customer => ({
+    ...customer, items: customer.items.map(item => ({ ...item, price: nullablePrice(item.price) })),
+  })) };
 }
 
 export async function readParties(client: PoolClient, accountId: string): Promise<Party[]> {

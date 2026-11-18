@@ -3,19 +3,20 @@
     <view class="section-title">货品 {{index + 1}}</view>
     <view class="field-grid">
       <view wx:for="{{item.fields}}" wx:for-item="field" wx:key="key">
-        <label for="{{item.id}}-{{field.key}}">{{field.label}}</label>
+        <label for="{{item.id}}-{{field.key}}">{{field.label}}{{showPendingPrice && (field.key === 'brand' || field.key === 'specification') ? '（选填）' : ''}}</label>
         <input id="{{item.id}}-{{field.key}}" value="{{field.value}}" type="{{field.type}}" maxlength="{{field.max}}"
           data-id="{{item.id}}" data-field="{{field.key}}" disabled="{{locked}}" bindinput="editItem" />
       </view>
     </view>
+    <view wx:if="{{showPendingPrice && item.pendingPrice}}" class="hint">待补价 · 可送货时补填</view>
     <button wx:if="{{form.length > 1}}" data-id="{{item.id}}" disabled="{{locked}}" bindtap="removeItem">移除此货品</button>
   </view>
   <button disabled="{{locked}}" bindtap="addItem">添加货品</button>
 </template>
 
 <template name="order-line">
-  <view class="product">{{line.brand}} {{line.product}} · {{line.specification}}</view>
-  <view>{{line.quantity}} {{line.unit}} × ¥{{line.price}} = ¥{{line.amount}}</view>
+  <view class="product">{{line.productLabel}}</view>
+  <view>{{line.quantity}} {{line.unit}} × {{line.priceLabel}} = {{line.amountLabel}}</view>
 </template>
 
 <template name="trip-customers">
@@ -24,6 +25,6 @@
     <view wx:for="{{customer.items}}" wx:for-item="line" wx:key="id" class="line">
       <template is="order-line" data="{{line: line}}" />
     </view>
-    <view class="subtotal">订单金额 ¥{{customer.total}}</view>
+    <view class="subtotal">{{customer.totalLabel}}</view>
   </view>
 </template>

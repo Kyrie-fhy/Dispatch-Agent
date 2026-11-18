@@ -4,8 +4,10 @@ import { localDatabaseUrl, requireApplicationRole } from './database';
 import { readSaveDraft } from './draft-input';
 import { DraftStore } from './drafts';
 import { DeliveryStore } from './delivery';
+import { LedgerStore } from './ledger';
 import { TripStore } from './trips';
-import { readConfirmInput, readDeliveryInput, readNextInput, readPreviewInput, readReviewInput, uuidPattern, validSheetKey } from './request-input';
+import { readConfirmInput, readDeliveryInput, readNextInput, readOpeningInput, readPreviewInput, readReceiptInput,
+  readReviewInput, uuidPattern, validSheetKey } from './request-input';
 import { HttpError } from './http-error';
 import { isObject } from '../miniprogram/core/orders';
 
@@ -48,7 +50,8 @@ function resourceId(path: string, collection: 'drafts' | 'trips'): string | null
   return uuidPattern.test(id) ? id : null;
 }
 
-async function handle(store: DraftStore, trips: TripStore, delivery: DeliveryStore, request: IncomingMessage, response: ServerResponse): Promise<void> {
+async function handle(store: DraftStore, trips: TripStore, delivery: DeliveryStore, ledger: LedgerStore,
+  request: IncomingMessage, response: ServerResponse): Promise<void> {
   const host = request.headers.host ?? '';
   if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host)) {
     throw new HttpError(400, 'invalid_host', '请通过本机地址访问草稿服务');
@@ -111,20 +114,33 @@ async function handle(store: DraftStore, trips: TripStore, delivery: DeliverySto
     return;
   }
 
-  const sheetRoute = /^\/v1\/trips\/([^/]+)\/sheets\/([^/]+)(?:\/(delivery|delivery\/preview|delivery\/confirm|review))?$/.exec(path);
+  const sheetRoute = /^\/v1\/trips\/([^/]+)\/sheets\/([^/]+)(?:\/(delivery(?:\/(?:preview|confirm))?|review|ledger|(?:opening|receipt)\/(?:preview|confirm)))?$/.exec(path);
   if (sheetRoute && uuidPattern.test(sheetRoute[1])) {
     const [, sheetTripId, key, action] = sheetRoute;
     let sheetId: string;
     try { sheetId = decodeURIComponent(key); }
     catch { throw new HttpError(400, 'invalid_id', '请提供有效的客户单编号'); }
     if (!validSheetKey(sheetId)) throw new HttpError(400, 'invalid_id', '请提供有效的客户单编号');
+    const sheetKey = { tripId: sheetTripId, sheetId };
     if (method === 'GET' && !action) {
       sendJson(response, 200, { sheet: await delivery.sheet(account, sheetTripId, sheetId) });
       return;
     }
-    if (method === 'POST' && action) {
+    if (method === 'GET' && action === 'ledger') {
+      sendJson(response, 200, { ledger: await ledger.read(account, sheetKey) });
+      return;
+    }
+    if (method === 'POST' && action && action !== 'ledger') {
       const body = await readJson(request, response);
-      if (action === 'delivery/preview') {
+      if (action === 'opening/preview') {
+        sendJson(response, 200, { preview: await ledger.previewOpening(account, sheetKey, readOpeningInput(body)) });
+      } else if (action === 'opening/confirm') {
+        sendJson(response, 200, { opening: await ledger.confirmOpening(account, sheetKey, readConfirmInput(body)) });
+      } else if (action === 'receipt/preview') {
+        sendJson(response, 200, { preview: await ledger.previewReceipt(account, sheetKey, readReceiptInput(body)) });
+      } else if (action === 'receipt/confirm') {
+        sendJson(response, 200, { receipt: await ledger.confirmReceipt(account, sheetKey, readConfirmInput(body)) });
+      } else if (action === 'delivery/preview') {
         const preview = await delivery.preview(account, sheetTripId, sheetId, readDeliveryInput(body));
         sendJson(response, 200, { preview });
       } else {
@@ -145,8 +161,9 @@ export async function startLocalServer(pool: Pool, port: number): Promise<Server
   const store = new DraftStore(pool);
   const trips = new TripStore(pool);
   const delivery = new DeliveryStore(pool);
+  const ledger = new LedgerStore(pool);
   const server = createServer({ requestTimeout: 15_000 }, (request, response) => {
-    void handle(store, trips, delivery, request, response).catch(error => {
+    void handle(store, trips, delivery, ledger, request, response).catch(error => {
       if (response.destroyed) return;
       if (error instanceof HttpError) {
         sendJson(response, error.status, { error: error.code, message: error.message });

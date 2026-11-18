@@ -4,7 +4,8 @@ import { readMaterials } from '../../services/mock-materials';
 import { confirmOfficial, OfficialCard, prepareOfficial } from './official';
 import { emptyItem, yuanToCents } from '../../core/orders';
 import { currentTrip, CustomerDraft, emptyCustomer, emptyTrip, latest, TripDraft } from '../../core/trips';
-import { newId, trips } from '../../services/orders';
+import { newId } from '../../services/ids';
+import { trips } from '../../services/orders';
 import { selectDeliverySheet, clearDeliverySheet } from '../../services/delivery-link';
 import { editLines, errorMessage, formLines, partyOptions, tripView } from '../order-view';
 

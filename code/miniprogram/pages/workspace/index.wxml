@@ -1,0 +1,125 @@
+<import src="../order-templates.wxml" />
+<view class="container">
+  <view class="title">配送工作区</view>
+  <view wx:if="{{error}}" class="error" role="alert">{{error}}</view>
+
+  <view wx:if="{{!signedIn}}" class="card">
+    <view class="section-title">微信登录</view>
+    <view class="hint">登录后可继续上次保存的草稿，并查看本趟正式单。</view>
+    <button class="primary" bindtap="login" disabled="{{busy}}" loading="{{busy}}">微信登录</button>
+    <button wx:if="{{revokeFailed}}" bindtap="retryLogout" disabled="{{busy}}">重试撤销上次会话</button>
+  </view>
+  <block wx:else>
+    <view class="session-actions">
+      <button wx:if="{{draft && !dirty}}" size="mini" bindtap="reload" disabled="{{busy}}">刷新工作区</button>
+      <button size="mini" bindtap="logout">退出登录</button>
+    </view>
+    <view wx:if="{{!draft}}" class="card">
+      <view wx:if="{{busy}}">正在恢复工作区…</view>
+      <button wx:else class="primary" bindtap="reload">重试恢复</button>
+    </view>
+    <block wx:else>
+      <view class="workspace-actions">
+        <button size="mini" class="{{section === 'draft' ? 'option-active' : ''}}" data-section="draft" bindtap="selectSection">录单</button>
+        <button size="mini" class="{{section === 'picking' ? 'option-active' : ''}}" data-section="picking" bindtap="selectSection">取货</button>
+        <button size="mini" class="{{section === 'delivery' ? 'option-active' : ''}}" data-section="delivery" bindtap="selectSection">送货单</button>
+      </view>
+
+      <block wx:if="{{section === 'draft'}}">
+        <block wx:if="{{draftConfirmed && formal}}">
+          <view class="card">
+            <view class="section-title">已出单 · 第 {{formal.version}} 版</view>
+            <view class="amount">整趟订单金额 ¥{{formal.total}}</view>
+            <button class="primary" bindtap="nextTrip" disabled="{{busy}}" loading="{{busy}}">开始下一趟</button>
+          </view>
+          <template is="trip-customers" data="{{summary: formal}}" />
+        </block>
+
+        <block wx:elif="{{preview}}">
+          <view class="section-title">整趟预览</view>
+          <view wx:for="{{preview.identities}}" wx:key="*this" class="hint">{{index + 1}}. {{item}}</view>
+          <template is="trip-customers" data="{{summary: preview}}" />
+          <view class="amount">整趟订单金额 ¥{{preview.total}}</view>
+          <button class="primary" bindtap="confirmTrip" disabled="{{busy}}" loading="{{busy}}">确认生成正式单</button>
+          <button bindtap="backToEdit" disabled="{{busy}}">返回修改</button>
+        </block>
+
+        <block wx:else>
+          <view class="card" wx:if="{{conflict}}">
+            <view class="section-title">核对工作区的最新草稿</view>
+            <view class="hint">下方编辑区保留了你的修改。请核对服务端最新版本后选择。</view>
+            <view class="hint">服务端草稿 · 修订 {{conflict.draft.revision}}{{conflict.draftConfirmed ? ' · 已出单' : ''}}</view>
+            <view class="line" wx:for="{{conflict.draft.customers}}" wx:for-item="customer" wx:key="id">
+              <view class="product">{{customer.customer || '未命名客户'}}</view>
+              <view wx:for="{{customer.items}}" wx:for-item="line" wx:key="id">
+                {{line.brand}} {{line.product}} {{line.specification}} · {{line.quantity}}{{line.unit}} · 单价 {{line.price || '待填'}}
+              </view>
+            </view>
+            <button class="primary" bindtap="useSavedDraft" disabled="{{busy}}">使用服务端版本</button>
+            <button wx:if="{{!conflict.draftConfirmed && draft.id === conflict.draft.id}}" bindtap="keepLocalDraft" disabled="{{busy}}">用我的草稿覆盖并保存</button>
+          </view>
+          <view class="card">
+            <view class="section-title">本趟客户</view>
+            <view class="hint">{{dirty ? '有修改待保存' : '已保存 · 修订 ' + draft.revision}}</view>
+            <view class="customer-options">
+              <button wx:for="{{draft.customers}}" wx:key="id" data-id="{{item.id}}" bindtap="selectCustomer"
+                class="option {{item.id === active.id ? 'option-active' : ''}}">{{index + 1}}. {{item.customer || '未命名客户'}}</button>
+            </view>
+            <button bindtap="addCustomer" disabled="{{busy || !!conflict}}">添加客户</button>
+          </view>
+          <view class="card" wx:if="{{active}}">
+            <picker wx:if="{{parties.length}}" range="{{parties}}" range-key="label" bindchange="chooseExisting" disabled="{{busy || !!conflict}}">
+              <view class="link">{{partyLabel || '选择已有客户'}}</view>
+            </picker>
+            <button wx:if="{{active.partyId}}" bindtap="chooseNew" disabled="{{busy || !!conflict}}">改为新客户</button>
+            <block wx:else>
+              <label for="customer-name">新客户名称</label>
+              <input id="customer-name" value="{{active.customer}}" maxlength="100" data-id="{{active.id}}"
+                disabled="{{busy || !!conflict}}" bindinput="editCustomer" placeholder="例如：王记餐饮" />
+            </block>
+            <template is="edit-lines" data="{{form: form, locked: busy || !!conflict}}" />
+            <button wx:if="{{draft.customers.length > 1}}" bindtap="removeCustomer" disabled="{{busy || !!conflict}}">移除此客户</button>
+          </view>
+          <button bindtap="saveDraft" disabled="{{busy || !dirty || !!conflict}}">保存草稿</button>
+          <button class="primary" bindtap="showPreview" disabled="{{busy || !!conflict}}" loading="{{busy}}">预览整趟</button>
+        </block>
+      </block>
+
+      <block wx:elif="{{section === 'picking'}}">
+        <view wx:if="{{!formal}}" class="card">还没有正式送货单。</view>
+        <block wx:else>
+          <view wx:if="{{formal.version > 1}}" class="card">
+            <view class="section-title">第 {{formal.version}} 版取货变化</view>
+            <view wx:if="{{!formal.changes.length}}" class="hint">本次取货数量无变化</view>
+            <view wx:for="{{formal.changes}}" wx:key="id" class="line">
+              <view>{{item.brand}} {{item.product}} · {{item.specification}}</view>
+              <view>{{item.before}} → {{item.after}} {{item.unit}}</view>
+            </view>
+          </view>
+          <view class="card">
+            <view class="section-title">本趟应取 · 第 {{formal.version}} 版</view>
+            <view wx:for="{{formal.picking}}" wx:key="id" class="line">
+              <view class="product">{{item.brand}} {{item.product}} · {{item.specification}}</view>
+              <view>{{item.quantity}} {{item.unit}}</view>
+            </view>
+          </view>
+        </block>
+      </block>
+
+      <block wx:else>
+        <view wx:if="{{!formal}}" class="card">还没有正式送货单。</view>
+        <block wx:else>
+          <view class="section-title">本趟送货单 · 第 {{formal.version}} 版</view>
+          <view wx:for="{{formal.customers}}" wx:for-item="customer" wx:key="id" class="card">
+            <view class="section-title">{{customer.customer}}</view>
+            <view wx:for="{{customer.items}}" wx:for-item="line" wx:key="id" class="line">
+              <template is="order-line" data="{{line: line}}" />
+              <view class="muted">{{formal.statuses[line.id] || '未记录'}}</view>
+            </view>
+            <view class="subtotal">订单金额 ¥{{customer.total}}</view>
+          </view>
+        </block>
+      </block>
+    </block>
+  </block>
+</view>

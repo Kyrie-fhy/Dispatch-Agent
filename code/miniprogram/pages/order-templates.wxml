@@ -5,12 +5,12 @@
       <view wx:for="{{item.fields}}" wx:for-item="field" wx:key="key">
         <label for="{{item.id}}-{{field.key}}">{{field.label}}</label>
         <input id="{{item.id}}-{{field.key}}" value="{{field.value}}" type="{{field.type}}" maxlength="{{field.max}}"
-          data-id="{{item.id}}" data-field="{{field.key}}" bindinput="editItem" />
+          data-id="{{item.id}}" data-field="{{field.key}}" disabled="{{locked}}" bindinput="editItem" />
       </view>
     </view>
-    <button wx:if="{{form.length > 1}}" data-id="{{item.id}}" bindtap="removeItem">移除此货品</button>
+    <button wx:if="{{form.length > 1}}" data-id="{{item.id}}" disabled="{{locked}}" bindtap="removeItem">移除此货品</button>
   </view>
-  <button bindtap="addItem">添加货品</button>
+  <button disabled="{{locked}}" bindtap="addItem">添加货品</button>
 </template>
 
 <template name="order-line">

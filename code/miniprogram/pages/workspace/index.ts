@@ -63,8 +63,8 @@ function initialData() {
     ...sheetEditor(), sheetTarget: null as Sheet | null, sheet: null as ReturnType<typeof sheetView> | null,
     sheetNeedsRefresh: false, sheetRetry: false,
     materialRows: [] as (MaterialSource & { id: string; label: string; draftCurrent: boolean;
-      ready: boolean; local: boolean; progress: number })[],
-    materialLoaded: false, uploading: '', materialNotice: '',
+      ready: boolean; local: boolean; progress: number; canOrganize: boolean })[],
+    materialLoaded: false, uploading: '', organizingImage: '', materialNotice: '',
   };
 }
 
@@ -361,6 +361,18 @@ Page({
     if (!this.data.busy) this.setData({ orderText: event.detail.value, textNotice: '', error: '' });
   },
 
+  acceptOrganizedDraft(before: TripDraft, after: unknown, source: '文字' | '图片') {
+    if (!isTripDraft(after) || after.id !== before.id || after.revision !== before.revision + 1 ||
+        this.data.draft?.id !== before.id || this.data.draft.revision !== before.revision) {
+      throw new Error(`草稿已变化，请刷新工作区后核对。${source === '文字' ? '原文仍在' : '图片已保留'}。`);
+    }
+    const questions = textOrderQuestions(after);
+    this.pending = null;
+    this.setData({ textSaved: true,
+      textNotice: questions.length ? '已写入草稿，请补齐下列信息。' : '已写入草稿，请核对货品和单价。' });
+    this.showDraft(after, questions[0]?.id ?? this.data.active?.id);
+  },
+
   organizeText() {
     const { draft, draftConfirmed, conflict, preview, orderText } = this.data;
     const text = orderText.trim();
@@ -374,15 +386,8 @@ Page({
         const result = await this.command<{ draft: TripDraft }>('POST', '/text-orders', token,
           { draftId: saved.id, revision: saved.revision, text }, 25_000);
         if (generation !== this.generation) return;
-        if (!isTripDraft(result?.draft) || result.draft.id !== saved.id ||
-            result.draft.revision !== saved.revision + 1 || this.data.draft?.revision !== saved.revision) {
-          throw new Error('草稿已变化，请刷新工作区后核对。原文仍在。');
-        }
-        const questions = textOrderQuestions(result.draft);
-        this.pending = null;
-        this.setData({ orderText: '', textSaved: true,
-          textNotice: questions.length ? '已写入草稿，请补齐下列信息。' : '已写入草稿，请核对货品和单价。' });
-        this.showDraft(result.draft, questions[0]?.id ?? this.data.active?.id);
+        this.acceptOrganizedDraft(saved, result?.draft, '文字');
+        this.setData({ orderText: '' });
       } finally {
         if (generation === this.generation) this.setData({ organizingText: false });
       }
@@ -656,13 +661,14 @@ Page({
     const local = stagedMaterials();
     const { draft, draftConfirmed } = this.data;
     const rows = this.materials.map(material => ({
-      ...material, label: material.status === 'ready' ? '已上传' : '待续传',
+      ...material, label: this.data.deliveryMvp && material.organized ? '已整理' : material.status === 'ready' ? '已上传' : '待续传',
       ready: material.status === 'ready', local: local.some(source => sameMaterial(source, material)),
+      canOrganize: material.status === 'ready' && !material.organized && material.draftId === draft?.id && !draftConfirmed,
       progress: Math.floor(material.received * 100 / material.size),
     }));
     const pending = local.filter(source => source.draftId === draft?.id &&
       !this.materials.some(material => sameMaterial(material, source))).map(source => ({
-      ...source, id: '', label: '待登记', ready: false, local: true, progress: 0,
+      ...source, id: '', label: '待登记', ready: false, local: true, progress: 0, canOrganize: false,
       draftCurrent: !draftConfirmed && source.revision === draft?.revision,
     }));
     this.setData({ materialRows: [...pending, ...rows] });
@@ -680,6 +686,24 @@ Page({
   refreshMaterials() {
     if (!this.token) return;
     return this.run(generation => this.loadMaterials(generation, this.token));
+  },
+
+  organizeImage(event: WechatMiniprogram.TouchEvent) {
+    const { draft, draftConfirmed, dirty, conflict, preview, deliveryMvp } = this.data;
+    const row = this.data.materialRows.find(item => item.id === event.currentTarget.dataset.id);
+    if (!deliveryMvp || !draft || draftConfirmed || dirty || conflict || preview || !this.token || !row?.canOrganize) return;
+    return this.run(async generation => {
+      this.setData({ organizingImage: row.name, materialNotice: '' });
+      try {
+        const result = await this.command<{ draft: TripDraft }>('POST', '/image-orders', this.token,
+          { draftId: draft.id, revision: draft.revision, materialId: row.id }, 25_000);
+        if (generation !== this.generation) return;
+        this.acceptOrganizedDraft(draft, result?.draft, '图片');
+        this.setData({ section: 'draft' });
+      } finally {
+        if (generation === this.generation) this.setData({ organizingImage: '' });
+      }
+    });
   },
 
   selectMaterial(event: WechatMiniprogram.TouchEvent) {

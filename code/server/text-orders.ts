@@ -5,10 +5,11 @@ import { textFields, textOrderLimit, validTextField } from '../miniprogram/core/
 import { CustomerDraft, TripDraft } from '../miniprogram/core/trips';
 import { missingDraft, readAccount, readAccountResult, readParties, readWorkspace, Workspace, writeAccount } from './account-workspace';
 import { HttpError } from './http-error';
-import { readPreviewInput, validRevision } from './request-input';
-import { TextModel } from './text-model';
+import { readOrderImage } from './materials';
+import { readId, readPreviewInput, validRevision } from './request-input';
+import { ImageModel, TextModel } from './text-model';
 
-type Input = ReturnType<typeof readTextOrder>;
+type Input = ReturnType<typeof readTextOrder> | ReturnType<typeof readImageOrder>;
 type Fields = Omit<ItemInput, 'id'>;
 const productFields = ['product', 'brand', 'specification', 'unit'] as const;
 const contextLimit = 12_000;
@@ -21,9 +22,14 @@ function readable(value: unknown, limit: number): value is string {
   return typeof value === 'string' && value.length <= limit && !value.includes('\0') && Buffer.from(value).toString() === value;
 }
 
-export function readTextOrder(value: unknown) {
+function readOrderBasis(value: unknown) {
   const input = readPreviewInput(value);
   if (!validRevision(input.revision, true)) throw new HttpError(409, 'draft_revision_limit', '草稿已达到修订上限');
+  return input;
+}
+
+export function readTextOrder(value: unknown) {
+  const input = readOrderBasis(value);
   const { text } = value as Record<string, unknown>;
   if (!readable(text, textOrderLimit) || !text.trim()) {
     throw new HttpError(400, 'invalid_order_text', `请输入 1 至 ${textOrderLimit} 字的录单文字`);
@@ -31,12 +37,9 @@ export function readTextOrder(value: unknown) {
   return { ...input, text: text.trim() };
 }
 
-function invalidModel(): never {
-  throw new HttpError(502, 'invalid_text_result', '文字整理结果无法读取。原文仍在，可以重试或手动填写。');
-}
-
-function needsReview(message: string): never {
-  throw new HttpError(422, 'text_needs_review', message);
+export function readImageOrder(value: unknown) {
+  const input = readOrderBasis(value);
+  return { ...input, materialId: readId((value as Record<string, unknown>).materialId, '图片编号') };
 }
 
 function targetRows(draft: TripDraft) {
@@ -52,7 +55,7 @@ function isPlaceholder(item: ItemInput) {
   return (!item.unit || item.unit === '箱') && textFields.every(field => field === 'unit' || !item[field].trim());
 }
 
-function safeFields(op: Record<string, unknown>) {
+function safeFields(op: Record<string, unknown>, invalidModel: () => never) {
   const fields: Partial<Fields> = {};
   for (const key of textFields) {
     if (!(key in op)) continue;
@@ -65,28 +68,40 @@ function safeFields(op: Record<string, unknown>) {
   return fields;
 }
 
-function mergeText(draft: TripDraft, output: unknown, partyNames: Set<string>, text: string): TripDraft {
-  if (!isObject(output) || !Array.isArray(output.operations) || output.operations.length > 24
+function mergeOrder(draft: TripDraft, output: unknown, partyNames: Set<string>, text?: string): TripDraft {
+  const image = text === undefined;
+  function invalidModel(): never {
+    throw image
+      ? new HttpError(502, 'invalid_image_result', '图片整理结果无法读取。图片已保留，可以重试或手动填写。')
+      : new HttpError(502, 'invalid_text_result', '文字整理结果无法读取。原文仍在，可以重试或手动填写。');
+  }
+  function needsReview(message: string): never {
+    throw new HttpError(422, image ? 'image_needs_review' : 'text_needs_review', message);
+  }
+  if (!isObject(output) || !Array.isArray(output.operations)
       || !readable(output.question ?? '', 250)) invalidModel();
+  if (image && output.operations.length > 64) needsReview('这张图片的明细超过 64 行，请分成几张图片再识别。');
+  if (!image && output.operations.length > 24) invalidModel();
   const question = typeof output.question === 'string' ? output.question.trim() : '';
   if (question) needsReview(question);
   if (!output.operations.length) needsReview('没有找到可录入的明细。请补充客户和货品，或直接手动填写。');
 
   const next = structuredClone(draft);
   const targets = targetRows(next);
+  let unnamedImageCustomer: CustomerDraft | undefined;
   // Resolve short supplements against the original rows, before applying any changes in this response.
   const original = targetRows(draft);
   const compact = (value: string) => normalized(value).toLowerCase().replace(/\s/g, '');
-  const source = compact(text);
+  const source = compact(text ?? '');
   const referenceScore = ({ customer, item }: typeof original[number]) =>
     [...new Set([customer.customer, ...productFields.map(field => item[field])].map(compact))]
       .filter(term => term && source.includes(term)).length;
   for (const op of output.operations as unknown[]) {
-    if (!isObject(op) || (op.action !== 'add' && op.action !== 'fill')
+    if (!isObject(op) || (op.action !== 'add' && (image || op.action !== 'fill'))
         || Object.keys(op).some(key => !['action', 'target', 'customer', ...textFields].includes(key))) invalidModel();
     if (!readable(op.customer ?? '', 200)) invalidModel();
     const customer = typeof op.customer === 'string' ? op.customer.trim() : '';
-    const fields = safeFields(op);
+    const fields = safeFields(op, invalidModel);
 
     if (op.action === 'fill') {
       if (!Number.isSafeInteger(op.target) || Number(op.target) < 1 || Number(op.target) > targets.length) {
@@ -121,10 +136,12 @@ function mergeText(draft: TripDraft, output: unknown, partyNames: Set<string>, t
       }
     } else {
       if (op.target !== undefined && op.target !== null) invalidModel();
-      if (!fields.product) needsReview('请说明要添加的货品名称，或直接手动填写。');
+      const product = fields.product;
+      if (!product && (!image || !fields.quantity)) needsReview(image
+        ? '图片中的货品和数量都无法确认，请直接手动填写。' : '请说明要添加的货品名称，或直接手动填写。');
       const matches = customer ? next.customers.filter(entry => normalized(entry.customer) === normalized(customer)) : [];
       if (matches.length > 1) needsReview('草稿有多个同名客户，请手动选择对应客户后添加明细。');
-      let owner: CustomerDraft | undefined = matches[0];
+      let owner: CustomerDraft | undefined = matches[0] ?? (image && !customer ? unnamedImageCustomer : undefined);
       if (!owner) {
         owner = next.customers.find(entry => !entry.customer.trim() && !entry.partyId && entry.items.every(isPlaceholder));
         if (!owner) {
@@ -134,7 +151,8 @@ function mergeText(draft: TripDraft, output: unknown, partyNames: Set<string>, t
         owner.customer = customer;
         owner.partyId = !customer || partyNames.has(normalized(customer)) ? undefined : null;
       }
-      if (owner.items.some(item => normalized(item.product) === normalized(fields.product!) &&
+      if (image && !customer) unnamedImageCustomer = owner;
+      if (product && owner.items.some(item => normalized(item.product) === normalized(product) &&
           productFields.every(field => !item[field].trim() || !fields[field] || normalized(item[field]) === normalized(fields[field])))) {
         needsReview('草稿里有同款或相似货品，请补充规格和单位，或直接修改现有明细。');
       }
@@ -144,14 +162,17 @@ function mergeText(draft: TripDraft, output: unknown, partyNames: Set<string>, t
       else owner.items[blank] = item;
     }
   }
-  if (JSON.stringify(next.customers) === JSON.stringify(draft.customers)) needsReview('这段文字没有新增可填写的内容，请核对草稿。');
+  if (JSON.stringify(next.customers) === JSON.stringify(draft.customers)) {
+    needsReview(image ? '图片没有新增可填写的内容，请核对草稿。' : '这段文字没有新增可填写的内容，请核对草稿。');
+  }
   return { ...next, revision: draft.revision + 1 };
 }
 
 function checkBasis(current: Workspace, input: Input) {
   if (current.id !== input.draftId) throw missingDraft();
   if (current.currentTripId === current.id) throw new HttpError(409, 'draft_confirmed', '本趟已确认，请开始下一趟');
-  if (current.revision !== input.revision) throw new HttpError(409, 'draft_changed', '草稿已更新，请刷新后核对，原文仍在。');
+  if (current.revision !== input.revision) throw new HttpError(409, 'draft_changed', 'materialId' in input
+    ? '草稿已更新，请刷新后核对。图片已保留。' : '草稿已更新，请刷新后核对，原文仍在。');
 }
 
 async function checkDuplicate(client: PoolClient, account: string, draftId: string, digest: Buffer) {
@@ -163,13 +184,17 @@ async function checkDuplicate(client: PoolClient, account: string, draftId: stri
 export class TextOrders {
   private readonly running = new Set<string>();
 
-  constructor(private readonly pool: Pool, private readonly model?: TextModel) {}
+  constructor(private readonly pool: Pool, private readonly model?: TextModel, private readonly imageModel?: ImageModel) {}
 
   async apply(account: string, input: Input, checkSession: () => Promise<unknown>): Promise<{ draft: TripDraft }> {
-    const command = { action: 'text-order', draftId: input.draftId, revision: input.revision, text: input.text };
-    const digest = createHash('sha256').update(normalized(input.text)).digest();
+    const image = 'materialId' in input;
+    const basis = { draftId: input.draftId, revision: input.revision };
+    const command = image
+      ? { action: 'image-order', ...basis, materialId: input.materialId }
+      : { action: 'text-order', ...basis, text: input.text };
+    const textDigest = image ? null : createHash('sha256').update(normalized(input.text)).digest();
     if (this.running.has(account) || this.running.size >= 4) {
-      throw new HttpError(429, 'text_order_busy', '正在整理文字，请稍后重试。');
+      throw new HttpError(429, image ? 'image_order_busy' : 'text_order_busy', image ? '正在整理录单材料，请稍后重试。' : '正在整理文字，请稍后重试。');
     }
     this.running.add(account);
     try {
@@ -182,27 +207,40 @@ export class TextOrders {
         }
         const draft = { id: current.id, revision: current.revision, customers: current.customers };
         checkBasis(current, input);
-        await checkDuplicate(client, account, input.draftId, digest);
+        if (textDigest) await checkDuplicate(client, account, input.draftId, textDigest);
+        const picture = image ? await readOrderImage(client, account, input.draftId, input.materialId) : null;
         const partyNames = new Set((await readParties(client, account)).map(party => normalized(party.name)));
-        return { draft, partyNames } as const;
+        return { draft, partyNames, picture } as const;
       });
       if (snapshot.replay) return snapshot.replay;
-      if (!this.model) throw new HttpError(503, 'text_model_unavailable', '文字整理暂未开启。可以保留原文，先手动填写草稿。');
-      const current = targetRows(snapshot.draft).map(({ customer, item }, index) =>
-        ({ target: index + 1, customer: customer.customer, ...fieldsOf(item), ...(isPlaceholder(item) ? { unit: '' } : {}) }));
-      if (JSON.stringify(current).length > contextLimit) {
-        throw new HttpError(422, 'text_context_too_large', '当前草稿明细较多，请手动补充，已保存的草稿仍可使用。');
+      let output: unknown;
+      const { picture } = snapshot;
+      if (image) {
+        if (!this.imageModel || !picture) throw new HttpError(503, 'image_model_unavailable', '图片识别暂未开启。图片已保留，可以先手动填写。');
+        output = await this.imageModel({ content: picture.content, mime: picture.mime });
+      } else {
+        if (!this.model) throw new HttpError(503, 'text_model_unavailable', '文字整理暂未开启。可以保留原文，先手动填写草稿。');
+        const current = targetRows(snapshot.draft).map(({ customer, item }, index) =>
+          ({ target: index + 1, customer: customer.customer, ...fieldsOf(item), ...(isPlaceholder(item) ? { unit: '' } : {}) }));
+        if (JSON.stringify(current).length > contextLimit) {
+          throw new HttpError(422, 'text_context_too_large', '当前草稿明细较多，请手动补充，已保存的草稿仍可使用。');
+        }
+        output = await this.model({ text: input.text, current });
       }
-      const output = await this.model({ text: input.text, current });
-      const draft = mergeText(snapshot.draft, output, snapshot.partyNames, input.text);
+      const draft = mergeOrder(snapshot.draft, output, snapshot.partyNames, image ? undefined : input.text);
       await checkSession();
       return await writeAccount(this.pool, account, input.requestId, command, async (client, latest) => {
         checkBasis(latest, input);
-        await checkDuplicate(client, account, input.draftId, digest);
+        if (textDigest) await checkDuplicate(client, account, input.draftId, textDigest);
         await client.query('UPDATE dispatch.workspaces SET draft_revision = $2, draft_customers = $3 WHERE account_id = $1',
           [account, draft.revision, JSON.stringify(draft.customers)]);
-        await client.query('INSERT INTO dispatch.text_order_inputs (account_id, draft_id, text_digest) VALUES ($1,$2,$3)',
-          [account, draft.id, digest]);
+        if (picture) {
+          await client.query('INSERT INTO dispatch.image_order_inputs (account_id, draft_id, image_digest) VALUES ($1,$2,$3)',
+            [account, draft.id, picture.digest]);
+        } else {
+          await client.query('INSERT INTO dispatch.text_order_inputs (account_id, draft_id, text_digest) VALUES ($1,$2,$3)',
+            [account, draft.id, textDigest]);
+        }
         return { draft };
       });
     } finally {

@@ -7,8 +7,10 @@ import { setAccount, transaction } from './database';
 import { HttpError } from './http-error';
 import { readCommand, readId, validRevision } from './request-input';
 
-type MaterialRow = MaterialSource & Pick<Material, 'id' | 'received'>;
-const columns = 'id, request_id AS "requestId", draft_id AS "draftId", revision, name, size, digest, received';
+type MaterialRow = MaterialSource & Pick<Material, 'id' | 'received' | 'organized'>;
+const columns = `id, request_id AS "requestId", draft_id AS "draftId", revision, name, size, digest, received,
+  EXISTS (SELECT 1 FROM dispatch.image_order_inputs i
+    WHERE i.account_id = m.account_id AND i.draft_id = m.draft_id AND i.image_digest = m.digest) AS organized`;
 
 export function readMaterialInput(value: unknown): MaterialSource {
   const body = readCommand(value);
@@ -31,10 +33,32 @@ function details(row: MaterialRow, workspace: Workspace): Material {
 
 async function findMaterial(client: PoolClient, accountId: string, id: string, lock = false): Promise<MaterialRow> {
   const { rows: [row] } = await client.query<MaterialRow>(
-    `SELECT ${columns} FROM dispatch.materials WHERE account_id = $1 AND id = $2 ${lock ? 'FOR UPDATE' : ''}`,
+    `SELECT ${columns} FROM dispatch.materials m WHERE account_id = $1 AND id = $2 ${lock ? 'FOR UPDATE' : ''}`,
     [accountId, id]);
   if (!row) throw new HttpError(404, 'material_not_found', '未找到材料');
   return row;
+}
+
+export async function readOrderImage(client: PoolClient, accountId: string, draftId: string, id: string) {
+  const material = await findMaterial(client, accountId, id);
+  if (material.draftId !== draftId) throw new HttpError(404, 'material_not_found', '这张图片不属于当前趟');
+  if (material.received !== material.size) throw new HttpError(409, 'material_incomplete', '请先完成图片上传');
+  if (material.organized) throw new HttpError(409, 'duplicate_order_image', '这张图片已整理到本趟草稿，请核对原明细。');
+  const { rows } = await client.query<{ content: Buffer }>(`
+    SELECT content FROM dispatch.material_chunks WHERE account_id = $1 AND material_id = $2 ORDER BY byte_offset
+  `, [accountId, id]);
+  const content = Buffer.concat(rows.map(row => row.content));
+  const mime = imageMime(content);
+  if (!mime) {
+    throw new HttpError(422, 'unsupported_order_image', '请选择 JPG、PNG 或 WebP 图片。HEIC 可以转存为 JPG 后重新上传，也可以手动录入。');
+  }
+  return { content, mime, digest: material.digest };
+}
+
+function imageMime(content: Buffer): string | undefined {
+  if (content.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) return 'image/jpeg';
+  if (content.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
+  if (content.toString('ascii', 0, 4) === 'RIFF' && content.toString('ascii', 8, 12) === 'WEBP') return 'image/webp';
 }
 
 export class MaterialStore {
@@ -60,7 +84,7 @@ export class MaterialStore {
     return readAccount(this.pool, accountId, async client => {
       const workspace = await readWorkspace(client, accountId);
       const { rows } = await client.query<MaterialRow>(
-        `SELECT ${columns} FROM dispatch.materials WHERE account_id = $1 ORDER BY created_at DESC, id DESC`, [accountId]);
+        `SELECT ${columns} FROM dispatch.materials m WHERE account_id = $1 ORDER BY created_at DESC, id DESC`, [accountId]);
       return rows.map(row => details(row, workspace));
     });
   }

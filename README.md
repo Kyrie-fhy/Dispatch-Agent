@@ -20,17 +20,17 @@ npm ci
 npm run check
 ```
 
-依赖版本由 `package-lock.json` 锁定。GitHub Actions 在 PostgreSQL 18 上运行 `npm run test:server`。服务启动、检查范围和本地运行方式见 [S5 本地联调](docs/S5本地联调.md#5-运行集成检查)。
+依赖版本由 `package-lock.json` 锁定。`npm run check` 检查 TypeScript 类型、S4 页面构建、业务与页面事件及本地文档链接。检查通过后，`code/dist` 可直接用于当前配送 MVP 的微信预览。GitHub Actions 还在 PostgreSQL 18 上运行 `npm run test:server`。服务启动、检查范围和本地运行方式见 [S5 本地联调](docs/S5本地联调.md#5-运行集成检查)。
 
 ## 微信预览
 
 ```sh
-npm run build:s6
+npm run build
 ```
 
 上述命令构建配送 MVP。用微信开发者工具导入项目根目录，运行目录为 `code/dist`。把测试号 AppID 填入本地 `project.private.config.json`，仓库里的 `touristappid` 用于占位。启动服务时配置 PostgreSQL、微信会话和 DeepSeek。迁移、模型配置及同网手机预览从 [S7b 启动和验收](docs/S7b语音录单.md#启动和验收)进入。
 
-`npm run build` 构建 S4 本地演示，`npm run build:s5` 构建含收款和对账入口的 S5 工作区。`npm run check` 会重建 S4。检查完成后要预览配送 MVP，重新运行 `npm run build:s6`，再在开发者工具中编译。
+`npm run build:s4` 构建 S4 本地模拟原型。`npm run build:s5` 和 `npm run build:s6` 均为配送 MVP 默认构建的兼容别名。各命令共用 `code/dist`，运行 `npm run build` 可从 S4 切回配送 MVP。
 
 使用开发者工具 CLI 或自动化时，在项目窗口的 macOS 菜单栏进入「设置 → 安全设置」，开启「服务端口」。也可按 `⌘ + ,` 打开设置后切到「安全」。重置演示数据会清除当前设备的本地原型数据，由用户在页面弹窗中确认。
 
@@ -50,4 +50,4 @@ scripts/              构建和文档链接检查
 
 ## 协作
 
-`main` 保存已合并的版本。分支依赖和 PR 交付要求见[项目约定](AGENTS.md#git-与交付)。
+`main` 已合入截至 S7c 的配送 MVP。PR #19 作为独立的账务扩展草稿保留。当前分支基线和待验事项见[开发任务](docs/开发任务.md#远端与试用)，PR 交付要求见[项目约定](AGENTS.md#git-与交付)。

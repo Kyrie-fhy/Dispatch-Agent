@@ -10,6 +10,8 @@
 
 小程序源码在 `code/miniprogram`，共用业务规则在其 `core` 目录。工作区 TypeScript 服务和 PostgreSQL 迁移在 `code/server`。启动与检查见 [README](README.md)。`code/dist` 和 `code/server-dist` 均为构建产物。
 
+`npm run build` 默认构建当前配送 MVP，`build:s5` 和 `build:s6` 为兼容别名。`npm run build:s4` 用于 S4 本地模拟原型。`npm run check` 保留 S4 编译检查，之后构建配送 MVP 并运行测试，成功后 `code/dist` 留存配送 MVP。
+
 ## 实现与验证
 
 - 金额使用整数分；预览不产生正式单；确认与重复请求必须一致。
@@ -23,6 +25,8 @@
 ## Git 与交付
 
 采用 `main` 和短期功能分支。文档与初始化也在分支上完成，通过 PR 汇总改动和验证证据。默认从 `main` 开分支。依赖未合并改动时，从对应分支继续，在 PR 写明依赖并按顺序合并。合并依照当前任务授权及阶段验收情况。
+
+截至 S7c 的配送 MVP 已合入 `main`，PR #19 保留为独立账务扩展草稿。当前基线见[开发任务](docs/开发任务.md#远端与试用)。
 
 PR 记录实际执行的页面验收及待验证场景，并链接对应阶段的验收记录。
 

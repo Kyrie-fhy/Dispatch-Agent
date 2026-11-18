@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const { spawnSync } = require('node:child_process');
 const { randomBytes, randomUUID } = require('node:crypto');
 const { readFile } = require('node:fs/promises');
 const { resolve } = require('node:path');
@@ -25,10 +26,10 @@ async function isolatedDatabase(t, beforeMigrate) {
       await admin.end();
     }
   });
-  await admin.query(`CREATE DATABASE ${name}`);
+  await admin.query(`CREATE DATABASE ${name} TEMPLATE template0`);
   url.pathname = `/${name}`;
   migrationPool = new Pool({ connectionString: url.href });
-  if (beforeMigrate) await beforeMigrate(migrationPool);
+  if (beforeMigrate) await beforeMigrate(migrationPool, name);
   await migrate(migrationPool);
   await migrate(migrationPool);
   await admin.query(`CREATE ROLE ${name} LOGIN PASSWORD '${password}'`);
@@ -36,7 +37,32 @@ async function isolatedDatabase(t, beforeMigrate) {
   url.username = name;
   url.password = password;
 
-  return { admin: migrationPool, services, pool: () => new Pool({ connectionString: url.href, connectionTimeoutMillis: 5000 }) };
+  return { name, admin: migrationPool, services, pool: () => new Pool({ connectionString: url.href, connectionTimeoutMillis: 5000 }) };
+}
+
+function runPostgresClient(tool, database, args, input) {
+  assert.match(database, /^dispatch_test_[0-9a-f]{16}$/);
+  const url = new URL(process.env.DISPATCH_TEST_ADMIN_URL);
+  const container = process.env.DISPATCH_TEST_PG_CONTAINER;
+  const connection = {
+    PGHOST: container ? '127.0.0.1' : url.hostname.replace(/^\[|\]$/g, ''),
+    PGPORT: container ? '5432' : (url.port || '5432'),
+    PGUSER: decodeURIComponent(url.username),
+    PGPASSWORD: decodeURIComponent(url.password),
+    PGDATABASE: database,
+    PGSSLMODE: url.searchParams.get('sslmode') ?? 'prefer',
+    PGCONNECT_TIMEOUT: '5',
+  };
+  const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('PG')));
+  const directory = process.env.DISPATCH_TEST_PG_BIN;
+  const options = { input, env: { ...environment, ...connection }, timeout: 15_000, maxBuffer: 8 * 1024 * 1024 };
+  const argumentsForTool = ['--no-password', ...args];
+  const result = container
+    ? spawnSync('docker', ['exec', '-i', ...Object.keys(connection).flatMap(key => ['-e', key]), container, tool, ...argumentsForTool], options)
+    : spawnSync(directory ? resolve(directory, tool) : tool, argumentsForTool, options);
+  if (result.error) throw result.error;
+  assert.equal(result.status, 0, `${tool} failed: ${result.stderr.toString()}`);
+  return result.stdout;
 }
 
 async function start(db) {
@@ -731,4 +757,110 @@ test('amendment rejects changed delivery and receipts and writes the new version
   assert.equal(amended.trip.statuses['line-extra'], 'pending');
   assert.equal(amended.trip.statuses['line-b-box'], 'delivered');
   assert.deepEqual((await sheet()).data.sheet.amounts, fresh.data.preview.after);
+});
+
+test('a logical backup restores the S5 ledger, account policies and confirmation results into a fresh database', { timeout: 60_000 }, async t => {
+  const source = await isolatedDatabase(t);
+  const api = await start(source);
+  const a = await login(api, 'a');
+  const b = await login(api, 'b');
+  const formal = await formalExample(api, a);
+  const ownB = await formalExample(api, b);
+  const tripId = formal.trip.id;
+  const sheet = sheetEndpoint(api, a, tripId, 'sheet-a');
+  const partial = sheetEndpoint(api, a, tripId, 'sheet-b');
+  const checked = await deliverAndReview(sheet, 'backup-a');
+  const boxes = await partial('delivery', {
+    requestId: 'backup-b-boxes', version: 1, statusRevision: checked.statusRevision, lineId: 'line-b-box', status: 'delivered',
+  });
+  assert.equal(boxes.status, 200);
+  const statusRevision = boxes.data.sheet.statusRevision;
+  assert.equal((await partial('review', { requestId: 'backup-b-review', version: 1, statusRevision })).status, 200);
+
+  const opening = await sheet('opening/preview', { requestId: 'opening-preview', day: '2020-01-01', amount: '60' });
+  assert.equal(opening.status, 200);
+  assert.equal((await sheet('opening/confirm', { requestId: 'opening-confirm', previewId: opening.data.preview.id })).status, 200);
+  async function receive(amount, label) {
+    const preview = await sheet('receipt/preview', { requestId: `preview-${label}`, amount });
+    assert.equal(preview.status, 200);
+    const body = { requestId: `confirm-${label}`, previewId: preview.data.preview.id };
+    const result = await sheet('receipt/confirm', body);
+    assert.equal(result.status, 200);
+    return { body, result };
+  }
+  const first = await receive('100', 'first');
+  const second = await receive('124', 'second');
+  assert.deepEqual(first.result.data.receipt.allocations.map(({ cents }) => cents), [6000, 4000]);
+  assert.deepEqual(second.result.data.receipt.allocations.map(({ cents }) => cents), [12400]);
+  const edit = await sheet('amendment/preview', {
+    requestId: 'preview-correction', version: 1, statusRevision, items: [line('line-a', '安井', '箱', '2', '110')],
+  });
+  assert.equal(edit.status, 200);
+  const amendmentBody = { requestId: 'confirm-correction', previewId: edit.data.preview.previewId };
+  const amendment = await sheet('amendment/confirm', amendmentBody);
+  assert.equal(amendment.status, 200);
+  assert.equal(amendment.data.version.version, 2);
+
+  async function snapshot(service, token) {
+    const aSheet = sheetEndpoint(service, token, tripId, 'sheet-a');
+    const bSheet = sheetEndpoint(service, token, tripId, 'sheet-b');
+    const results = await Promise.all([
+      service.request(`/v1/trips/${tripId}`, { token }), aSheet(), bSheet(), aSheet('ledger'),
+    ]);
+    for (const result of results) assert.equal(result.status, 200, JSON.stringify(result.data));
+    const [trip, a, b, ledger] = results.map(result => result.data);
+    return { trip, a: a.sheet, b: b.sheet, ledger: ledger.ledger };
+  }
+  const before = await snapshot(api, a);
+  assert.deepEqual(before.a.amounts, { due: 22000, paid: 16400, remaining: 5600, excess: 0 });
+  assert.deepEqual(before.b.amounts, { due: 24000, paid: 0, remaining: 24000, excess: 0 });
+  assert.equal(before.b.lines.find(line => line.id === 'line-b-bag').status, 'pending');
+  assert.deepEqual(before.trip.trip.versions, [formal.trip.versions[0], amendment.data.version]);
+  assert.deepEqual(before.ledger.receipts, [first.result.data.receipt, second.result.data.receipt]);
+
+  await api.stop();
+  const archive = runPostgresClient('pg_dump', source.name, ['--format=custom', '--schema=dispatch']);
+  assert.equal(archive.subarray(0, 5).toString(), 'PGDMP');
+  const restored = await isolatedDatabase(t, async (admin, name) => {
+    assert.notEqual(name, source.name);
+    assert.equal((await admin.query("SELECT to_regnamespace('dispatch') AS schema")).rows[0].schema, null);
+    runPostgresClient('pg_restore', name, ['--dbname', name, '--single-transaction', '--exit-on-error', '--no-owner'], archive);
+  });
+
+  const recoveryApi = await start(restored);
+  const recoveredA = await login(recoveryApi, 'a');
+  const recoveredB = await login(recoveryApi, 'b');
+  assert.deepEqual(await snapshot(recoveryApi, recoveredA), before);
+  const restoredB = await recoveryApi.request(`/v1/trips/${ownB.trip.id}`, { token: recoveredB });
+  assert.deepEqual(restoredB, { status: 200, data: ownB });
+  const foreign = sheetEndpoint(recoveryApi, recoveredB, tripId, 'sheet-a');
+  assert.equal((await foreign('ledger')).status, 404);
+  assert.equal((await foreign('receipt/confirm', first.body)).status, 404);
+  assert.equal((await foreign('amendment/confirm', amendmentBody)).status, 404);
+
+  const recoveredSheet = sheetEndpoint(recoveryApi, recoveredA, tripId, 'sheet-a');
+  assert.deepEqual(await recoveredSheet('receipt/confirm', first.body), first.result);
+  assert.deepEqual(await recoveredSheet('receipt/confirm', { ...first.body, requestId: 'receipt-after-recovery' }), first.result);
+  assert.deepEqual(await recoveredSheet('amendment/confirm', amendmentBody), amendment);
+  assert.deepEqual(await recoveredSheet('amendment/confirm', { ...amendmentBody, requestId: 'amendment-after-recovery' }), amendment);
+  assert.deepEqual(await snapshot(recoveryApi, recoveredA), before);
+
+  const { rows: [accountB] } = await restored.admin.query("SELECT id FROM dispatch.accounts WHERE identity_subject = 'b'");
+  const restricted = restored.pool();
+  try {
+    const connection = await restricted.connect();
+    try {
+      await connection.query('BEGIN');
+      await connection.query("SELECT set_config('dispatch.account_id', $1, true)", [accountB.id]);
+      assert.deepEqual((await connection.query('SELECT id FROM dispatch.trips')).rows, [{ id: ownB.trip.id }]);
+      assert.equal((await connection.query('SELECT 1 FROM dispatch.receipt_allocations')).rowCount, 0);
+      const update = await connection.query('UPDATE dispatch.trips SET status_revision = 999 WHERE id = $1', [tripId]);
+      assert.equal(update.rowCount, 0);
+      await connection.query('COMMIT');
+    } finally {
+      connection.release();
+    }
+  } finally {
+    await restricted.end();
+  }
 });

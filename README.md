@@ -24,7 +24,7 @@ npm ci
 npm run check
 ```
 
-依赖版本由 `package-lock.json` 锁定。GitHub Actions 还会在 PostgreSQL 18 上运行 `npm run test:server`，验证账号隔离、草稿保存、正式出单、配送和对账。服务启动及本地集成检查见 [S5 本地联调](docs/S5本地联调.md)。
+依赖版本由 `package-lock.json` 锁定。GitHub Actions 在 PostgreSQL 18 上运行 `npm run test:server`，覆盖账号隔离、正式单与账目流程及备份恢复。服务启动和本地检查见 [S5 本地联调](docs/S5本地联调.md)。
 
 ## 微信预览
 

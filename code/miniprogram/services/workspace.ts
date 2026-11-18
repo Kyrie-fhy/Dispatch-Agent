@@ -1,7 +1,7 @@
 import type { DeliveryEdits } from '../core/delivery-execution';
 import { isObject } from '../core/orders';
 import type { Account, Party } from '../core/settlement';
-import type { PickingLine, Trip, TripDraft, TripVersion } from '../core/trips';
+import type { PickingLine, Trip, TripDraft } from '../core/trips';
 import { apiOrigin } from './workspace-config';
 
 export interface Workspace {
@@ -18,12 +18,7 @@ export interface FormalTrip {
   sheets?: Account[];
 }
 
-export type TripPreview = Pick<TripVersion, 'customers' | 'totalCents'> & {
-  previewId: string;
-  draftId: string;
-  revision: number;
-  choices: (Party | null)[];
-};
+export type { TripPreview } from '../core/trips';
 
 export class WorkspaceError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) { super(message); }

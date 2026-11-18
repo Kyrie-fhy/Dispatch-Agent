@@ -13,6 +13,7 @@ const { startLocalServer } = require('../../code/server-dist/server/main');
 const { configuredWechatLogin } = require('../../code/server-dist/server/wechat-login');
 const { configuredImageModel, configuredTextModel, imagePromptVersion, textPromptVersion } = require('../../code/server-dist/server/text-model');
 const { configuredSpeechModel } = require('../../code/server-dist/server/voice');
+const { agentTools, configuredAgentModel } = require('../../code/server-dist/server/agent/model');
 const { HttpError } = require('../../code/server-dist/server/http-error');
 const s6 = require('../fixtures/s6-text-cases.cjs');
 const { materialChunkBytes } = require('../../code/server-dist/miniprogram/core/materials');
@@ -75,11 +76,11 @@ function runPostgresClient(tool, database, args, input) {
   return result.stdout;
 }
 
-async function start(db, wechat, textModel, imageModel, speechModel) {
+async function start(db, wechat, textModel, imageModel, speechModel, agentModel) {
   const pool = db.pool();
   let server;
   try {
-    server = await startLocalServer(pool, 0, wechat, textModel, imageModel, speechModel);
+    server = await startLocalServer(pool, 0, wechat, textModel, imageModel, speechModel, agentModel);
   } catch (error) {
     await pool.end();
     throw error;
@@ -1704,3 +1705,255 @@ test('onsite updates persist and lock exact receivables without changing formal 
   assert.deepEqual(after.trip.versions, confirmed.data.trip.versions);
   assert.equal(after.deliveryEdits.boxes.unitPriceCents, 1235);
 });
+
+const a1 = require('../fixtures/a1-dialogues.cjs');
+
+const agentPost = (api, token, path, body) => api.request(`/v1/agent/${path}`, { method: 'POST', token, body });
+const agentPoll = (api, token, id, after = 0) => api.request(`/v1/agent/turns/${id}/events?after=${after}`, { token });
+const agentHistory = (api, token) => api.request('/v1/agent/conversation', { token });
+const agentInput = (draft, text, materialIds = [], requestId = randomUUID()) =>
+  ({ draftId: draft.id, revision: draft.revision, text, materialIds, requestId });
+
+async function waitForAgent(api, token, id) {
+  const events = [];
+  let after = 0;
+  const started = Date.now();
+  while (Date.now() - started < 65_000) {
+    const { status, data } = await agentPoll(api, token, id, after);
+    assert.equal(status, 200);
+    assert.ok(data.events.every(event => event.seq > after));
+    events.push(...data.events);
+    after = events.at(-1)?.seq ?? 0;
+    if (data.status !== 'running') return { ...data, events, wallMs: Date.now() - started };
+    await new Promise(resolve => setTimeout(resolve, 120));
+  }
+  assert.fail('agent turn did not finish');
+}
+
+function makeToolReply([name, args]) {
+  return { role: 'assistant', content: null, tool_calls: [
+    { id: randomUUID(), type: 'function', function: { name, arguments: JSON.stringify(args) } },
+  ] };
+}
+
+async function startingOrder(api, token, confirmOrder = false) {
+  const draft = await read(api, token);
+  const customer = draft.customers[0];
+  customer.customer = '老王';
+  customer.partyId = null;
+  Object.assign(customer.items[0], { product: '水饺', quantity: '2', unit: '箱', price: '82' });
+  const saved = await putCustomers(api, token, draft, randomUUID(), draft.customers);
+  if (confirmOrder) {
+    const repr = await preview(api, token, saved, randomUUID());
+    assert.equal(repr.status, 200);
+    assert.equal((await confirm(api, token, repr.data.preview.previewId, randomUUID())).status, 200);
+    assert.equal((await api.request('/v1/trips/next-draft', { method: 'POST', token,
+      body: { draftId: draft.id, requestId: randomUUID() } })).status, 200);
+  }
+  return read(api, token);
+}
+
+test('A1 turn replay, account isolation, concurrent form save and late write after next trip', { timeout: 30_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  let enter;
+  let release;
+  const block = () => new Promise(resolve => { release = resolve; enter(); });
+  let started = new Promise(resolve => { enter = resolve; });
+  const model = async () => {
+    await block();
+    return makeToolReply(a1.edit(a1.add('周记', '汤圆', '1')));
+  };
+  const api = await start(db, undefined, undefined, undefined, undefined, model);
+  const token = await login(api, 'a');
+  const other = await login(api, 'b');
+  const draft = await startingOrder(api, token);
+  const input = agentInput(draft, '周记一箱汤圆');
+  const [first, replay] = await Promise.all([agentPost(api, token, 'turns', input), agentPost(api, token, 'turns', input)]);
+  assert.equal(first.status, 202);
+  assert.deepEqual(replay, first);
+  const { turnId } = first.data;
+  await started;
+  assert.equal((await agentPost(api, token, 'turns', { ...input, text: '别的内容' })).status, 409);
+  assert.equal((await agentPost(api, token, 'turns', { ...input, requestId: randomUUID() })).status, 429);
+  assert.equal((await agentPoll(api, other, turnId)).status, 404);
+  assert.equal((await agentHistory(api, other)).data.turns.length, 0);
+  assert.equal((await agentHistory(api, token)).data.turns.length, 1);
+  const changed = await save(api, token, draft, randomUUID(), '表单中的老王');
+  assert.equal(changed.status, 200);
+  release();
+  const conflict = await waitForAgent(api, token, turnId);
+  assert.equal(conflict.status, 'failed');
+  assert.equal(conflict.events.at(-1).payload.errorCode, 'draft_changed');
+  assert.deepEqual(await read(api, token), changed.data.draft);
+  assert.deepEqual(await agentPost(api, token, 'turns', input), first);
+
+  started = new Promise(resolve => { enter = resolve; });
+  const second = await agentPost(api, token, 'turns', agentInput(changed.data.draft, '周记一箱汤圆'));
+  assert.equal(second.status, 202);
+  await started;
+  const card = await preview(api, token, changed.data.draft, randomUUID());
+  assert.equal(card.status, 200);
+  assert.equal((await confirm(api, token, card.data.preview.previewId, randomUUID())).status, 200);
+  const next = await api.request('/v1/trips/next-draft', { method: 'POST', token,
+    body: { draftId: draft.id, requestId: randomUUID() } });
+  assert.equal(next.status, 200);
+  release();
+  const late = await waitForAgent(api, token, second.data.turnId);
+  assert.equal(late.status, 'failed');
+  assert.deepEqual(await read(api, token), next.data.draft);
+  assert.deepEqual((await agentHistory(api, token)).data.turns, []);
+});
+
+test('A1 undo restores the snapshot once and rejects a later draft revision', { timeout: 30_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const model = async messages => messages.at(-1).role === 'tool'
+    ? { role: 'assistant', content: '已整理到草稿。' } : makeToolReply(a1.edit(a1.add('老王', '水饺')));
+  const api = await start(db, undefined, undefined, undefined, undefined, model);
+  const token = await login(api, 'a');
+  const blank = await read(api, token);
+  const startTurn = async draft => {
+    const response = await agentPost(api, token, 'turns', agentInput(draft, '老王两箱水饺'));
+    assert.equal(response.status, 202);
+    assert.equal((await waitForAgent(api, token, response.data.turnId)).status, 'completed');
+    return response.data.turnId;
+  };
+  const id = await startTurn(blank);
+  const undo = (turn, requestId) => agentPost(api, token, `turns/${turn}/undo`, { requestId });
+  const result = await undo(id, 'first-undo');
+  assert.equal(result.status, 200);
+  assert.deepEqual(await undo(id, 'first-undo'), result);
+  const restored = await read(api, token);
+  assert.deepEqual(restored.customers, blank.customers);
+  assert.equal(restored.revision, blank.revision + 2);
+  assert.equal((await undo(id, 'again')).status, 409);
+  const nextId = await startTurn(restored);
+  const filled = await read(api, token);
+  assert.equal((await save(api, token, filled, 'form-saves', '手改')).status, 200);
+  assert.equal((await undo(nextId, 'stale-undo')).status, 409);
+  assert.equal((await read(api, token)).customers[0].customer, '手改');
+});
+
+test('A1 restarts interrupted turns and keeps original messages', { timeout: 25_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  let api = await start(db);
+  const token = await login(api, 'a');
+  const draft = await read(api, token);
+  const id = randomUUID();
+  const { rows: [account] } = await db.admin.query('SELECT id FROM dispatch.accounts WHERE identity_subject = $1', ['a']);
+  await db.admin.query(`INSERT INTO dispatch.agent_turns (account_id, id, draft_id, start_revision, end_revision, before_customers, status)
+    VALUES ($1, $2, $3, $4, $4, $5, 'running')`, [account.id, id, draft.id, draft.revision, JSON.stringify(draft.customers)]);
+  await db.admin.query("INSERT INTO dispatch.agent_messages (account_id, turn_id, role, content) VALUES ($1,$2,'user','保存原文')",
+    [account.id, id]);
+  await api.stop();
+  api = await start(db);
+  const history = await agentHistory(api, token);
+  assert.equal(history.data.turns[0].text, '保存原文');
+  assert.equal(history.data.turns[0].status, 'interrupted');
+  assert.match(history.data.turns[0].events.at(-1).payload.text, /已中断.*草稿没有变化/);
+});
+
+const a1Live = process.env.DISPATCH_A1_EVAL_LIVE === '1';
+for (const scenario of a1.cases) {
+  test(`A1 Harness: ${scenario.id}`, { timeout: 215_000 }, async t => {
+    assert.deepEqual(agentTools.map(tool => tool.function.name), [
+      'read_draft', 'list_customers', 'read_current_trip', 'edit_draft', 'import_image', 'ask_user', 'preview_trip',
+    ]);
+    const liveModel = a1Live ? configuredAgentModel(process.env) : null;
+    if (a1Live) assert.ok(liveModel, '请配置 DISPATCH_TEXT_MODEL_KEY');
+    for (let sample = 1; sample <= (a1Live ? 3 : 1); sample++) {
+      await t.test(`sample ${sample}`, async sampleTest => {
+        const db = await isolatedDatabase(sampleTest);
+        let script = [];
+        const imageModel = a1Live ? configuredImageModel(process.env) : async () => ({
+          operations: [a1.add('老王', '水饺'), a1.add('小李', '水饺', '3')],
+        });
+        const agentModel = async (messages, signal, record) => {
+          if (scenario.id === 'provider-failure') {
+            if (liveModel) return liveModel(messages, AbortSignal.abort(), record);
+            throw new HttpError(502, 'agent_model_failed', '助手暂时没有完成，请重试。');
+          }
+          if (liveModel) return liveModel(messages, signal, record);
+          if (!script.length) return { role: 'assistant', content: '已经整理，请核对。' };
+          return makeToolReply(script.shift());
+        };
+        const api = await start(db, undefined, undefined, imageModel, undefined, agentModel);
+        const token = await login(api, 'a');
+        if (scenario.id === 'same-name') await startingOrder(api, token, true);
+        if (scenario.seeded) await startingOrder(api, token);
+        const beforeCount = (await db.admin.query('SELECT count(*)::int AS n FROM dispatch.trips')).rows[0].n;
+        const before = await read(api, token);
+        let attachment;
+        if (scenario.id === 'mixed') {
+          const content = await readFile(resolve(__dirname, '../fixtures/s7d-unpriced-order.png'));
+          const result = await api.request('/v1/materials', { method: 'POST', token, body: materialInput(before, content, randomUUID()) });
+          assert.equal(result.status, 201);
+          attachment = result.data.material.id;
+          const uploaded = await api.request(`/v1/materials/${attachment}/chunks`, { method: 'PUT', token, chunk: content, offset: 0 });
+          assert.equal(uploaded.status, 200);
+        }
+        const results = [];
+        for (const [step, commands] of scenario.steps.entries()) {
+          const [text, ...tools] = commands;
+          const draft = await read(api, token);
+          script = [];
+          for (const tool of tools) {
+            if (tool === 'image') script.push(['import_image', { materialId: attachment }]);
+            else if (tool === 'pick') {
+              const { data } = await api.request('/v1/workspace', { token });
+              script.push(a1.edit({ action: 'set_customer', customerNumber: 1, partyId: data.parties[0].id }));
+            } else script.push(tool);
+          }
+          const submitted = await agentPost(api, token, 'turns', agentInput(draft, text, text ? [] : [attachment]));
+          assert.equal(submitted.status, 202);
+          const result = await waitForAgent(api, token, submitted.data.turnId);
+          results.push(result);
+          const traces = (await db.admin.query(`SELECT kind, payload FROM dispatch.agent_events WHERE turn_id = $1 ORDER BY seq`,
+            [submitted.data.turnId])).rows;
+          const models = traces.filter(trace => trace.kind === 'model').map(trace => trace.payload);
+          const toolTrace = traces.filter(trace => trace.kind === 'tool').map(trace => trace.payload.name);
+          sampleTest.diagnostic(JSON.stringify({ case: scenario.id, sample, step: step + 1, mode: a1Live ? 'live' : 'fixture',
+            status: result.status, wallMs: result.wallMs, modelCalls: models.length, models, tools: toolTrace,
+            summary: result.events.filter(event => ['change','questions','end'].includes(event.kind)).map(event => event.payload) }));
+          assert.ok(toolTrace.every(name => agentTools.some(tool => tool.function.name === name)));
+          assert.equal(result.status, ['provider-failure', 'injection'].includes(scenario.id) ? 'failed' : 'completed');
+          if (!a1Live && tools.length && Array.isArray(tools[0])) assert.equal(toolTrace[0], tools[0][0]);
+        }
+        const after = await read(api, token);
+        const last = results.at(-1);
+        const candidate = last.events.find(event => event.kind === 'preview')?.payload.preview;
+        const items = after.customers.flatMap(customer => customer.items);
+        assert.equal((await db.admin.query('SELECT count(*)::int AS n FROM dispatch.trips')).rows[0].n, beforeCount);
+        if (scenario.id === 'standard') {
+          assert.equal(candidate?.totalCents, 16_400);
+          const formal = await confirm(api, token, candidate.previewId, randomUUID());
+          assert.equal(formal.status, 200);
+          assert.deepEqual(formal.data.picking.map(row => [row.quantity, row.unit]), [[2, '箱']]);
+        } else if (scenario.id === 'multiple') {
+          assert.deepEqual(after.customers.map(({ customer, items }) => [customer, items.map(item => item.quantity)]),
+            [['周记', ['1']], ['林记', ['4']]]);
+        } else if (scenario.id === 'append') {
+          assert.ok(results[1].events.some(event => event.kind === 'questions'));
+          assert.equal(results[1].events.some(event => event.kind === 'change'), false);
+          assert.equal(items[0].quantity, '7');
+          assert.match(last.events.find(event => event.kind === 'change')?.payload.lines.join(' '), /4\s*箱 → 7\s*箱/);
+        } else if (scenario.id === 'same-name') {
+          assert.ok(results[0].events.some(event => event.kind === 'questions'));
+          assert.ok(after.customers[0].partyId);
+          assert.ok(candidate?.previewId);
+        } else if (scenario.id === 'no-price') {
+          assert.equal(candidate?.customers[0].items[0].price, null);
+          assert.equal(candidate?.customers[0].items[0].amountCents, null);
+          assert.ok(results.every(result => !result.events.some(event => event.kind === 'questions')));
+        } else if (scenario.id === 'mixed') {
+          assert.ok(results[0].events.some(event => event.kind === 'change'));
+          assert.equal(after.customers.find(customer => customer.customer === '老王').items[0].price, '82');
+          assert.equal(candidate?.totalCents, 16_400);
+        } else {
+          assert.deepEqual(after, before);
+          assert.match(last.events.at(-1).payload.text, /草稿没有变化/);
+        }
+        await api.stop();
+      });
+    }
+  });
+}

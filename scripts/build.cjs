@@ -32,7 +32,7 @@ function copyAssets(directory) {
 copyAssets(source);
 const app = JSON.parse(fs.readFileSync(path.join(target, 'app.json'), 'utf8'));
 if (s5) {
-  app.pages = ['pages/workspace/index'];
+  app.pages = s6 ? ['pages/agent/index', 'pages/workspace/index'] : ['pages/workspace/index'];
   delete app.tabBar;
   fs.writeFileSync(path.join(target, 'app.json'), `${JSON.stringify(app, null, 2)}\n`);
   if (s6 || origin) fs.writeFileSync(path.join(target, 'services/workspace-config.js'),

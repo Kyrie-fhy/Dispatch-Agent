@@ -1,3 +1,4 @@
+import { agentSession } from '../../services/agent-session';
 import { deliveryLines, deliverySummary } from '../../core/delivery-execution';
 import { emptyItem, ItemInput, money, nullablePrice } from '../../core/orders';
 import { Material, materialImagePattern, MaterialSource } from '../../core/materials';
@@ -5,7 +6,7 @@ import { deliveredBalance, localDay, OpeningPreview, ReceiptPreview, Sheet } fro
 import { textOrderLimit, textOrderQuestions } from '../../core/text-order';
 import { CustomerDraft, emptyCustomer, isTripDraft, latest, PickingChange, PickingLine, pickingChanges, pickingKey, TripDraft } from '../../core/trips';
 import { newId } from '../../services/ids';
-import { chooseMaterial, forgetStaged, materialInfo, readChunk, sameMaterial, stagedMaterials, stageMaterial, uploadChunk } from '../../services/materials';
+import { chooseMaterial, forgetStaged, materialInfo, sameMaterial, stagedMaterials, stageMaterial, transferMaterial } from '../../services/materials';
 import { readVoiceFile, startVoiceRecording, transcribeVoice, VoiceFileError, VoicePermissionError } from '../../services/voice';
 import { FormalTrip, revokeSession, TripPreview, wechatCode, Workspace, WorkspaceError, workspaceRequest } from '../../services/workspace';
 import { deliveryMvp } from '../../services/workspace-config';
@@ -87,6 +88,29 @@ Page({
   voiceCapture: null as ReturnType<typeof startVoiceRecording> | null,
   voiceFile: null as VoiceFile | null,
 
+  fromAgent: false,
+  agentLoaded: false,
+
+  onLoad(query: Record<string, string | undefined>): Promise<void> | undefined {
+    if (!this.data.deliveryMvp || query.from !== 'agent' || !agentSession.token) return;
+    this.fromAgent = true;
+    this.token = agentSession.token;
+    this.setData({ signedIn: true, section: query.section === 'picking' ? 'picking' : 'draft' });
+    return this.run(async generation => {
+      const latest = await this.readWorkspace(this.token);
+      if (generation !== this.generation) return;
+      const previous = agentSession.unsaved;
+      await this.restore(generation, this.token, latest);
+      if (generation !== this.generation) return;
+      this.agentLoaded = true;
+      if (!previous) return;
+      this.showDraft(previous.draft, previous.activeId);
+      this.setData({ dirty: true, section: 'draft',
+        conflict: latest.draft.id !== previous.draft.id || latest.draft.revision !== previous.draft.revision || latest.draftConfirmed
+          ? latest : null });
+    });
+  },
+
   async run(action: (generation: number) => Promise<void>) {
     if (this.data.busy) return;
     const generation = this.generation;
@@ -106,6 +130,10 @@ Page({
 
   clearSession(error = '') {
     const token = this.token;
+    if (this.fromAgent && agentSession.token === token) {
+      agentSession.token = '';
+      agentSession.unsaved = null;
+    }
     this.generation += 1;
     this.token = '';
     this.pending = null;
@@ -121,7 +149,11 @@ Page({
 
   onUnload() {
     this.generation += 1;
-    const tokens = [this.token, ...this.retiredTokens].filter(Boolean);
+    if (this.fromAgent && this.agentLoaded && this.token && agentSession.token === this.token) {
+      const { dirty, draft, active } = this.data;
+      agentSession.unsaved = dirty && draft ? { draft, activeId: active?.id } : null;
+    }
+    const tokens = [this.fromAgent ? '' : this.token, ...this.retiredTokens].filter(Boolean);
     this.token = '';
     this.retiredTokens = [];
     this.pending = null;
@@ -141,6 +173,7 @@ Page({
 
   login() {
     if (this.token) return;
+    if (this.fromAgent) { wx.navigateBack(); return; }
     return this.run(async generation => {
       const code = await wechatCode();
       if (generation !== this.generation) return;
@@ -933,26 +966,17 @@ Page({
     this.materialTransfer = transfer;
     this.setData({ uploading: source.name, materialNotice: '' });
     try {
-      const { requestId, draftId, revision, name, size, digest } = source;
-      let { material } = id
-        ? await workspaceRequest<{ material: Material }>('GET', `/materials/${id}`, token)
-        : await workspaceRequest<{ material: Material }>('POST', '/materials', token, { requestId, draftId, revision, name, size, digest });
-      while (generation === this.generation) {
-        const saved = this.materials.some(item => item.id === material.id);
-        this.materials = saved ? this.materials.map(item => item.id === material.id ? material : item) : [material, ...this.materials];
-        if (material.status === 'ready') {
-          forgetStaged([material]);
-          this.showMaterials();
-          this.setData({ materialNotice: '材料已上传。' });
-          return;
-        }
+      const material = await transferMaterial(source, token, progress => {
+        const saved = this.materials.some(item => item.id === progress.id);
+        this.materials = saved ? this.materials.map(item => item.id === progress.id ? progress : item) : [progress, ...this.materials];
         this.showMaterials();
-        if (transfer.paused) break;
-        const content = await readChunk(material);
-        if (generation !== this.generation || transfer.paused) break;
-        const next = (await uploadChunk(material, content, token)).material;
-        if (next.received <= material.received) throw new Error('上传进度未更新，请重试续传');
-        material = next;
+      }, () => generation === this.generation && !transfer.paused, id);
+      if (generation !== this.generation) return;
+      if (material) {
+        forgetStaged([material]);
+        this.showMaterials();
+        this.setData({ materialNotice: '材料已上传。' });
+        return;
       }
       if (generation === this.generation) this.setData({ materialNotice: '已暂停，可从已上传位置继续。' });
     } finally {

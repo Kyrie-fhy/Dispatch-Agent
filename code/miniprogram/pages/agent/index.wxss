@@ -1,0 +1,37 @@
+page { height: 100%; color: #192b26; background: #f3f6f4; font-size: 28rpx; }
+.agent { display: flex; flex-direction: column; height: 100%; }
+.toolbar, .composer { flex: none; padding: 14rpx 22rpx; background: #fff; }
+.toolbar { display: flex; gap: 12rpx; border-bottom: 1rpx solid #dbe4df; }
+.toolbar button, .actions button, .turn button, .file button { margin: 0; }
+button[size="mini"] { padding: 0 17rpx; font-size: 25rpx; }
+.conversation { flex: 1; height: 0; }
+.welcome { display: flex; gap: 16rpx; flex-direction: column; padding: 38rpx 28rpx; }
+.title { font-size: 44rpx; font-weight: 700; }
+.muted { color: #52655d; font-size: 25rpx; }
+.turn { display: flex; flex-direction: column; align-items: flex-start; padding: 20rpx 22rpx 0; gap: 12rpx; }
+.bubble, .card { padding: 18rpx 22rpx; border-radius: 18rpx; box-sizing: border-box; white-space: pre-wrap; overflow-wrap: anywhere; }
+.user { align-self: flex-end; max-width: 88%; background: #d9eee2; }
+.assistant, .card { background: #fff; border: 1rpx solid #dbe4df; }
+.card { width: 100%; }
+.conversation > .card { margin: 20rpx 22rpx; width: auto; }
+.card-title { display: block; font-weight: 700; }
+.question { background: #fffaf0; border-color: #e5d9b9; }
+.progress { background: #f9fbfa; font-size: 25rpx; }
+.progress-row, .preview-line, .file { display: flex; gap: 14rpx; align-items: baseline; }
+.preview-line { justify-content: space-between; padding-top: 8rpx; }
+.progress-row { padding: 3rpx 0; }
+.check, .amount { color: #17644d; font-weight: 700; }
+.waiting { color: #63746a; min-width: 20rpx; }
+.detail { border-top: 1rpx solid #e3e9e5; margin-top: 12rpx; padding-top: 12rpx; }
+.line, .inline { display: block; padding-top: 6rpx; }
+.actions { display: flex; flex-wrap: wrap; gap: 8rpx; margin-top: 12rpx; }
+.primary { color: #fff; background: #12664d; }
+.primary[disabled] { color: #52655d; background: #e0e9e4; }
+.send { margin-left: auto !important; }
+.success { background: #edf9f2; }
+.composer { border-top: 1rpx solid #dbe4df; padding-bottom: calc(14rpx + env(safe-area-inset-bottom)); }
+.input { width: 100%; box-sizing: border-box; min-height: 64rpx; max-height: 190rpx; padding: 13rpx 15rpx; background: #f4f7f5; border: 1rpx solid #dbe4df; border-radius: 12rpx; }
+.error { display: block; color: #a32b24; margin-bottom: 9rpx; }
+.file-list { max-height: 180rpx; overflow-y: auto; }
+.file { justify-content: space-between; margin-bottom: 8rpx; }
+#latest { height: 20rpx; }

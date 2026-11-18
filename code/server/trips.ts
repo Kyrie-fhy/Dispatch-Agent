@@ -4,20 +4,13 @@ import { DeliveryEdits } from '../miniprogram/core/delivery-execution';
 import { Account, Party } from '../miniprogram/core/settlement';
 import {
   emptyTrip, latest, PickingLine, pickingList, previewTrip, resolveCustomerChoices, statusesFor,
-  Trip, TripDraft, TripVersion,
+  Trip, TripDraft, TripPreview, TripVersion,
 } from '../miniprogram/core/trips';
 import { readAccount, readParties, readWorkspace, workspaceDraft, writeAccount } from './account-workspace';
 import { HttpError } from './http-error';
 import { readConfirmInput, readNextInput, readPreviewInput } from './request-input';
 
 type OrderSummary = Pick<TripVersion, 'customers' | 'totalCents'>;
-
-interface TripPreview extends OrderSummary {
-  previewId: string;
-  draftId: string;
-  revision: number;
-  choices: (Party | null)[];
-}
 
 interface FormalTrip {
   trip: Trip;
@@ -68,8 +61,9 @@ export class TripStore {
     return readAccount(this.pool, accountId, client => this.readTrip(client, accountId, tripId));
   }
 
-  async preview(accountId: string, { requestId, draftId, revision }: ReturnType<typeof readPreviewInput>): Promise<TripPreview> {
+  async preview(accountId: string, { requestId, draftId, revision }: ReturnType<typeof readPreviewInput>, signal?: AbortSignal): Promise<TripPreview> {
     return writeAccount(this.pool, accountId, requestId, { action: 'preview-trip', draftId, revision }, async (client, workspace) => {
+      signal?.throwIfAborted();
       if (workspace.id !== draftId || workspace.revision !== revision) throw draftChanged();
       if (workspace.currentTripId === draftId) {
         throw new HttpError(409, 'draft_confirmed', '本趟已确认，请查看正式单');
@@ -97,6 +91,7 @@ export class TripStore {
         INSERT INTO dispatch.trip_previews (account_id, id, draft_id, draft_revision, preview)
         VALUES ($1, $2, $3, $4, $5)
       `, [accountId, preview.previewId, draftId, revision, JSON.stringify(preview)]);
+      signal?.throwIfAborted();
       return preview;
     });
   }

@@ -1,3 +1,6 @@
+import { AgentRuntime } from './agent/runtime';
+import { AgentModel, configuredAgentModel } from './agent/model';
+import { readTurnInput } from './agent/store';
 import { createServer, IncomingMessage, Server, ServerResponse } from 'node:http';
 import { Pool } from 'pg';
 import { databaseOptions, requireApplicationRole, trialMode } from './database';
@@ -9,7 +12,7 @@ import { LedgerStore } from './ledger';
 import { MaterialStore, readMaterialInput } from './materials';
 import { TripStore } from './trips';
 import { readConfirmInput, readDeliveryEdit, readDeliveryInput, readNextInput, readOpeningInput, readPreviewInput, readReceiptInput,
-  readReviewInput, uuidPattern, validRevision, validSheetKey } from './request-input';
+  readCommand, readReviewInput, uuidPattern, validRevision, validSheetKey } from './request-input';
 import { HttpError } from './http-error';
 import { configuredWechatLogin, readWechatCode, WechatLogin } from './wechat-login';
 import { isObject } from '../miniprogram/core/orders';
@@ -63,7 +66,7 @@ function resourceId(path: string, collection: 'drafts' | 'trips'): string | null
 }
 
 async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery: DeliveryStore, ledger: LedgerStore, amendments: AmendmentStore,
-  materials: MaterialStore, textOrders: TextOrders, request: IncomingMessage, response: ServerResponse,
+  materials: MaterialStore, textOrders: TextOrders, agent: AgentRuntime, request: IncomingMessage, response: ServerResponse,
   wechat?: WechatLogin, speechModel?: SpeechModel): Promise<void> {
   const host = request.headers.host ?? '';
   if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host)) {
@@ -107,6 +110,36 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
     response.writeHead(204, { 'Cache-Control': 'no-store' });
     response.end();
     return;
+  }
+
+  if (method === 'POST' && path === '/v1/agent/turns') {
+    const input = readTurnInput(await readJson(request, response));
+    sendJson(response, 202, await agent.submit(account, input, () => store.accountFor(token, wechat?.appId)));
+    return;
+  }
+  if (method === 'GET' && path === '/v1/agent/conversation') {
+    sendJson(response, 200, await agent.store.conversation(account));
+    return;
+  }
+  if (method === 'POST' && path === '/v1/agent/card-actions') {
+    sendJson(response, 200, await agent.store.card(account, await readJson(request, response)));
+    return;
+  }
+  const turnRoute = /^\/v1\/agent\/turns\/([^/]+)\/(events|undo)$/.exec(path);
+  if (turnRoute && uuidPattern.test(turnRoute[1])) {
+    const [, id, action] = turnRoute;
+    if (method === 'GET' && action === 'events') {
+      const after = new URL(request.url ?? '/', 'http://localhost').searchParams.get('after') ?? '0';
+      if (!/^\d+$/.test(after) || !Number.isSafeInteger(Number(after))) {
+        throw new HttpError(400, 'invalid_cursor', '消息进度无效，请重新载入。');
+      }
+      sendJson(response, 200, await agent.store.events(account, id, Number(after)));
+      return;
+    }
+    if (method === 'POST' && action === 'undo') {
+      sendJson(response, 200, await agent.store.undo(account, id, readCommand(await readJson(request, response)).requestId));
+      return;
+    }
   }
 
   if (method === 'GET' && path === '/v1/workspace') {
@@ -254,7 +287,7 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
 }
 
 export async function startLocalServer(pool: Pool, port: number, wechat?: WechatLogin, textModel?: TextModel,
-  imageModel?: ImageModel, speechModel?: SpeechModel): Promise<Server> {
+  imageModel?: ImageModel, speechModel?: SpeechModel, agentModel?: AgentModel): Promise<Server> {
   await requireApplicationRole(pool);
   const store = new DraftStore(pool);
   const trips = new TripStore(pool);
@@ -263,8 +296,10 @@ export async function startLocalServer(pool: Pool, port: number, wechat?: Wechat
   const amendments = new AmendmentStore(pool);
   const materials = new MaterialStore(pool);
   const textOrders = new TextOrders(pool, textModel, imageModel);
+  const agent = new AgentRuntime(pool, trips, textOrders, agentModel);
+  await agent.store.interrupt();
   const server = createServer({ requestTimeout: 15_000 }, (request, response) => {
-    void handle(pool, store, trips, delivery, ledger, amendments, materials, textOrders, request, response, wechat, speechModel).catch(error => {
+    void handle(pool, store, trips, delivery, ledger, amendments, materials, textOrders, agent, request, response, wechat, speechModel).catch(error => {
       if (response.destroyed) return;
       if (error instanceof HttpError) {
         sendJson(response, error.status, { error: error.code, message: error.message });
@@ -294,7 +329,7 @@ async function main(): Promise<void> {
   pool.on('error', () => console.error('PostgreSQL 空闲连接已断开，后续请求会重新连接'));
   try {
     const server = await startLocalServer(pool, port, wechat, configuredTextModel(process.env),
-      configuredImageModel(process.env), configuredSpeechModel(process.env));
+      configuredImageModel(process.env), configuredSpeechModel(process.env), configuredAgentModel(process.env));
     const stop = () => {
       server.close(() => { void pool.end(); });
       server.closeIdleConnections();

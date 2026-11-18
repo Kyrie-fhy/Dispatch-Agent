@@ -7,18 +7,18 @@ import { missingDraft, readAccount, readAccountResult, readParties, readWorkspac
 import { HttpError } from './http-error';
 import { readOrderImage } from './materials';
 import { readId, readPreviewInput, validRevision } from './request-input';
-import { ImageModel, TextModel } from './text-model';
+import { ImageModel, ModelTrace, TextModel } from './text-model';
 
 type Input = ReturnType<typeof readTextOrder> | ReturnType<typeof readImageOrder>;
 type Fields = Omit<ItemInput, 'id'>;
 const productFields = ['product', 'brand', 'specification', 'unit'] as const;
 const contextLimit = 12_000;
 
-function normalized(value: string) {
+export function normalized(value: string) {
   return value.normalize('NFKC').trim().replace(/\s+/g, ' ');
 }
 
-function readable(value: unknown, limit: number): value is string {
+export function readable(value: unknown, limit: number): value is string {
   return typeof value === 'string' && value.length <= limit && !value.includes('\0') && Buffer.from(value).toString() === value;
 }
 
@@ -42,7 +42,7 @@ export function readImageOrder(value: unknown) {
   return { ...input, materialId: readId((value as Record<string, unknown>).materialId, '图片编号') };
 }
 
-function targetRows(draft: TripDraft) {
+export function targetRows(draft: TripDraft) {
   return draft.customers.flatMap(customer => customer.items.map(item => ({ customer, item })));
 }
 
@@ -51,11 +51,11 @@ function fieldsOf(item: ItemInput): Fields {
   return fields;
 }
 
-function isPlaceholder(item: ItemInput) {
+export function isPlaceholder(item: ItemInput) {
   return (!item.unit || item.unit === '箱') && textFields.every(field => field === 'unit' || !item[field]?.trim());
 }
 
-function safeFields(op: Record<string, unknown>, invalidModel: () => never) {
+export function safeFields(op: Record<string, unknown>, invalidModel: () => never) {
   const fields: Partial<Fields> = {};
   for (const key of textFields) {
     if (!(key in op)) continue;
@@ -69,7 +69,7 @@ function safeFields(op: Record<string, unknown>, invalidModel: () => never) {
   return fields;
 }
 
-function mergeOrder(draft: TripDraft, output: unknown, partyNames: Set<string>, text?: string): TripDraft {
+function prepareOrder(draft: TripDraft, output: unknown, partyNames: Set<string>, text?: string): TripDraft {
   const image = text === undefined;
   function invalidModel(): never {
     throw image
@@ -77,7 +77,7 @@ function mergeOrder(draft: TripDraft, output: unknown, partyNames: Set<string>, 
       : new HttpError(502, 'invalid_text_result', '文字整理结果无法读取。原文仍在，可以重试或手动填写。');
   }
   function needsReview(message: string): never {
-    throw new HttpError(422, image ? 'image_needs_review' : 'text_needs_review', message);
+    throw new OrderReview(message);
   }
   if (!isObject(output) || !Array.isArray(output.operations)
       || !readable(output.question ?? '', 250)) invalidModel();
@@ -171,6 +171,22 @@ function mergeOrder(draft: TripDraft, output: unknown, partyNames: Set<string>, 
   return { ...next, revision: draft.revision + 1 };
 }
 
+class OrderReview extends Error {}
+
+export function mergeOrder(draft: TripDraft, output: unknown, partyNames: Set<string>, text?: string) {
+  try { return { draft: prepareOrder(draft, output, partyNames, text), issues: [] }; }
+  catch (error) {
+    if (!(error instanceof OrderReview)) throw error;
+    return { draft: null, issues: [{ code: text === undefined ? 'image_needs_review' : 'text_needs_review', message: error.message }] };
+  }
+}
+
+type ApplyHooks = {
+  signal: AbortSignal;
+  trace: (trace: ModelTrace) => void;
+  saved: (client: PoolClient, draft: TripDraft, digest: string) => Promise<void>;
+};
+
 function checkBasis(current: Workspace, input: Input) {
   if (current.id !== input.draftId) throw missingDraft();
   if (current.currentTripId === current.id) throw new HttpError(409, 'draft_confirmed', '本趟已确认，请开始下一趟');
@@ -190,6 +206,18 @@ export class TextOrders {
   constructor(private readonly pool: Pool, private readonly model?: TextModel, private readonly imageModel?: ImageModel) {}
 
   async apply(account: string, input: Input, checkSession: () => Promise<unknown>): Promise<{ draft: TripDraft }> {
+    const result = await this.organize(account, input, checkSession);
+    if ('draft' in result) return result;
+    const [issue] = result.issues;
+    throw new HttpError(422, issue.code, issue.message);
+  }
+
+  importImage(account: string, input: ReturnType<typeof readImageOrder>, checkSession: () => Promise<unknown>, hooks: ApplyHooks) {
+    return this.organize(account, input, checkSession, hooks);
+  }
+
+  private async organize(account: string, input: Input, checkSession: () => Promise<unknown>, hooks?: ApplyHooks)
+    : Promise<{ draft: TripDraft } | { issues: { code: string; message: string }[] }> {
     const image = 'materialId' in input;
     const basis = { draftId: input.draftId, revision: input.revision };
     const command = image
@@ -220,7 +248,7 @@ export class TextOrders {
       const { picture } = snapshot;
       if (image) {
         if (!this.imageModel || !picture) throw new HttpError(503, 'image_model_unavailable', '图片识别暂未开启。图片已保留，可以先手动填写。');
-        output = await this.imageModel({ content: picture.content, mime: picture.mime });
+        output = await this.imageModel({ content: picture.content, mime: picture.mime }, hooks);
       } else {
         if (!this.model) throw new HttpError(503, 'text_model_unavailable', '文字整理暂未开启。可以保留原文，先手动填写草稿。');
         const current = targetRows(snapshot.draft).map(({ customer, item }, index) =>
@@ -230,9 +258,13 @@ export class TextOrders {
         }
         output = await this.model({ text: input.text, current });
       }
-      const draft = mergeOrder(snapshot.draft, output, snapshot.partyNames, image ? undefined : input.text);
+      const merged = mergeOrder(snapshot.draft, output, snapshot.partyNames, image ? undefined : input.text);
+      if (!merged.draft) return { issues: merged.issues };
+      const { draft } = merged;
+      hooks?.signal.throwIfAborted();
       await checkSession();
       return await writeAccount(this.pool, account, input.requestId, command, async (client, latest) => {
+        hooks?.signal.throwIfAborted();
         checkBasis(latest, input);
         if (textDigest) await checkDuplicate(client, account, input.draftId, textDigest);
         await client.query('UPDATE dispatch.workspaces SET draft_revision = $2, draft_customers = $3 WHERE account_id = $1',
@@ -240,6 +272,7 @@ export class TextOrders {
         if (picture) {
           await client.query('INSERT INTO dispatch.image_order_inputs (account_id, draft_id, image_digest) VALUES ($1,$2,$3)',
             [account, draft.id, picture.digest]);
+          await hooks?.saved(client, draft, picture.digest);
         } else {
           await client.query('INSERT INTO dispatch.text_order_inputs (account_id, draft_id, text_digest) VALUES ($1,$2,$3)',
             [account, draft.id, textDigest]);

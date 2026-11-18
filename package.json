@@ -15,7 +15,8 @@
     "db:migrate": "npm run build:server && node code/server-dist/server/migrate.js",
     "serve:local": "npm run build:server && node code/server-dist/server/main.js",
     "test:server": "npm run build:server && node --test tests/server/*.test.cjs",
-    "eval:s6": "npm run build:server && node --test --test-name-pattern='S6 Harness:' tests/server/drafts.test.cjs"
+    "eval:s6": "npm run build:server && node --test --test-name-pattern='S6 Harness:' tests/server/drafts.test.cjs",
+    "eval:a1": "npm run build:server && node --test --test-name-pattern='A1 Harness:' tests/server/drafts.test.cjs"
   },
   "engines": {
     "node": ">=18.15.0"

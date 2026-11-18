@@ -13,6 +13,12 @@ export interface TripVersion {
   savedAt: string;
   amendmentId?: string;
 }
+export type TripPreview = Pick<TripVersion, 'customers' | 'totalCents'> & {
+  previewId: string;
+  draftId: string;
+  revision: number;
+  choices: (Party | null)[];
+};
 export type DeliveryStatus = 'pending' | 'delivered' | 'unrecorded';
 export interface Trip {
   id: string;

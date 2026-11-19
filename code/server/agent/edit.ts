@@ -48,7 +48,9 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
   const options = previous?.payload.questions.flatMap(question => question.options) ?? [];
   const matches = options.filter(option => {
     const candidate = normalized(option);
-    return candidate === response || (response === '追加' && candidate.startsWith('追加')) || (response === '改成' && candidate.startsWith('改成'));
+    return candidate === response ||
+      (response === '追加' && /^(?:追加|增加|再加|加上)/.test(candidate)) ||
+      (response === '改成' && candidate.startsWith('改成'));
   });
   const selected = matches.length === 1 ? normalized(matches[0]) : '';
   const issues = (message: string) => ({ issues: [{ code: 'edit_needs_review', message }] });

@@ -309,7 +309,7 @@ export class AgentRuntime {
     const customers = draft.customers.filter(customer => customer.customer || customer.items.length);
     const text = input.text.normalize('NFKC');
     const numbers = spokenNumbers(text).map(({ start, end, value }) => ({ original: text.slice(start, end), value, after: text.slice(end, end + 4) }));
-    const reply = await this.complete(run, agentPrompt, { text: input.text, numbers, customers,
+    const reply = await this.complete(run, agentPrompt, { text: input.text, numbers, customers, pendingPrices: draft.pendingPrices,
       previous: run.previous ? { text: run.previous.payload.sourceText ?? run.previous.text, questions: run.previous.payload.questions } : null }, draftTools);
     for (const call of reply.tool_calls ?? []) {
       const name = call?.function?.name;

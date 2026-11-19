@@ -326,6 +326,41 @@ test('confirmed order versions and live delivery edits supply read-only draft pr
   assert.deepEqual((await storedDraft()).rows, before);
 });
 
+test('draft price lookup includes stored empty and whitespace prices without rewriting them', { timeout: 20_000 }, async t => {
+  const stores = await isolatedDatabase(t);
+  const accountId = await login(stores, 'a');
+  const name = '裕丰餐饮';
+  const { sheets: [sheet] } = await issue(stores, accountId, [freshCustomer('old', name, '78')]);
+  const customers = [customer('current', name, sheet.partyId, [
+    line('missing', '水饺', null), line('empty', '水饺', ''), line('blank', '水饺', '   '), line('priced', '水饺', '80'),
+  ])];
+  const saved = await save(stores, accountId, customers);
+  assert.deepEqual(saved.customers[0].items.map(item => item.price), [null, null, null, '80']);
+
+  // DraftStore.save normalizes these inputs today. Seed a stored draft that retained the validated raw form values.
+  const { draft } = readSaveDraft(saved.id, { ...command(), revision: saved.revision, customers });
+  await scoped(stores.pool, accountId, async client => {
+    const result = await client.query(`
+      UPDATE dispatch.workspaces SET draft_customers = $3
+      WHERE draft_id = $1 AND draft_revision = $2
+    `, [draft.id, draft.revision, JSON.stringify(draft.customers)]);
+    assert.equal(result.rowCount, 1);
+  });
+  const readStored = () => stores.db.query(
+    'SELECT draft_revision, draft_customers FROM dispatch.workspaces WHERE account_id = $1 AND draft_id = $2',
+    [accountId, saved.id]);
+  const before = (await readStored()).rows;
+  assert.deepEqual(before[0].draft_customers[0].items.map(item => item.price), [null, '', '   ', '80']);
+
+  const result = await stores.memory.suggestDraftPrices(accountId, saved.id);
+  assert.equal(result.revision, saved.revision);
+  assert.deepEqual(result.suggestions.map(row => [row.draftCustomerId, row.lineId, row.status, row.unitPriceCents]), [
+    ['current', 'missing', 'exact_match', 7800], ['current', 'empty', 'exact_match', 7800],
+    ['current', 'blank', 'exact_match', 7800],
+  ]);
+  assert.deepEqual((await readStored()).rows, before);
+});
+
 test('pg_dump and pg_restore retain aliases, idempotency, constraints and forced RLS', { timeout: 30_000 }, async t => {
   const source = await isolatedDatabase(t);
   const [a, b] = await Promise.all([login(source, 'a'), login(source, 'b')]);

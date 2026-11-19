@@ -1,9 +1,10 @@
 import { Pool, PoolClient } from 'pg';
 import {
-  collectHistoricalSales, CustomerAlias, CustomerDirectory, DraftPriceCustomer, HistoricalSheet, lookupHistoricalPrice,
-  normalizeMemoryText, ProductMention, resolveCustomerMention, suggestDraftCustomerMentions, suggestDraftPrices,
+  collectHistoricalSales, CustomerAlias, CustomerDirectory, DraftPriceCustomer, draftCustomersForPriceSuggestions,
+  HistoricalSheet, lookupHistoricalPrice, normalizeMemoryText, ProductMention, resolveCustomerMention,
+  suggestDraftCustomerMentions, suggestDraftPrices,
 } from '../miniprogram/core/memory';
-import { missingDraft, readAccount, readParties, readWorkspace, workspaceDraft, writeAccount } from './account-workspace';
+import { missingDraft, readAccount, readParties, readWorkspace, writeAccount } from './account-workspace';
 import { HttpError } from './http-error';
 import { readCommand, readId, uuidPattern, validSheetKey } from './request-input';
 
@@ -45,7 +46,7 @@ async function readDirectory(client: PoolClient, accountId: string): Promise<Cus
 async function readDraft(client: PoolClient, accountId: string, draftId: string) {
   const workspace = await readWorkspace(client, accountId);
   if (workspace.id !== draftId) throw missingDraft();
-  return workspaceDraft(workspace);
+  return workspace;
 }
 
 async function readHistoricalSales(client: PoolClient, accountId: string, customerIds: readonly string[]) {
@@ -171,12 +172,7 @@ export class MemoryStore {
   suggestDraftPrices(accountId: string, draftId: string) {
     return readAccount(this.pool, accountId, async client => {
       const draft = await readDraft(client, accountId, draftId);
-      const customers = draft.customers.map(({ id, partyId: customerId, items }) => ({
-        id, customerId,
-        items: items.filter(item => item.price === null).map(item => ({
-          id: item.id, productName: item.product, brand: item.brand, spec: item.specification, unit: item.unit, unitPriceCents: null,
-        })),
-      }));
+      const customers = draftCustomersForPriceSuggestions(draft.customers);
       return { draftId, revision: draft.revision, suggestions: await suggestPrices(client, accountId, customers) };
     });
   }

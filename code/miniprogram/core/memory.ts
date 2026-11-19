@@ -48,7 +48,7 @@ export function resolveCustomerMention(directory: CustomerDirectory, rawInput: s
   const exact: Extract<CustomerMention, { status: 'resolved' }>[] = [];
   const nearby: CustomerCandidate[] = [];
   const allowNearMatch = Array.from(key).length >= 2;
-  const isNear = (name: string) => name !== '' && (key.includes(name) || name.includes(key));
+  const isNear = (name: string) => Array.from(name).length >= 2 && (key.includes(name) || name.includes(key));
   const compareCandidates = (left: CustomerCandidate, right: CustomerCandidate) =>
     compareText(left.canonicalName, right.canonicalName) || compareText(left.customerId, right.customerId);
 
@@ -89,16 +89,17 @@ export function mergeDraftCustomers(customers: readonly CustomerDraft[], directo
       ? resolveCustomerMention(directory, customer.customer).customerId
       : customer.partyId;
     const party = partyId ? parties.get(partyId) : undefined;
+    const items = customer.items.map(item => ({ ...item }));
     if (!party) {
-      merged.push({ ...customer, items: [...customer.items] });
+      merged.push({ ...customer, items });
       continue;
     }
 
     const group = groups.get(party.id);
     if (group) {
-      group.items.push(...customer.items);
+      group.items.push(...items);
     } else {
-      const entry = { ...customer, partyId: party.id, customer: party.name, items: [...customer.items] };
+      const entry = { ...customer, partyId: party.id, customer: party.name, items };
       groups.set(party.id, entry);
       merged.push(entry);
     }
@@ -227,6 +228,15 @@ export interface DraftPriceCustomer {
   id: string;
   customerId?: string | null;
   items: readonly DraftPriceLine[];
+}
+
+export function draftCustomersForPriceSuggestions(customers: readonly CustomerDraft[]): DraftPriceCustomer[] {
+  return customers.map(({ id, partyId: customerId, items }) => ({
+    id, customerId,
+    items: items.filter(item => nullablePrice(item.price) === null).map(item => ({
+      id: item.id, productName: item.product, brand: item.brand, spec: item.specification, unit: item.unit, unitPriceCents: null,
+    })),
+  }));
 }
 
 export type DraftPriceSuggestion =

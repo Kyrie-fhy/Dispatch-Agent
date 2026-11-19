@@ -1,8 +1,8 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
-  collectHistoricalSales, lookupHistoricalPrice, mergeDraftCustomers, normalizeMemoryText, resolveCustomerMention,
-  suggestDraftCustomerMentions, suggestDraftPrices,
+  collectHistoricalSales, draftCustomersForPriceSuggestions, lookupHistoricalPrice, mergeDraftCustomers, normalizeMemoryText,
+  resolveCustomerMention, suggestDraftCustomerMentions, suggestDraftPrices,
 } = require('../code/dist/core/memory');
 
 const product = { productName: '冷冻 水饺', brand: '安井', spec: '500g', unit: '箱' };
@@ -122,6 +122,21 @@ test('draft suggestions attach only to missing prices and never infer the custom
   assert.deepEqual(customers, before);
 });
 
+test('draft price extraction treats null, empty and whitespace-only prices as missing', () => {
+  const items = [null, '', ' \t　 ', '80', ' 80 '].map((price, index) => ({
+    id: String(index), product: '水饺', brand: '安井', specification: '500g', unit: '箱', quantity: '2', price,
+  }));
+  const draft = [{ id: 'draft-a', customer: '常客', partyId: 'customer-a', items }];
+  const before = structuredClone(draft);
+  assert.deepEqual(draftCustomersForPriceSuggestions(draft), [{
+    id: 'draft-a', customerId: 'customer-a',
+    items: ['0', '1', '2'].map(id => ({
+      id, productName: '水饺', brand: '安井', spec: '500g', unit: '箱', unitPriceCents: null,
+    })),
+  }]);
+  assert.deepEqual(draft, before);
+});
+
 const customer = { id: 'a', name: '王记餐饮' };
 const alias = { customerId: 'a', alias: ' 老王 ', normalizedAlias: '老王' };
 const directory = { customers: [customer], aliases: [alias] };
@@ -144,10 +159,14 @@ test('exact alias and canonical matches resolve to one formal customer and prese
   assert.deepEqual(suggestDraftCustomerMentions(drafts, directory).map(row => [row.draftCustomerId, row.resolution.status]),
     [['first', 'resolved'], ['second', 'resolved'], ['similar', 'candidate_only']]);
   const before = structuredClone(drafts);
-  assert.deepEqual(mergeDraftCustomers(drafts, directory), [
+  const merged = mergeDraftCustomers(drafts, directory);
+  assert.deepEqual(merged, [
     { id: 'first', customer: '王记餐饮', partyId: 'a', items: [{ id: 'line-1' }, { id: 'line-2' }, { id: 'line-5' }] },
     drafts[2], drafts[3],
   ]);
+  for (const group of merged) {
+    for (const item of group.items) item.id = 'changed';
+  }
   assert.deepEqual(drafts, before);
 });
 
@@ -170,5 +189,21 @@ test('unrecorded near names only suggest candidates and one-character, empty or 
   }
   for (const input of ['王', '新店', ' ']) {
     assert.deepEqual(resolveCustomerMention(directory, input), { status: 'new_customer', customerId: null });
+  }
+});
+
+test('one-character canonical names and aliases match only exact mentions', () => {
+  const shortNames = {
+    customers: [{ id: 'a', name: '王' }, { id: 'b', name: '裕丰餐饮' }],
+    aliases: [{ customerId: 'b', alias: '店', normalizedAlias: '店' }],
+  };
+  assert.deepEqual(resolveCustomerMention(shortNames, '王'), {
+    status: 'resolved', customerId: 'a', canonicalName: '王', matchedBy: 'canonical', matchedAlias: null,
+  });
+  assert.deepEqual(resolveCustomerMention(shortNames, '店'), {
+    status: 'resolved', customerId: 'b', canonicalName: '裕丰餐饮', matchedBy: 'alias', matchedAlias: '店',
+  });
+  for (const input of ['小王水产', '新店', '新王店']) {
+    assert.deepEqual(resolveCustomerMention(shortNames, input), { status: 'new_customer', customerId: null });
   }
 });

@@ -31,11 +31,16 @@ export function nullablePrice(price: string | null): string | null {
   return price?.trim() || null;
 }
 
+export function validTextPrice(value: string): boolean {
+  const cents = yuanToCents(value);
+  return Number.isSafeInteger(cents) && cents > 0;
+}
+
 export function unitPrice(price: string | null): number | null {
   const input = nullablePrice(price);
   if (input === null) return null;
   const cents = yuanToCents(input);
-  if (!Number.isSafeInteger(cents) || cents <= 0) throw new Error('单价须为大于零且最多两位小数的金额');
+  if (!validTextPrice(input)) throw new Error('单价须为大于零且最多两位小数的金额');
   return cents;
 }
 
@@ -47,17 +52,25 @@ export function lineAmount(quantity: number, cents: number | null): number | nul
   return amount;
 }
 
+export function requiredLineFields(item: ItemInput, flexible: boolean) {
+  return ([['product', '货品'], ['brand', '品牌'], ['specification', '规格'], ['unit', '单位']] as const)
+    .filter(([key]) => !(flexible && (key === 'brand' || key === 'specification')) && !item[key]?.trim());
+}
+
+export function quantityIssue(value: string): string | undefined {
+  if (!/^[1-9]\d*$/.test(value)) return '数量须为正整数';
+  if (!Number.isSafeInteger(Number(value))) return '数量超出可计算范围';
+}
+
 export function preview(draft: Draft, flexible = false): Order {
   if (!draft.customer.trim()) throw new Error('请填写客户名称');
   if (draft.items.length === 0) throw new Error('请至少添加一条货品');
   const items = draft.items.map((item, index) => {
-    for (const [key, label] of [['product', '货品'], ['brand', '品牌'], ['specification', '规格'], ['unit', '单位']] as const) {
-      if (flexible && (key === 'brand' || key === 'specification')) continue;
-      if (!item[key]?.trim()) throw new Error(`第 ${index + 1} 条：请填写${label}`);
-    }
-    if (!/^[1-9]\d*$/.test(item.quantity)) throw new Error(`第 ${index + 1} 条：数量须为正整数`);
+    const [missing] = requiredLineFields(item, flexible);
+    if (missing) throw new Error(`第 ${index + 1} 条：请填写${missing[1]}`);
     const quantity = Number(item.quantity);
-    if (!Number.isSafeInteger(quantity)) throw new Error(`第 ${index + 1} 条：数量超出可计算范围`);
+    const issue = quantityIssue(item.quantity);
+    if (issue) throw new Error(`第 ${index + 1} 条：${issue}`);
     if (flexible) {
       const price = nullablePrice(item.price);
       try {

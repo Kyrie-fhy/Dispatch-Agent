@@ -1,0 +1,9 @@
+<import src="../order-templates.wxml" />
+<view class="container">
+  <view class="title">送货单</view>
+  <view wx:if="{{error}}" class="error">{{error}}</view>
+  <button wx:if="{{!signedIn}}" class="primary" bindtap="goAssistant">去助手登录</button>
+  <view wx:elif="{{busy && !draft}}" class="hint">正在读取送货单…</view>
+  <block wx:elif="{{sheetTarget}}"><include src="../workspace/sheet.wxml" /></block>
+  <block wx:else><include src="../workspace/delivery.wxml" /></block>
+</view>

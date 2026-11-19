@@ -44,6 +44,7 @@ function setup(mvp = false) {
   };
   const modulePath = require.resolve('../code/dist/pages/workspace/index');
   delete require.cache[modulePath];
+  delete require.cache[require.resolve('../code/dist/pages/workspace/page')];
   delete require.cache[require.resolve('../code/dist/services/voice')];
   require(modulePath);
 

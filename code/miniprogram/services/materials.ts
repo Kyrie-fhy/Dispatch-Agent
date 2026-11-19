@@ -116,3 +116,20 @@ export function uploadChunk(material: Material, content: ArrayBuffer, token: str
   return workspaceRequest<{ material: Material }>('PUT', `/materials/${material.id}/chunks`, token, content,
     { 'Content-Type': 'application/octet-stream', 'X-Material-Offset': String(material.received) });
 }
+
+export async function transferMaterial(source: MaterialSource, token: string,
+  onProgress: (material: Material) => void, active: () => boolean, id?: string) {
+  const { requestId, draftId, revision, name, size, digest } = source;
+  let { material } = id
+    ? await workspaceRequest<{ material: Material }>('GET', `/materials/${id}`, token)
+    : await workspaceRequest<{ material: Material }>('POST', '/materials', token, { requestId, draftId, revision, name, size, digest });
+  while (active()) {
+    onProgress(material);
+    if (material.status === 'ready') return material;
+    const content = await readChunk(material);
+    if (!active()) return;
+    const next = (await uploadChunk(material, content, token)).material;
+    if (next.received <= material.received) throw new Error('上传进度未更新，请重试续传');
+    material = next;
+  }
+}

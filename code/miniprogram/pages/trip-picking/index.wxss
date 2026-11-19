@@ -1,0 +1,4 @@
+@import "../workspace/index.wxss";
+.picking-row { display: flex; align-items: center; justify-content: space-between; gap: 20rpx; min-height: 70rpx; }
+.picking-row .product { font-size: 32rpx; }
+.picking-quantity { font-size: 37rpx; font-weight: 750; color: #12664d; white-space: nowrap; }

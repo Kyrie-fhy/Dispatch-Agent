@@ -1,0 +1,61 @@
+page { height: 100%; color: #192b26; background: #f3f6f4; font-size: 28rpx; }
+.agent { display: flex; flex-direction: column; height: 100%; }
+.draft-strip, .composer { flex: none; padding: 14rpx 22rpx; background: #fff; }
+.draft-strip { border-bottom: 1rpx solid #dbe4df; }
+.draft-strip button, .actions button, .turn button, .file button { margin: 0; }
+button[size="mini"] { padding: 0 17rpx; font-size: 25rpx; }
+.conversation { flex: 1; height: 0; }
+.welcome { display: flex; gap: 16rpx; flex-direction: column; padding: 38rpx 28rpx; }
+.title { font-size: 44rpx; font-weight: 700; }
+.muted { color: #52655d; font-size: 25rpx; }
+.turn { display: flex; flex-direction: column; align-items: flex-start; padding: 20rpx 22rpx 0; gap: 12rpx; }
+.bubble, .card { padding: 18rpx 22rpx; border-radius: 18rpx; box-sizing: border-box; white-space: pre-wrap; overflow-wrap: anywhere; }
+.user { align-self: flex-end; max-width: 88%; background: #d9eee2; }
+.assistant, .card { background: #fff; border: 1rpx solid #dbe4df; }
+.card { width: 100%; }
+.conversation > .card { margin: 20rpx 22rpx; width: auto; }
+.card-title { display: block; font-weight: 700; }
+.question { background: #fffaf0; border-color: #e5d9b9; }
+.preview-line, .file { display: flex; gap: 14rpx; align-items: baseline; }
+.preview-line { justify-content: space-between; padding-top: 8rpx; }
+.amount { color: #17644d; font-weight: 700; }
+.detail { border-top: 1rpx solid #e3e9e5; margin-top: 12rpx; padding-top: 12rpx; }
+.line, .inline { display: block; padding-top: 6rpx; }
+.actions { display: flex; flex-wrap: wrap; gap: 8rpx; margin-top: 12rpx; }
+.primary { color: #fff; background: #12664d; }
+.primary[disabled] { color: #52655d; background: #e0e9e4; }
+.send { margin-left: auto !important; }
+.success { background: #edf9f2; }
+.composer { border-top: 1rpx solid #dbe4df; padding-bottom: calc(14rpx + env(safe-area-inset-bottom)); }
+.input { width: 100%; box-sizing: border-box; min-height: 64rpx; max-height: 190rpx; padding: 13rpx 15rpx; background: #f4f7f5; border: 1rpx solid #dbe4df; border-radius: 12rpx; }
+.error { display: block; color: #a32b24; margin-bottom: 9rpx; }
+.file-list { max-height: 180rpx; overflow-y: auto; }
+.file { justify-content: space-between; margin-bottom: 8rpx; }
+#latest { height: 20rpx; }
+
+.draft-header, .user-row, .assistant-row { display: flex; align-items: flex-start; gap: 14rpx; width: 100%; }
+.draft-header { align-items: center; justify-content: space-between; }
+.draft-toggle { text-align: left; min-width: 0; white-space: normal; line-height: 1.5 !important; padding: 8rpx 12rpx !important; }
+.draft-detail { max-height: 260rpx; }
+.user-row { justify-content: flex-end; }
+.avatar { width: 54rpx; height: 54rpx; flex: 0 0 54rpx; border-radius: 18rpx; line-height: 54rpx; text-align: center; font-weight: 700; }
+.mine { color: #234039; background: #cdded5; }
+.helper { color: #f3faf5; background: #12664d; font-size: 32rpx; }
+.assistant-content { flex: 1; min-width: 0; }
+.assistant-name, .elapsed { display: block; color: #52655d; font-size: 23rpx; }
+.assistant-name { margin-bottom: 6rpx; }
+.elapsed { margin-top: 14rpx; }
+.step { display: flex; align-items: flex-start; gap: 12rpx; padding: 5rpx 0; }
+.step-icon { width: 30rpx; height: 30rpx; margin-top: 3rpx; box-sizing: border-box; flex: 0 0 30rpx; text-align: center; line-height: 30rpx; font-weight: 700; color: #66766d; }
+.step-done .step-icon { color: #17644d; }
+.step-needs_input .step-icon { color: #a05210; }
+.step-failed .step-icon, .step-failed .step-result { color: #a32b24; }
+.step-skipped .step-label { color: #66766d; text-decoration: line-through; }
+.step-result { color: #52655d; font-size: 24rpx; padding-left: 8rpx; }
+.step-running .step-icon { border: 3rpx solid #d0e1d8; border-top-color: #12664d; border-radius: 50%; animation: roll 0.85s linear infinite; }
+@keyframes roll { to { transform: rotate(360deg); } }
+.question { padding: 12rpx; border-radius: 12rpx; }
+.question-item + .question-item { margin-top: 12rpx; }
+.minor-action { margin-top: 12rpx !important; }
+.logout { display: block; margin: 5rpx 0 0 auto; color: #53685d; background: transparent; font-size: 22rpx !important; }
+.logout::after { border: 0; }

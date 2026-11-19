@@ -8,5 +8,6 @@ coverage/
 .env.*
 !.env.example
 project.private.config.json
+tests/fixtures/a1-heldout.local.json
 *.pem
 *.key

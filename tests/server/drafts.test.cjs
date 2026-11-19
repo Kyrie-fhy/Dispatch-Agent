@@ -15,6 +15,7 @@ const { configuredImageModel, configuredTextModel, imagePromptVersion, textPromp
 const { configuredSpeechModel } = require('../../code/server-dist/server/voice');
 const { configuredAgentModel } = require('../../code/server-dist/server/agent/model');
 const { configuredIntentModel } = require('../../code/server-dist/server/agent/intent');
+const { configuredDeliveryModel, deliveryPromptVersion } = require('../../code/server-dist/server/agent/delivery-model');
 const { HttpError } = require('../../code/server-dist/server/http-error');
 const s6 = require('../fixtures/s6-text-cases.cjs');
 const { materialChunkBytes } = require('../../code/server-dist/miniprogram/core/materials');
@@ -78,11 +79,11 @@ function runPostgresClient(tool, database, args, input) {
 }
 
 async function start(db, wechat, textModel, imageModel, speechModel, agentModel,
-  intentModel = agentModel && (async () => ({ draft: true, preview: false, query: false, answering: false }))) {
+  intentModel = agentModel && (async () => ({ draft: true, preview: false, query: false, answering: false })), deliveryModel) {
   const pool = db.pool();
   let server;
   try {
-    server = await startLocalServer(pool, 0, wechat, textModel, imageModel, speechModel, agentModel, intentModel);
+    server = await startLocalServer(pool, 0, wechat, textModel, imageModel, speechModel, agentModel, intentModel, deliveryModel);
   } catch (error) {
     await pool.end();
     throw error;
@@ -1715,6 +1716,244 @@ const agentPoll = (api, token, id, after = 0) => api.request(`/v1/agent/turns/${
 const agentHistory = (api, token) => api.request('/v1/agent/conversation', { token });
 const agentInput = (draft, text, materialIds = [], requestId = randomUUID()) =>
   ({ draftId: draft.id, revision: draft.revision, text, materialIds, requestId });
+
+const a2 = require('../fixtures/a2-delivery-cases.cjs');
+const a2Live = process.env.DISPATCH_A2_EVAL_LIVE === '1';
+
+async function deliverySnapshot(db) {
+  const result = await db.admin.query(`SELECT
+    (SELECT jsonb_agg(to_jsonb(t) ORDER BY t.id) FROM dispatch.trips t) AS trips,
+    (SELECT jsonb_agg(to_jsonb(s) ORDER BY s.id) FROM dispatch.sheets s) AS sheets,
+    (SELECT jsonb_agg(to_jsonb(v) ORDER BY v.trip_id, v.version) FROM dispatch.trip_versions v) AS versions`);
+  return result.rows[0];
+}
+
+async function deliveryFixture(api, token, shops) {
+  const draft = await putCustomers(api, token, await read(api, token), randomUUID(), shops);
+  const candidate = await preview(api, token, draft, randomUUID());
+  assert.equal(candidate.status, 200, JSON.stringify(candidate.data));
+  const formal = await confirm(api, token, candidate.data.preview.previewId, randomUUID());
+  assert.equal(formal.status, 200, JSON.stringify(formal.data));
+  return { draft, formal: formal.data };
+}
+
+function checkDeliveryChecklist(result, expected) {
+  const plans = result.events.filter(event => event.kind === 'plan');
+  assert.equal(plans.length, 1);
+  const steps = [expected.direct ? '已收到你的选择' : '看懂你的意思'];
+  if (expected.adjust) steps.push(expected.answering ? '按你的回答核对送货单' : '读本趟送货单',
+    expected.answering ? '算预计应收' : '核对变更与预计应收', '等你确认保存或送达', '已更新送货单');
+  if (expected.query) steps.push('查本趟送货与取货进度', '回答');
+  if (steps.length === 1) steps.push('回答或提醒操作方式');
+  assert.deepEqual(plans[0].payload.steps.map(step => step.text), steps);
+  const updates = Object.fromEntries(result.events.filter(event => event.kind === 'step').map(event => [event.payload.id, event.payload.state]));
+  assert.equal(updates.intent, 'done');
+  if (expected.adjust) {
+    assert.equal(updates['delivery-read'], 'done');
+    assert.equal(updates['delivery-check'], expected.options ? 'needs_input' : 'done');
+    assert.equal(updates['delivery-confirm'], expected.card && (expected.card.complete || expected.card.quantity !== undefined) ? 'needs_input' : 'skipped');
+    assert.equal(updates['delivery-updated'], updates['delivery-confirm'] === 'needs_input' ? undefined : 'skipped');
+  }
+}
+
+function fromCard(card, turnId, complete = false) {
+  return { requestId: randomUUID(), version: card.version, statusRevision: card.statusRevision, turnId, complete,
+    edits: card.edits.map(({ lineId, receivedQuantity, price }) => ({ lineId, receivedQuantity, price })) };
+}
+
+test('A2 multi-line apply is atomic with confirmation and idempotent replay', async t => {
+  const db = await isolatedDatabase(t);
+  const api = await start(db);
+  const token = await login(api, 'a');
+  const { draft, formal } = await deliveryFixture(api, token, [a2.shop('north', '北街餐馆', [
+    a2.item('dumpling'), a2.item('wonton', '馄饨', '2', null),
+  ])]);
+  const sheet = sheetEndpoint(api, token, draft.id, 'north');
+  const before = await deliverySnapshot(db);
+  const first = { lineId: 'dumpling', receivedQuantity: 3, price: '82.50' };
+  const second = { lineId: 'wonton', receivedQuantity: 1, price: '10.00' };
+  const input = edits => ({ requestId: randomUUID(), version: 1, statusRevision: before.trips[0].status_revision, complete: true, edits });
+  assert.equal((await sheet('delivery/apply', input([first, { ...second, lineId: 'foreign' }]))).data.error, 'line_not_found');
+  assert.equal((await sheet('delivery/apply', input([first, { ...second, price: null }]))).data.error, 'delivery_price_required');
+  assert.deepEqual(await deliverySnapshot(db), before);
+  const body = input([first, second]);
+  const applied = await sheet('delivery/apply', body);
+  assert.equal(applied.status, 200, JSON.stringify(applied.data));
+  assert.equal(applied.data.sheet.statusRevision, body.statusRevision + 1);
+  assert.equal(applied.data.sheet.deliveryCompleted, true);
+  assert.equal(applied.data.sheet.amounts.due, 25750);
+  assert.deepEqual(await sheet('delivery/apply', body), applied);
+  const trip = await api.request(`/v1/trips/${draft.id}`, { token });
+  assert.deepEqual(trip.data.picking, formal.picking);
+});
+
+test('A2 agent voice transcribes the confirmed current trip without writing order data', async t => {
+  const db = await isolatedDatabase(t);
+  const wave = pcmWave(32_000);
+  let calls = 0;
+  const text = '水饺少收两箱';
+  const api = await start(db, undefined, undefined, undefined, async bytes => {
+    assert.deepEqual(bytes, wave);
+    calls++;
+    return { text };
+  });
+  const token = await login(api, 'a');
+  const draft = await read(api, token);
+  const voice = (basis, path = '/v1/agent/transcription') => api.request(path, { method: 'POST', token,
+    body: { wave: wave.toString('base64') }, headers: { 'x-draft-id': basis.id, 'x-draft-revision': String(basis.revision) } });
+  assert.deepEqual(await voice(draft), { status: 200, data: { draftId: draft.id, revision: draft.revision, text } });
+  const current = (await deliveryFixture(api, token, [a2.shop('north', '北街餐馆', [a2.item('dumpling')])])).draft;
+  const before = await deliverySnapshot(db);
+  assert.deepEqual(await voice(current), { status: 200, data: { draftId: current.id, revision: current.revision, text } });
+  assert.equal((await voice(current, `/v1/drafts/${current.id}/transcription`)).data.error, 'draft_confirmed');
+  assert.equal((await voice({ ...current, revision: current.revision + 1 })).data.error, 'draft_changed');
+  assert.deepEqual(await deliverySnapshot(db), before);
+  assert.equal((await api.request('/v1/trips/next-draft', { method: 'POST', token,
+    body: { draftId: current.id, requestId: randomUUID() } })).status, 200);
+  assert.equal((await voice(current)).status, 404);
+  assert.equal(calls, 2);
+});
+
+test('A2 Harness: 全量十类现场场景', { timeout: 1_200_000 }, async t => {
+  const model = a2Live ? configuredDeliveryModel({ ...process.env, DISPATCH_A2_MODEL: 'deepseek-flash' }) : null;
+  if (a2Live) assert.ok(model, '请在当前进程配置 DISPATCH_TEXT_MODEL_KEY；未执行真实模型评测。');
+  const rows = [];
+  const trials = [];
+  for (const scenario of a2.cases) {
+    for (let sample = 1; sample <= (a2Live ? 3 : 1); sample++) {
+      await t.test(`A2 Harness: ${scenario.id} #${sample}`, async testCase => {
+        const db = await isolatedDatabase(testCase);
+        let expected;
+        const api = await start(db, undefined, undefined, undefined, undefined, undefined, undefined, model ?? (async (phase, input, signal, record) => {
+          record({ model: 'fixture', outcome: phase, elapsedMs: 0, promptVersion: deliveryPromptVersion });
+          return phase === 'candidate' ? expected.fixture : { adjust: !!expected.adjust, query: !!expected.query, answering: !!expected.answering,
+            lookup: expected.lookup ?? 'none', shop: expected.shopName ?? '' };
+        }));
+        const token = await login(api, 'a');
+        const { draft, formal } = await deliveryFixture(api, token, scenario.shops);
+        if (scenario.locked) {
+          const lock = await sheetEndpoint(api, token, draft.id, scenario.locked)('delivery/complete', { requestId: randomUUID(), version: 1, statusRevision: 0 });
+          assert.equal(lock.status, 200, JSON.stringify(lock.data));
+        }
+        const failures = [];
+        let previousId;
+        for (expected of scenario.turns) {
+          const row = { scenario: scenario.id, sample, text: expected.text, ok: false, intent: false };
+          rows.push(row);
+          try {
+            const before = await deliverySnapshot(db);
+            const input = agentInput(draft, expected.text);
+            if (expected.direct && previousId) input.direct = { intent: 'draft', turnId: previousId, answer: expected.text };
+            const submitted = await agentPost(api, token, 'turns', input);
+            assert.equal(submitted.status, 202, JSON.stringify(submitted.data));
+            const id = submitted.data.turnId;
+            previousId = id;
+            const result = await waitForAgent(api, token, id);
+            const stored = (await db.admin.query(`SELECT kind, payload FROM dispatch.agent_events WHERE turn_id = $1
+              AND kind IN ('model', 'delivery_intent') ORDER BY seq`, [id])).rows;
+            const intent = stored.find(event => event.kind === 'delivery_intent')?.payload;
+            const traces = stored.filter(event => event.kind === 'model').map(event => event.payload);
+            row.calls = traces.length;
+            row.models = traces;
+            const end = result.events.find(event => event.kind === 'end')?.payload;
+            row.elapsedMs = end?.elapsedMs ?? result.wallMs;
+            row.intent = Boolean(intent && intent.adjust === !!expected.adjust && intent.query === !!expected.query &&
+              intent.answering === !!expected.answering && intent.direct === !!expected.direct && (!expected.lookup || intent.lookup === expected.lookup));
+            assert.deepEqual(await deliverySnapshot(db), before, '对话回合不得改动正式表');
+            assert.equal(result.status, 'completed', end?.text);
+            assert.ok(row.intent, `意图错误：${JSON.stringify(intent)}`);
+            assert.deepEqual(traces.map(trace => trace.phase), [...(expected.direct ? [] : ['intent']), ...(expected.adjust ? ['candidate'] : [])]);
+            const revisions = await db.admin.query('SELECT start_revision, end_revision FROM dispatch.agent_turns WHERE id = $1', [id]);
+            assert.deepEqual(revisions.rows, [{ start_revision: draft.revision, end_revision: draft.revision }]);
+            checkDeliveryChecklist(result, expected);
+            const card = result.events.find(event => event.kind === 'delivery_proposal')?.payload;
+            const questions = result.events.find(event => event.kind === 'questions')?.payload.questions;
+            if (expected.options) {
+              const options = questions?.flatMap(question => question.options) ?? [];
+              for (const option of expected.options) assert.ok(options.some(found => typeof option === 'string' ? found === option : option.test(found)), JSON.stringify(questions));
+            } else assert.equal(questions, undefined, JSON.stringify(questions));
+            if (expected.reply) assert.match(end.text, expected.reply);
+            if (!expected.card) assert.equal(card, undefined);
+            else {
+              const target = expected.card;
+              assert.ok(card);
+              assert.equal(card.tripId, draft.id);
+              assert.equal(card.sheetId, target.sheet);
+              assert.equal(card.totalCents, target.total);
+              assert.equal(card.canComplete, target.complete);
+              assert.equal(card.version, 1);
+              assert.equal(card.statusRevision, before.trips[0].status_revision);
+              if (target.missing) assert.match(card.pendingPriceNames.join('、'), target.missing);
+              else assert.deepEqual(card.pendingPriceNames, []);
+              if (target.quantity !== undefined) {
+                assert.equal(card.edits.length, 1);
+                assert.equal(card.edits[0].receivedQuantity, target.quantity);
+                assert.equal(card.edits[0].price, target.price);
+              } else assert.deepEqual(card.edits, []);
+              const sheet = sheetEndpoint(api, token, draft.id, target.sheet);
+              if (expected.action === 'cancel') {
+                const cancelled = await agentPost(api, token, 'card-actions', { ...agentInput(draft, ''), action: 'delivery-cancel', turnId: id });
+                assert.equal(cancelled.status, 200, JSON.stringify(cancelled.data));
+                assert.deepEqual(await deliverySnapshot(db), before);
+                assert.equal((await agentPoll(api, token, id)).data.events.find(event => event.kind === 'delivery_applied').payload.status, 'cancelled');
+              } else if (expected.action === 'stale') {
+                const form = await sheet('delivery/line', { requestId: randomUUID(), version: card.version, statusRevision: card.statusRevision,
+                  lineId: card.edits[0].lineId, receivedQuantity: '2', price: '81' });
+                assert.equal(form.status, 200, JSON.stringify(form.data));
+                const fresh = await deliverySnapshot(db);
+                const stale = await sheet('delivery/apply', fromCard(card, id));
+                assert.equal(stale.status, 409);
+                assert.equal(stale.data.error, 'delivery_changed');
+                assert.deepEqual(await deliverySnapshot(db), fresh);
+                assert.ok(!(await agentPoll(api, token, id)).data.events.some(event => event.kind === 'delivery_applied'));
+              } else if (expected.action) {
+                const complete = expected.action === 'complete';
+                const command = fromCard(card, id, complete);
+                const applied = await sheet('delivery/apply', command);
+                assert.equal(applied.status, 200, JSON.stringify(applied.data));
+                assert.deepEqual(await sheet('delivery/apply', command), applied);
+                assert.equal(applied.data.sheet.statusRevision, card.statusRevision + 1);
+                assert.equal(applied.data.sheet.execution.totalCents, target.total);
+                assert.equal(applied.data.sheet.deliveryCompleted, complete);
+                if (complete) assert.equal(applied.data.sheet.amounts.due, target.total);
+                const after = await deliverySnapshot(db);
+                assert.equal(after.sheets.find(sheet => sheet.id === target.sheet).delivery_completed, complete);
+                for (const edit of card.edits) assert.deepEqual(after.trips[0].delivery_edits[edit.lineId],
+                  { receivedQuantity: edit.receivedQuantity, unitPriceCents: edit.price === null ? null : Math.round(Number(edit.price) * 100) });
+                assert.deepEqual(after.versions, before.versions);
+                const trip = await api.request(`/v1/trips/${draft.id}`, { token });
+                assert.deepEqual(trip.data.picking, formal.picking);
+                const restored = (await agentHistory(api, token)).data.turns.find(turn => turn.id === id);
+                assert.deepEqual(restored.events.filter(event => event.kind === 'delivery_applied').map(event => event.payload.status), [complete ? 'completed' : 'saved']);
+              }
+            }
+            row.ok = true;
+          } catch (error) {
+            row.reason = error.message;
+            failures.push(`${expected.text}：${error.message}`);
+          }
+          testCase.diagnostic(JSON.stringify(row));
+        }
+        trials.push(failures.length === 0);
+        if (!a2Live) assert.deepEqual(failures, []);
+      });
+    }
+  }
+  const median = values => {
+    const sorted = values.filter(Number.isFinite).sort((a, b) => a - b);
+    return sorted.length ? (sorted[Math.floor((sorted.length - 1) / 2)] + sorted[Math.floor(sorted.length / 2)]) / 2 : null;
+  };
+  const summary = { mode: a2Live ? 'live' : 'fixture', scenarios: trials.length, passed: trials.filter(Boolean).length, turns: rows.length,
+    passedTurns: rows.filter(row => row.ok).length, correctIntents: rows.filter(row => row.intent).length,
+    medianCalls: median(rows.map(row => row.calls)), medianMs: median(rows.map(row => row.elapsedMs)),
+    failures: rows.filter(row => !row.ok).map(({ scenario, sample, text, reason }) => ({ scenario, sample, text, reason })) };
+  t.diagnostic(`A2 SUMMARY ${JSON.stringify(summary)}`);
+  assert.equal(trials.length, a2.cases.length * (a2Live ? 3 : 1));
+  if (a2Live) {
+    assert.ok(summary.passed / summary.scenarios >= 0.9, 'A2 场景通过率低于 90%');
+    assert.ok(summary.medianMs !== null && summary.medianMs <= 2500, 'A2 回合中位数高于 2.5s');
+  }
+});
 
 async function waitForAgent(api, token, id) {
   const events = [];

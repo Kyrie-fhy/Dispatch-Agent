@@ -1,6 +1,8 @@
 import { AgentRuntime } from './agent/runtime';
 import { AgentModel, configuredAgentModel } from './agent/model';
 import { configuredIntentModel, IntentModel } from './agent/intent';
+import { configuredDeliveryModel, DeliveryModel } from './agent/delivery-model';
+import { missingDraft, readAccount, readWorkspace } from './account-workspace';
 import { readTurnInput } from './agent/store';
 import { createServer, IncomingMessage, Server, ServerResponse } from 'node:http';
 import { Pool } from 'pg';
@@ -8,7 +10,7 @@ import { databaseOptions, requireApplicationRole, trialMode } from './database';
 import { readAmendmentInput, readSaveDraft } from './draft-input';
 import { AmendmentStore } from './amendments';
 import { DraftStore } from './drafts';
-import { DeliveryStore } from './delivery';
+import { DeliveryStore, readDeliveryApply } from './delivery';
 import { LedgerStore } from './ledger';
 import { MaterialStore, readMaterialInput } from './materials';
 import { TripStore } from './trips';
@@ -148,8 +150,10 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
     return;
   }
   const voiceRoute = /^\/v1\/drafts\/([^/]+)\/transcription$/.exec(path);
-  if (method === 'POST' && voiceRoute && uuidPattern.test(voiceRoute[1])) {
-    const voiceDraftId = voiceRoute[1];
+  const agentVoice = path === '/v1/agent/transcription';
+  const voiceDraftId = agentVoice ? request.headers['x-draft-id'] : voiceRoute?.[1];
+  if (method === 'POST' && (agentVoice || (voiceRoute && uuidPattern.test(voiceRoute[1])))) {
+    if (typeof voiceDraftId !== 'string' || !uuidPattern.test(voiceDraftId)) throw missingDraft();
     const header = request.headers['x-draft-revision'];
     const revision = typeof header === 'string' && /^\d{1,10}$/.test(header) ? Number(header) : NaN;
     if (!validRevision(revision)) throw new HttpError(400, 'invalid_draft', '请提供有效的草稿版本');
@@ -157,7 +161,12 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
     if (contentType !== 'audio/wav' && contentType !== 'application/json') {
       throw new HttpError(415, 'invalid_content_type', '请以 JSON 或 WAV 发送录音');
     }
-    await store.checkVoiceDraft(account, voiceDraftId, revision);
+    const checkVoice = () => agentVoice ? readAccount(pool, account, async client => {
+      const workspace = await readWorkspace(client, account);
+      if (workspace.id !== voiceDraftId) throw missingDraft();
+      if (workspace.revision !== revision) throw new HttpError(409, 'draft_changed', '本趟信息已更新，请刷新后重新录音。');
+    }) : store.checkVoiceDraft(account, voiceDraftId, revision);
+    await checkVoice();
     if (!speechModel) throw new HttpError(503, 'voice_model_unavailable', '语音转写暂未开启，可以手动输入。');
     const tooLarge = '录音文件过大，请分段录音';
     const wave = contentType === 'application/json'
@@ -165,10 +174,10 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
       : await readBody(request, response, voiceMaxBytes, tooLarge);
     validateWave(wave);
     await store.accountFor(token, wechat?.appId);
-    await store.checkVoiceDraft(account, voiceDraftId, revision);
+    await checkVoice();
     const result = await speechModel(wave);
     await store.accountFor(token, wechat?.appId);
-    await store.checkVoiceDraft(account, voiceDraftId, revision);
+    await checkVoice();
     sendJson(response, 200, { draftId: voiceDraftId, revision, text: readTranscript(result) });
     return;
   }
@@ -249,7 +258,7 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
     return;
   }
 
-  const sheetRoute = /^\/v1\/trips\/([^/]+)\/sheets\/([^/]+)(?:\/(delivery(?:\/(?:preview|confirm|line|complete))?|review|ledger|(?:opening|receipt|amendment)\/(?:preview|confirm)))?$/.exec(path);
+  const sheetRoute = /^\/v1\/trips\/([^/]+)\/sheets\/([^/]+)(?:\/(delivery(?:\/(?:preview|confirm|line|complete|apply))?|review|ledger|(?:opening|receipt|amendment)\/(?:preview|confirm)))?$/.exec(path);
   if (sheetRoute && uuidPattern.test(sheetRoute[1])) {
     const [, sheetTripId, key, action] = sheetRoute;
     let sheetId: string;
@@ -286,6 +295,7 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
         const sheet = action === 'review' ? await delivery.review(account, sheetTripId, sheetId, readReviewInput(body))
           : action === 'delivery/line' ? await delivery.editLine(account, sheetTripId, sheetId, readDeliveryEdit(body))
           : action === 'delivery/complete' ? await delivery.complete(account, sheetTripId, sheetId, readReviewInput(body))
+          : action === 'delivery/apply' ? await delivery.apply(account, sheetTripId, sheetId, readDeliveryApply(body))
           : action === 'delivery/confirm' ? await delivery.confirm(account, sheetTripId, sheetId, readConfirmInput(body))
           : await delivery.setDelivery(account, sheetTripId, sheetId, readDeliveryInput(body));
         sendJson(response, 200, { sheet });
@@ -298,7 +308,7 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
 }
 
 export async function startLocalServer(pool: Pool, port: number, wechat?: WechatLogin, textModel?: TextModel,
-  imageModel?: ImageModel, speechModel?: SpeechModel, agentModel?: AgentModel, intentModel?: IntentModel): Promise<Server> {
+  imageModel?: ImageModel, speechModel?: SpeechModel, agentModel?: AgentModel, intentModel?: IntentModel, deliveryModel?: DeliveryModel): Promise<Server> {
   await requireApplicationRole(pool);
   const store = new DraftStore(pool);
   const trips = new TripStore(pool);
@@ -307,7 +317,7 @@ export async function startLocalServer(pool: Pool, port: number, wechat?: Wechat
   const amendments = new AmendmentStore(pool);
   const materials = new MaterialStore(pool);
   const textOrders = new TextOrders(pool, textModel, imageModel);
-  const agent = new AgentRuntime(pool, trips, textOrders, agentModel, intentModel);
+  const agent = new AgentRuntime(pool, trips, textOrders, agentModel, intentModel, deliveryModel);
   await agent.store.interrupt();
   const server = createServer({ requestTimeout: 15_000 }, (request, response) => {
     void handle(pool, store, trips, delivery, ledger, amendments, materials, textOrders, agent, request, response, wechat, speechModel).catch(error => {
@@ -341,7 +351,7 @@ async function main(): Promise<void> {
   try {
     const server = await startLocalServer(pool, port, wechat, configuredTextModel(process.env),
       configuredImageModel(process.env), configuredSpeechModel(process.env), configuredAgentModel(process.env),
-      configuredIntentModel(process.env, 'A'));
+      configuredIntentModel(process.env, 'A'), configuredDeliveryModel(process.env));
     const stop = () => {
       server.close(() => { void pool.end(); });
       server.closeIdleConnections();

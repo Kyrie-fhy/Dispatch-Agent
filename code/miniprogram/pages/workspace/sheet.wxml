@@ -150,6 +150,8 @@
       </view>
       <button wx:if="{{deliveryMvp && !sheet.reviewed}}" class="primary" bindtap="completeDelivery"
         disabled="{{busy || !!fieldEdit}}" loading="{{busy}}">按实收数量确认送达</button>
+      <button wx:if="{{deliveryMvp && !sheet.reviewed && formal.id === sheet.tripId}}" size="mini" bindtap="goAssistantDelivery"
+        disabled="{{busy || !!fieldEdit || !!sheetRetry}}">去助手语音改单</button>
       <button wx:if="{{!deliveryMvp && sheet.pending.length}}" bindtap="markDelivery" data-status="delivered" disabled="{{busy}}">本客户整单送达</button>
       <button wx:if="{{!deliveryMvp && !sheet.reviewed}}" class="primary" data-action="review" bindtap="beginSheetAction" disabled="{{busy}}">{{deliveryMvp ? '核对配送' : '开始对账'}}</button>
       <button wx:if="{{!deliveryMvp}}" data-action="amendment" bindtap="beginSheetAction" disabled="{{busy}}">更正单据</button>

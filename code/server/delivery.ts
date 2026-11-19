@@ -1,11 +1,36 @@
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { Pool, PoolClient } from 'pg';
 import { DeliveryEdits, DeliveryLine, deliveryLines, deliverySummary } from '../miniprogram/core/delivery-execution';
+import { isObject, unitPrice } from '../miniprogram/core/orders';
 import { Account, deliveredBalance } from '../miniprogram/core/settlement';
 import { CustomerOrder, Trip } from '../miniprogram/core/trips';
 import { readAccount, writeAccount } from './account-workspace';
 import { HttpError } from './http-error';
-import { readConfirmInput, readDeliveryEdit, readDeliveryInput, readReviewInput, validRevision } from './request-input';
+import { readConfirmInput, readDeliveryEdit, readDeliveryInput, readId, readReviewInput, validRevision } from './request-input';
+import { finishDeliveryCard, pendingDeliveryCard } from './agent/store';
+
+export function readDeliveryApply(value: unknown) {
+  const basis = readReviewInput(value);
+  if (!isObject(value) || typeof value.complete !== 'boolean' || !Array.isArray(value.edits) || value.edits.length > 200 ||
+      (!value.edits.length && !value.complete)) throw new HttpError(400, 'invalid_delivery_apply', '请提供有效的送货变更');
+  const seen = new Set<string>();
+  const edits = value.edits.map(line => {
+    if (!isObject(line) || typeof line.lineId !== 'string' || seen.has(line.lineId) ||
+        typeof line.receivedQuantity !== 'number' || !Number.isSafeInteger(line.receivedQuantity) || line.receivedQuantity < 0 ||
+        (line.price !== null && (typeof line.price !== 'string' || !/^\d+(?:\.\d{1,2})?$/.test(line.price) || line.price.length > 40))) {
+      throw new HttpError(400, 'invalid_delivery_apply', '明细重复，或实收数量、单价无效');
+    }
+    seen.add(line.lineId);
+    try {
+      return { lineId: line.lineId, receivedQuantity: line.receivedQuantity, unitPriceCents: unitPrice(line.price) };
+    } catch (error) {
+      throw new HttpError(400, 'invalid_delivery_price', (error as Error).message);
+    }
+  });
+  const turnId = value.turnId === undefined ? undefined : readId(value.turnId, '核对卡回合编号');
+  return { ...basis, edits, complete: value.complete, turnId };
+}
 
 type ReviewBasis = Omit<ReturnType<typeof readReviewInput>, 'requestId'>;
 type DeliveryChange = Omit<ReturnType<typeof readDeliveryInput>, 'requestId'>;
@@ -97,6 +122,56 @@ export async function readFormalSheet(client: PoolClient, accountId: string, tri
 
 export class DeliveryStore {
   constructor(private readonly pool: Pool) {}
+
+  apply(accountId: string, tripId: string, sheetId: string, { requestId, edits: changes, complete, turnId, ...basis }: ReturnType<typeof readDeliveryApply>) {
+    return writeAccount(this.pool, accountId, requestId, { action: 'delivery-apply', tripId, sheetId, changes, complete, turnId, basis }, async (client, workspace) => {
+      if (workspace.id !== tripId || workspace.currentTripId !== tripId) {
+        throw new HttpError(409, 'delivery_changed', '本趟已切换，请打开最新送货单。');
+      }
+      const state = await readFormalSheet(client, accountId, tripId, sheetId);
+      checkBasis(state, basis);
+      checkEditable(state);
+      if (state.reviewed) throw new HttpError(409, 'delivery_completed', '本客户已核对，应收已锁定');
+      const key = turnId && { account: accountId, draftId: tripId, id: turnId };
+      if (key) {
+        const card = await pendingDeliveryCard(client, key, sheetId);
+        const expected = card.edits.map(({ lineId, receivedQuantity, price }) => ({ lineId, receivedQuantity, unitPriceCents: unitPrice(price) }));
+        if (card.version !== basis.version || card.statusRevision !== basis.statusRevision || !isDeepStrictEqual(changes, expected)) {
+          throw new HttpError(409, 'delivery_changed', '提交内容与核对卡不一致，请重新核对。');
+        }
+      }
+      const edits = { ...state.edits };
+      const statuses = { ...state.statuses };
+      const original = deliveryLines(state.customer, state.edits);
+      let changed = false;
+      for (const { lineId, ...edit } of changes) {
+        const line = original.find(item => item.id === lineId);
+        if (!line) throw new HttpError(404, 'line_not_found', '未找到本客户的货品明细');
+        if (line.receivedQuantity === edit.receivedQuantity && line.unitPriceCents === edit.unitPriceCents) continue;
+        changed = true;
+        edits[lineId] = edit;
+        if (edit.receivedQuantity === 0 || edit.unitPriceCents === null) statuses[lineId] = 'pending';
+      }
+      let lines: DeliveryLine[];
+      try {
+        lines = deliveryLines(state.customer, edits);
+        deliverySummary(lines);
+      } catch (error) {
+        throw new HttpError(400, 'invalid_delivery_amount', (error as Error).message);
+      }
+      if (complete) {
+        requirePrices(lines);
+        for (const line of lines) statuses[line.id] = line.receivedQuantity > 0 ? 'delivered' : 'pending';
+        await client.query('UPDATE dispatch.sheets SET reviewed = true, delivery_completed = true WHERE account_id = $1 AND trip_id = $2 AND id = $3',
+          [accountId, tripId, sheetId]);
+      }
+      const statusRevision = changed || complete ? nextRevision(state) : state.statusRevision;
+      if (changed || complete) await client.query(`UPDATE dispatch.trips SET delivery_edits = $3, statuses = $4, status_revision = $5
+        WHERE account_id = $1 AND id = $2`, [accountId, tripId, JSON.stringify(edits), JSON.stringify(statuses), statusRevision]);
+      if (key) await finishDeliveryCard(client, key, complete ? 'completed' : 'saved');
+      return sheetDetails({ ...state, edits, statuses, statusRevision, reviewed: complete, deliveryCompleted: complete });
+    });
+  }
 
   sheet(accountId: string, tripId: string, sheetId: string) {
     return readAccount(this.pool, accountId, async client => sheetDetails(await readFormalSheet(client, accountId, tripId, sheetId)));

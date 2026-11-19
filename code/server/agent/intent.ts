@@ -28,7 +28,7 @@ add 填 customer、product、quantity、unit。明确的品牌放在 brand，明
 数量为十进制整数的字符串，价格为元的十进制字符串。从用户原话或本轮明确选中的追问选项取值，不猜数量、单价或客户。缺单价留空，别问价或算金额。重复报同款且未确定按增量还是按新总量时先追问。增量调整填调整后的总数量。
 questions 的元素含 customer、text、options。只问缺的必填项或有歧义的事项，options 没有就用空数组。无候选或问题也用空数组。`;
 
-export const intentPromptVersion = 'a1-agent-v4';
+export const intentPromptVersion = 'a1-agent-v5';
 
 export function buildIntentInput(text: string, context: IntentContext): string {
   let target = 0;

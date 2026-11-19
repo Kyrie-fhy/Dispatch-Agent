@@ -381,7 +381,8 @@ export class AgentRuntime {
     if ('confirmation' in result && result.confirmation && result.question) {
       await this.store.append(run.key, 'edit_confirmation', result.confirmation);
       run.questions.push(result.question);
-    } else if ('issues' in result) run.questions.push(...issueQuestions(result.issues));
+    } else if ('questions' in result && result.questions) run.questions.push(...result.questions);
+    else if ('issues' in result) run.questions.push(...issueQuestions(result.issues));
     else if ('lines' in result && result.lines) run.lines.push(...result.lines);
   }
 

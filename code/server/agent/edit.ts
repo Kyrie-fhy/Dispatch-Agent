@@ -24,14 +24,39 @@ function includesValue(source: string, value: string) {
   return /^\d+(\.\d+)?$/.test(value) ? hasSpokenNumber(source, value) : source.includes(normalized(value));
 }
 
-function statedQuantity(source: string, unit: string): number | undefined {
-  const afterVerb = source.match(/(?:追加|再加|加上|加|再要|再来)\s*(.+)/)?.[1];
+const incrementVerb = /(?:追加|再加|加上|增加|多要|多来|多拿|加)\s*(.+)/;
+const repeatVerb = /[再又还][要来拿订给带捎]\s*(.+)/;
+const changeVerb = /改成|改为|改到|改一下|更正|换成|调整|重填|单价改|价格改/;
+
+function statedQuantity(source: string, unit: string, verb: RegExp): number | undefined {
+  const afterVerb = source.match(verb)?.[1];
   if (!afterVerb) return;
   const [token] = spokenNumbers(afterVerb);
-  if (token?.start !== 0 || token.value === null || !Number.isInteger(token.value)) return;
+  if (token?.start !== 0 || token.value === null || !Number.isSafeInteger(token.value) || token.value <= 0) return;
   const suffix = afterVerb.slice(token.end).trim();
   if (suffix && !suffix.startsWith(unit) && !/^[，,。；;！!]/.test(suffix)) return;
   return token.value;
+}
+
+function repeatedQuantity(source: string, unit: string) {
+  if (!unit || changeVerb.test(source) || /追加|再加|加上|增加|多[要来拿]/.test(source) ||
+      statedQuantity(source, unit, incrementVerb) !== undefined) return;
+  return statedQuantity(source, unit, repeatVerb);
+}
+
+function compatibleDetail(fromDraft?: string | null, fromCandidate?: string) {
+  const oldValue = normalized(fromDraft ?? '');
+  const newValue = normalized(fromCandidate ?? '');
+  return !oldValue || !newValue || oldValue === newValue;
+}
+
+function quantityQuestion(row: ReturnType<typeof targetRows>[number], quantity: number) {
+  const amount = `${quantity} ${row.item.unit}`;
+  return { questions: [{
+    customer: row.customer.customer,
+    text: `${row.item.product}是改成 ${amount}，还是加上 ${amount}？`,
+    options: [`改成 ${amount}`, `加上 ${amount}`],
+  }] };
 }
 
 export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[], source: string, previous?: PreviousQuestions, confirmed = false) {
@@ -39,20 +64,26 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
   const edits = value.operations.filter((op: unknown) => isObject(op) && (op.action === 'add' || op.action === 'fill'));
   const next = structuredClone(draft);
   const initial = targetRows(draft);
+  const actualRows = initial.filter(entry => !isPlaceholder(entry.item));
   const lines: string[] = [];
   const confirmations: string[] = [];
   let deleting = false;
   const names = new Set(parties.map(party => normalized(party.name)));
   const response = normalized(source);
   const priorText = previous?.payload.sourceText ?? previous?.text;
-  const options = previous?.payload.questions.flatMap(question => question.options) ?? [];
-  const matches = options.filter(option => {
-    const candidate = normalized(option);
-    return candidate === response ||
-      (response === '追加' && /^(?:追加|增加|再加|加上)/.test(candidate)) ||
-      (response === '改成' && candidate.startsWith('改成'));
-  });
-  const selected = matches.length === 1 ? normalized(matches[0]) : '';
+  const shortAnswer = response.replace(/\s/g, '');
+  const matches = previous?.payload.questions.flatMap(question => question.options
+    .map(normalized).filter(candidate =>
+      candidate.replace(/\s/g, '') === shortAnswer ||
+      (/^(?:追加|加上|再加|增加|加)$/.test(shortAnswer) && /^(?:追加|增加|再加|加上)/.test(candidate)) ||
+      (/^(?:改成|改为)$/.test(shortAnswer) && /^(?:改成|改为)/.test(candidate)))
+    .map(option => ({ question, option }))) ?? [];
+  const selectedMatch = matches.length === 1 ? matches[0] : undefined;
+  const selected = selectedMatch?.option ?? '';
+  const targetSource = selectedMatch
+    ? [response, priorText ?? '', selectedMatch.question.customer, selectedMatch.question.text].map(normalized).join(' ')
+    : response;
+  const checkRepeat = !confirmed && !selected;
   const issues = (message: string) => ({ issues: [{ code: 'edit_needs_review', message }] });
 
   if (edits.length) {
@@ -60,6 +91,22 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
       !includesValue(response, op.price.trim()))) return issues('请明确说明要填写的单价。');
     if (edits.some(op => isObject(op) && typeof op.quantity === 'string' && op.quantity.trim() &&
       !includesValue(response, op.quantity.trim()))) return issues('请说明要填写的确切数量。');
+    if (checkRepeat && repeatVerb.test(response)) {
+      for (const op of edits) {
+        if (!isObject(op) || op.action !== 'add' || typeof op.customer !== 'string') continue;
+        const customerName = normalized(op.customer);
+        const { unit, product, quantity: proposed, brand, specification } = safeFields(op, invalidTool);
+        if (!customerName || !unit || !product || !proposed) continue;
+        const quantity = repeatedQuantity(response, normalized(unit));
+        if (quantity === undefined || quantity !== Number(proposed)) continue;
+        const matches = actualRows.filter(({ customer, item }) =>
+          normalized(customer.customer) === customerName &&
+          normalized(item.product) === normalized(product) &&
+          normalized(item.unit) === normalized(unit) &&
+          compatibleDetail(item.brand, brand) && compatibleDetail(item.specification, specification));
+        if (matches.length === 1) return quantityQuestion(matches[0], quantity);
+      }
+    }
     const contextSource = priorText ? `${source} ${priorText}` : source;
     const merged = mergeOrder(next, { operations: edits }, names, contextSource);
     if (!merged.draft) return { issues: merged.issues };
@@ -97,8 +144,6 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
     const row = old && targetRows(next).find(entry => entry.item.id === old.item.id);
     if (!row || isPlaceholder(row.item)) return issues('请指明要修改的货品明细。');
     const label = `${row.customer.customer} ${row.item.product}`.trim();
-    const actualRows = initial.filter(entry => !isPlaceholder(entry.item));
-    const targetSource = selected && priorText ? response + normalized(priorText) : response;
     const matchScore = ({ item, customer }: typeof row) =>
       Number(Boolean(item.product && targetSource.includes(normalized(item.product)))) +
       Number(Boolean(customer.customer && targetSource.includes(normalized(customer.customer))));
@@ -120,17 +165,24 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
     const namesProduct = Boolean(row.item.product && targetSource.includes(normalized(row.item.product)));
     const uniqueRow = actualRows.length === 1 && !draft.customers.some(customer =>
       customer !== old.customer && customer.customer.trim() && targetSource.includes(normalized(customer.customer)));
-    const explicit = /改成|改为|改到|改一下|更正|换成|调整|重填|单价改|价格改/.test(response + selected);
+    const explicit = changeVerb.test(response + selected);
     const fields = safeFields(op, invalidTool);
+    if (checkRepeat && fields.quantity && (!fields.unit || normalized(fields.unit) === normalized(old.item.unit))) {
+      const quantity = repeatedQuantity(response, normalized(old.item.unit));
+      if (quantity !== undefined &&
+          (Number(fields.quantity) === quantity || Number(fields.quantity) === Number(old.item.quantity) + quantity)) {
+        return quantityQuestion(old, quantity);
+      }
+    }
     for (const field of textFields) {
       const value = fields[field];
       if (typeof value !== 'string' || value === row.item[field]) continue;
       const increment = field === 'quantity'
-        ? (selected && priorText && statedQuantity(normalized(priorText), row.item.unit)) ||
-          statedQuantity(selected || response, row.item.unit)
+        ? statedQuantity(selected || response, normalized(row.item.unit), incrementVerb) ||
+          (selected && priorText && incrementVerb.test(selected)
+            ? statedQuantity(normalized(priorText), row.item.unit, repeatVerb) : undefined)
         : undefined;
-      const append = typeof increment === 'number' && increment > 0 && /追加|加/.test(selected || response)
-        && Number(row.item.quantity) + increment === Number(value);
+      const append = increment !== undefined && Number(row.item.quantity) + increment === Number(value);
       const eligible = field !== 'price' || /单价|价格|每[公斤斤箱袋件个包]/.test(response);
       if (!includesValue(response, value) && !includesValue(selected, value) && !append) {
         return issues('请说明本轮要改成的值。');

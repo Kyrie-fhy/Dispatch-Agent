@@ -2244,6 +2244,69 @@ test('A1 resolves a server customer option directly and sends an open option to 
   ]);
 });
 
+test('A1 recovers ambiguous repeat orders after model proposals and applies the answer once across customers', { timeout: 30_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const customers = [
+    { id: 'repeat-a', customer: '青禾饭店', partyId: null, items: [line('repeat-line-a', '安井', '箱', '2', '82')] },
+    { id: 'repeat-b', customer: '东门快餐', partyId: null, items: [line('repeat-line-b', '安井', '箱', '4', '80')] },
+  ];
+  const updateQuantity = quantity => ({ action: 'update', target: 2, quantity });
+  const proposalCases = [
+    { statement: '东门快餐再要3箱', candidate: updateQuantity('7'), answer: '追加', expected: '7' },
+    { statement: '东门快餐再来三箱', candidate: updateQuantity('3'), answer: '追加', expected: '7' },
+    { statement: '东门快餐还要三箱', candidate: a1.add('东门快餐', '水饺', '3'), answer: '追加', expected: '7' },
+    { statement: '东门快餐又要3箱', candidate: updateQuantity('7'), answer: '加上3箱', expected: '7' },
+    { statement: '东门快餐再拿3箱', candidate: updateQuantity('7'), answer: '再加', expected: '7' },
+    { statement: '东门快餐再给3箱', candidate: updateQuantity('7'), answer: '改为', expected: '3' },
+  ];
+  const question = { customer: '东门快餐', text: '水饺是改成 3 箱，还是加上 3 箱？',
+    options: ['改成 3 箱', '加上 3 箱'] };
+  let current;
+  const calls = [];
+  const model = async messages => {
+    const { text, previous } = JSON.parse(messages[1].content);
+    calls.push(['edit', text]);
+    if (text === current.statement) return makeToolReply(a1.edit(current.candidate));
+    assert.equal(text, current.answer);
+    assert.equal(previous.text, current.statement);
+    assert.deepEqual(previous.questions, [question]);
+    return makeToolReply(a1.edit(updateQuantity(current.expected)));
+  };
+  const identify = async (text, context) => {
+    calls.push(['intent', text]);
+    return { draft: true, query: false, preview: false, answering: context.questions.length > 0 };
+  };
+  const api = await start(db, undefined, undefined, undefined, undefined, model, identify);
+  const token = await login(api, 'a');
+  const send = async (draft, text) => {
+    const result = await agentPost(api, token, 'turns', agentInput(draft, text));
+    assert.equal(result.status, 202);
+    const turn = await waitForAgent(api, token, result.data.turnId);
+    assert.equal(turn.status, 'completed');
+    return turn;
+  };
+  for (const sample of proposalCases) {
+    current = sample;
+    const before = await putCustomers(api, token, await read(api, token), randomUUID(), customers);
+    const asked = await send(before, sample.statement);
+    checklist(asked, 'draft', { needs: true, unresolvedEdit: true });
+    assert.deepEqual(asked.events.find(event => event.kind === 'questions')?.payload.questions, [question]);
+    assert.equal(asked.events.some(event => event.kind === 'change'), false);
+    assert.deepEqual(await read(api, token), before);
+
+    const answered = await send(before, sample.answer);
+    checklist(answered, 'draft', { answering: true });
+    assert.equal(answered.events.some(event => event.kind === 'questions'), false);
+    assert.equal(answered.events.filter(event => event.kind === 'change').length, 1);
+    const expected = structuredClone(before);
+    expected.revision++;
+    expected.customers[1].items[0].quantity = sample.expected;
+    assert.deepEqual(await read(api, token), expected);
+  }
+  assert.deepEqual(calls, proposalCases.flatMap(({ statement, answer }) =>
+    [['intent', statement], ['edit', statement], ['intent', answer], ['edit', answer]]));
+});
+
 test('A1 accepts only the active confirmation option and applies the original removal once', { timeout: 30_000 }, async t => {
   const db = await isolatedDatabase(t);
   const model = async () => makeToolReply(a1.edit({ action: 'remove_line', target: 1 }));

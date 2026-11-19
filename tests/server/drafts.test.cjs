@@ -2199,6 +2199,51 @@ test('A1 validates direct buttons, persists the checklist, and leaves formal con
   assert.equal(restored.confirmedPreviewId, preview.previewId);
 });
 
+test('A1 resolves a server customer option directly and sends an open option to the model', { timeout: 30_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const calls = [];
+  const customerText = '给老王记两箱水饺';
+  const questionText = '老王还要三箱';
+  const answer = '加上3箱';
+  const model = async messages => {
+    const input = JSON.parse(messages[1].content);
+    calls.push(['edit', input.text]);
+    if (input.text === customerText) return makeToolReply(a1.edit(a1.add('老王', '水饺')));
+    if (input.text === questionText) return makeToolReply(a1.ask('老王', '水饺改成3箱还是加上3箱？', '改成3箱', answer));
+    assert.equal(input.text, answer);
+    assert.equal(input.previous.text, questionText);
+    assert.ok(input.previous.questions[0].options.includes(answer));
+    return makeToolReply(a1.edit({ action: 'update', target: 1, quantity: '5' }));
+  };
+  const identify = async text => {
+    calls.push(['intent', text]);
+    return { draft: true, query: false, preview: false, answering: false };
+  };
+  const api = await start(db, undefined, undefined, undefined, undefined, model, identify);
+  const token = await login(api, 'a');
+  await startingOrder(api, token, true);
+  const send = async (text, turnId) => {
+    const draft = await read(api, token);
+    const direct = turnId ? { intent: 'draft', turnId, answer: text } : undefined;
+    const submitted = await agentPost(api, token, 'turns', { ...agentInput(draft, text), direct });
+    assert.equal(submitted.status, 202);
+    const turn = await waitForAgent(api, token, submitted.data.turnId);
+    assert.equal(turn.status, 'completed');
+    return { ...turn, turnId: submitted.data.turnId };
+  };
+  const customer = await send(customerText);
+  const option = customer.events.find(event => event.kind === 'questions').payload.questions[0].options[0];
+  assert.match(option, /^客户 1/);
+  checklist(await send(option, customer.turnId), 'draft', { answering: true, direct: true });
+  assert.ok((await read(api, token)).customers[0].partyId);
+  const open = await send(questionText);
+  checklist(await send(answer, open.turnId), 'draft', { answering: true, direct: true });
+  assert.equal((await read(api, token)).customers[0].items[0].quantity, '5');
+  assert.deepEqual(calls, [
+    ['intent', customerText], ['edit', customerText], ['intent', questionText], ['edit', questionText], ['edit', answer],
+  ]);
+});
+
 test('A1 accepts only the active confirmation option and applies the original removal once', { timeout: 30_000 }, async t => {
   const db = await isolatedDatabase(t);
   const model = async () => makeToolReply(a1.edit({ action: 'remove_line', target: 1 }));

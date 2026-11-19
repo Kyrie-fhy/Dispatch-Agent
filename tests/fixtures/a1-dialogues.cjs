@@ -19,7 +19,7 @@ module.exports = {
     ] },
     { id: 'append', steps: [
       ['林记要四箱汤圆', read, edit(add('林记', '汤圆', '4'))],
-      ['林记再要3箱', read, ask('林记', '汤圆改成 3 箱还是追加 3 箱？', '改成 3 箱', '追加 3 箱')],
+      ['林记再要3箱', read, ask('林记', '汤圆改成 3 箱还是追加 3 箱？', '改成 3 箱', '加上 3 箱')],
       ['追加', read, edit({ action: 'update', target: 1, quantity: '7' })],
     ] },
     { id: 'same-name', steps: [

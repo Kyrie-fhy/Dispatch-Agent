@@ -22,6 +22,29 @@ function adminUrl() {
   return url;
 }
 
+const pause = (ms) => new Promise(done => setTimeout(done, ms));
+
+async function ensureSharedRole(admin) {
+  const hasRole = async () => (await admin.query("SELECT 1 FROM pg_roles WHERE rolname = 'dispatch_app'")).rowCount > 0;
+  if (await hasRole()) return;
+
+  // Yield on a fresh cluster so a concurrent server suite finishes creating dispatch_app in 001_drafts.sql without racing.
+  await pause(400);
+  const deadline = Date.now() + 5000;
+  while (!(await hasRole())) {
+    const { rowCount: peers } = await admin.query("SELECT 1 FROM pg_database WHERE datname LIKE 'dispatch_test_%'");
+    if (!peers || Date.now() >= deadline) break;
+    await pause(30);
+  }
+  if (await hasRole()) return;
+
+  try {
+    await admin.query('CREATE ROLE dispatch_app NOLOGIN');
+  } catch (error) {
+    if (error.constraint !== 'pg_authid_rolname_index' && error.code !== '42710') throw error;
+  }
+}
+
 async function isolatedDatabase(t, restore) {
   const url = adminUrl();
   const name = `dispatch_test_${randomBytes(8).toString('hex')}`;
@@ -38,6 +61,7 @@ async function isolatedDatabase(t, restore) {
       await admin.end();
     }
   });
+  await ensureSharedRole(admin);
   await admin.query(`CREATE DATABASE ${name} TEMPLATE template0`);
   await admin.query(`CREATE ROLE ${name} LOGIN PASSWORD '${password}'`);
   url.pathname = `/${name}`;

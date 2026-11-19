@@ -13,7 +13,8 @@ const { startLocalServer } = require('../../code/server-dist/server/main');
 const { configuredWechatLogin } = require('../../code/server-dist/server/wechat-login');
 const { configuredImageModel, configuredTextModel, imagePromptVersion, textPromptVersion } = require('../../code/server-dist/server/text-model');
 const { configuredSpeechModel } = require('../../code/server-dist/server/voice');
-const { agentTools, configuredAgentModel } = require('../../code/server-dist/server/agent/model');
+const { configuredAgentModel } = require('../../code/server-dist/server/agent/model');
+const { configuredIntentModel } = require('../../code/server-dist/server/agent/intent');
 const { HttpError } = require('../../code/server-dist/server/http-error');
 const s6 = require('../fixtures/s6-text-cases.cjs');
 const { materialChunkBytes } = require('../../code/server-dist/miniprogram/core/materials');
@@ -76,11 +77,12 @@ function runPostgresClient(tool, database, args, input) {
   return result.stdout;
 }
 
-async function start(db, wechat, textModel, imageModel, speechModel, agentModel) {
+async function start(db, wechat, textModel, imageModel, speechModel, agentModel,
+  intentModel = agentModel && (async () => ({ draft: true, preview: false, query: false }))) {
   const pool = db.pool();
   let server;
   try {
-    server = await startLocalServer(pool, 0, wechat, textModel, imageModel, speechModel, agentModel);
+    server = await startLocalServer(pool, 0, wechat, textModel, imageModel, speechModel, agentModel, intentModel);
   } catch (error) {
     await pool.end();
     throw error;
@@ -1853,30 +1855,98 @@ test('A1 restarts interrupted turns and keeps original messages', { timeout: 25_
 });
 
 const a1Live = process.env.DISPATCH_A1_EVAL_LIVE === '1';
-for (const scenario of a1.cases) {
+const { originalSamples, heldoutSamples } = require('../fixtures/a1-intents.cjs');
+const { existsSync } = require('node:fs');
+const localCasesPath = resolve(__dirname, '../fixtures/a1-heldout.local.json');
+const localCases = existsSync(localCasesPath) ? require(localCasesPath) : [];
+const intentLabel = ({ draft, query, preview }) =>
+  [draft && 'draft', query && 'query', preview && 'preview'].filter(Boolean).join('+') || 'other';
+const originalLabels = new Map(originalSamples().map(sample => [sample.id, intentLabel(sample.expected)]));
+const heldoutLabels = new Map(heldoutSamples(localCases).map(sample => [sample.id, intentLabel(sample.expected)]));
+
+const localAdd = (customer, product, quantity, unit, price) =>
+  a1.edit(a1.add(customer, product, quantity, { unit, ...(price ? { price } : {}) }));
+const update = (target, fields) => a1.edit({ action: 'update', target, ...fields });
+const localActions = {
+  'spoken-price': [localAdd('陈嫂', '小馄饨', '3', '箱', '8.5'), update(1, { quantity: '5' })],
+  'multiple-and-remove': [
+    a1.edit(a1.add('城西食堂', '肉丸', '23', { unit: '袋' }), a1.add('方婶', '粉条', '11', { unit: '袋' })),
+    a1.edit({ action: 'remove_line', target: 2 }),
+  ],
+  bundled: [localAdd('大刘', '年糕', '120', '袋', '82.5'), update(1, { quantity: '103' })],
+  'quantity-needs-clarification': [a1.ask('丁家快餐', '具体要多少包炸豆皮？'), localAdd('丁家快餐', '炸豆皮', '13', '包')],
+  'quantity-and-unit': [a1.ask('兴隆', '具体要多少袋奶黄包？'), localAdd('兴隆', '奶黄包', '32', '袋')],
+  'two-stores': [a1.edit(a1.add('小冯', '手抓饼', '2', { unit: '提' }), a1.add('黄叔', '糯米鸡', '26', { unit: '盒' }))],
+};
+
+function checklist(result, intent, { image, answering, direct, needs, unresolvedEdit } = {}) {
+  const plan = result.events.filter(event => event.kind === 'plan');
+  assert.equal(plan.length, 1);
+  const latest = Object.fromEntries(result.events.filter(event => event.kind === 'step').map(event => [event.payload.id, event.payload.state]));
+  const ids = ['intent'];
+  if (image) ids.push('image-0', 'merge', 'check');
+  if (intent.includes('draft')) ids.push(...(answering ? [] : ['read']), 'edit', 'check', 'summary');
+  if (intent.includes('query')) ids.push('query', 'answer');
+  if (intent.includes('preview')) ids.push('verify', 'preview', 'confirm', 'issued');
+  if (intent === 'other' && !image) ids.push('other');
+  assert.deepEqual(plan[0].payload.steps.map(step => step.id), ids);
+  assert.ok(result.events.filter(event => event.kind === 'step').every(event => event.seq > plan[0].seq));
+  assert.equal(plan[0].payload.steps[0].text, direct ? '已收到你的选择' : '看懂你的意思');
+  const expected = Object.fromEntries(ids.map(id => [id, 'done']));
+  if (needs && intent === 'other' && !image) Object.assign(expected, { intent: 'needs_input', other: 'needs_input' });
+  if (needs && intent.includes('draft')) {
+    expected.check = 'needs_input';
+    if (unresolvedEdit) expected.edit = 'needs_input';
+  }
+  if (ids.includes('preview')) {
+    if (needs) Object.assign(expected, { verify: intent.includes('draft') ? 'skipped' : 'needs_input',
+      preview: 'skipped', confirm: 'skipped', issued: 'skipped' });
+    else {
+      expected.confirm = 'needs_input';
+      delete expected.issued;
+    }
+  }
+  if (result.status === 'failed') {
+    for (const id of ids) expected[id] = id === 'intent' || id === 'read' ? 'done' : id === 'edit' ? 'failed' : 'skipped';
+  }
+  assert.deepEqual(latest, expected);
+}
+
+const newCases = [...a1.revisionCases, ...localCases.map(scenario => ({
+  id: `heldout/${scenario.id}`, heldout: scenario,
+  steps: scenario.turns.map((turn, index) => [turn.text, localActions[scenario.id]?.[index] ?? turn.fixture].filter(Boolean)),
+}))];
+for (const scenario of [...a1.cases, ...newCases]) {
   test(`A1 Harness: ${scenario.id}`, { timeout: 215_000 }, async t => {
-    assert.deepEqual(agentTools.map(tool => tool.function.name), [
-      'read_draft', 'list_customers', 'read_current_trip', 'edit_draft', 'import_image', 'ask_user', 'preview_trip',
-    ]);
     const liveModel = a1Live ? configuredAgentModel(process.env) : null;
-    if (a1Live) assert.ok(liveModel, '请配置 DISPATCH_TEXT_MODEL_KEY');
+    const liveIntent = a1Live ? configuredIntentModel(process.env, 'A') : null;
+    if (a1Live) assert.ok(liveModel && liveIntent, '请配置 DISPATCH_TEXT_MODEL_KEY');
     for (let sample = 1; sample <= (a1Live ? 3 : 1); sample++) {
       await t.test(`sample ${sample}`, async sampleTest => {
         const db = await isolatedDatabase(sampleTest);
-        let script = [];
-        const imageModel = a1Live ? configuredImageModel(process.env) : async () => ({
-          operations: [a1.add('老王', '水饺'), a1.add('小李', '水饺', '3')],
-        });
-        const agentModel = async (messages, signal, record) => {
+        let action;
+        let expectedIntent;
+        const imageModel = a1Live ? configuredImageModel(process.env) : async (_image, hooks) => {
+          hooks?.trace({ tool: 'extract_image', model: 'fixture', outcome: 'stop', promptVersion: 'fixture', elapsedMs: 0 });
+          return { operations: [a1.add('老王', '水饺'), a1.add('小李', '水饺', '3')] };
+        };
+        const agentModel = async (messages, signal, record, allowed) => {
           if (scenario.id === 'provider-failure') {
-            if (liveModel) return liveModel(messages, AbortSignal.abort(), record);
+            if (liveModel) return liveModel(messages, AbortSignal.abort(), record, allowed);
             throw new HttpError(502, 'agent_model_failed', '助手暂时没有完成，请重试。');
           }
-          if (liveModel) return liveModel(messages, signal, record);
-          if (!script.length) return { role: 'assistant', content: '已经整理，请核对。' };
-          return makeToolReply(script.shift());
+          if (liveModel) return liveModel(messages, signal, record, allowed);
+          if (action) {
+            assert.ok(allowed.includes(action[0]), 'step must expose only accepted tools');
+            return makeToolReply(action);
+          }
+          return { role: 'assistant', content: scenario.id === 'vague' || scenario.id === 'heldout/unclear'
+            ? '请说清楚这趟要做什么。' : '我可以帮你整理这趟订单。' };
         };
-        const api = await start(db, undefined, undefined, imageModel, undefined, agentModel);
+        const classify = liveIntent ?? (async () => ({
+          draft: expectedIntent.includes('draft'), preview: expectedIntent.includes('preview'), query: expectedIntent.includes('query'),
+        }));
+        const api = await start(db, undefined, undefined, imageModel, undefined, agentModel, classify);
         const token = await login(api, 'a');
         if (scenario.id === 'same-name') await startingOrder(api, token, true);
         if (scenario.seeded) await startingOrder(api, token);
@@ -1892,68 +1962,218 @@ for (const scenario of a1.cases) {
           assert.equal(uploaded.status, 200);
         }
         const results = [];
+        const errors = [];
+        const capture = action => { try { action(); } catch (error) { errors.push(error); } };
         for (const [step, commands] of scenario.steps.entries()) {
           const [text, ...tools] = commands;
+          expectedIntent = scenario.expected?.[step] ?? originalLabels.get(`${scenario.id}/${step + 1}`) ??
+            heldoutLabels.get(`${scenario.heldout?.id}/${step + 1}`) ?? 'other';
+          const lastResult = results.at(-1);
           const draft = await read(api, token);
-          script = [];
-          for (const tool of tools) {
-            if (tool === 'image') script.push(['import_image', { materialId: attachment }]);
-            else if (tool === 'pick') {
-              const { data } = await api.request('/v1/workspace', { token });
-              script.push(a1.edit({ action: 'set_customer', customerNumber: 1, partyId: data.parties[0].id }));
-            } else script.push(tool);
+          action = tools.find(tool => Array.isArray(tool) && ['edit_draft', 'ask_user'].includes(tool[0]));
+          if (tools.includes('pick')) {
+            action = a1.edit({ action: 'set_customer', customerNumber: 1, partyNumber: 1 });
           }
-          const submitted = await agentPost(api, token, 'turns', agentInput(draft, text, text ? [] : [attachment]));
+          if (scenario.id === 'same-name' && step === 0 && action) {
+            const ask = tools.find(tool => tool[0] === 'ask_user');
+            action = [action[0], { ...action[1], ...ask[1] }];
+          }
+          const direct = tools.includes('direct') ? { intent: 'draft', turnId: lastResult.turnId, answer: text } : undefined;
+          const submitted = await agentPost(api, token, 'turns', { ...agentInput(draft, text, text ? [] : [attachment]), direct });
+          if (submitted.status !== 202) sampleTest.diagnostic(JSON.stringify(submitted));
           assert.equal(submitted.status, 202);
-          const result = await waitForAgent(api, token, submitted.data.turnId);
+          const result = { ...await waitForAgent(api, token, submitted.data.turnId), turnId: submitted.data.turnId };
           results.push(result);
-          const traces = (await db.admin.query(`SELECT kind, payload FROM dispatch.agent_events WHERE turn_id = $1 ORDER BY seq`,
+          const traces = (await db.admin.query('SELECT kind, payload FROM dispatch.agent_events WHERE turn_id = $1 ORDER BY seq',
             [submitted.data.turnId])).rows;
           const models = traces.filter(trace => trace.kind === 'model').map(trace => trace.payload);
           const toolTrace = traces.filter(trace => trace.kind === 'tool').map(trace => trace.payload.name);
+          const intent = models.find(model => model.phase === 'intent')?.intents;
           sampleTest.diagnostic(JSON.stringify({ case: scenario.id, sample, step: step + 1, mode: a1Live ? 'live' : 'fixture',
-            status: result.status, wallMs: result.wallMs, modelCalls: models.length, models, tools: toolTrace,
-            summary: result.events.filter(event => ['change','questions','end'].includes(event.kind)).map(event => event.payload) }));
-          assert.ok(toolTrace.every(name => agentTools.some(tool => tool.function.name === name)));
-          assert.equal(result.status, ['provider-failure', 'injection'].includes(scenario.id) ? 'failed' : 'completed');
-          if (!a1Live && tools.length && Array.isArray(tools[0])) assert.equal(toolTrace[0], tools[0][0]);
+            status: result.status, wallMs: result.wallMs, modelCalls: models.length,
+            actualIntent: intent ? intentLabel(intent) : null, expectedIntent, models, tools: toolTrace,
+            summary: result.events.filter(event => ['change', 'questions', 'end'].includes(event.kind)).map(event => event.payload) }));
+          capture(() => {
+            if (text && !direct) assert.equal(intent && intentLabel(intent), expectedIntent);
+            else assert.equal(intent, undefined);
+            assert.ok(toolTrace.every(name => ['edit_draft', 'ask_user', 'import_image', 'preview_trip'].includes(name)));
+            assert.equal(result.status, scenario.id === 'provider-failure' ? 'failed' : 'completed');
+            const needs = scenario.heldout?.turns[step]?.ask ?? (
+              (scenario.id === 'append' && step === 1) || (scenario.id === 'same-name' && step === 0) ||
+              (scenario.id === 'oral-standard' && step === 3) || (scenario.id === 'oral-naked-price' && step === 0) ||
+              ['blocked-preview', 'vague'].includes(scenario.id));
+            assert.equal(result.events.some(event => event.kind === 'questions'), needs && expectedIntent !== 'other');
+            checklist(result, expectedIntent, { needs, unresolvedEdit: needs && scenario.id !== 'same-name', image: !text,
+              answering: !!lastResult?.events.some(event => event.kind === 'questions'), direct });
+          });
+          if (scenario.heldout) {
+            const current = await read(api, token);
+            for (const { customer, ...fields } of scenario.heldout.turns[step].draft) {
+              capture(() => assert.ok(current.customers.find(c => c.customer === customer)?.items.some(
+                item => Object.entries(fields).every(([key, value]) => item[key] === value)), JSON.stringify({ customer, ...fields })));
+            }
+          }
         }
         const after = await read(api, token);
         const last = results.at(-1);
         const candidate = last.events.find(event => event.kind === 'preview')?.payload.preview;
         const items = after.customers.flatMap(customer => customer.items);
         assert.equal((await db.admin.query('SELECT count(*)::int AS n FROM dispatch.trips')).rows[0].n, beforeCount);
-        if (scenario.id === 'standard') {
-          assert.equal(candidate?.totalCents, 16_400);
+        capture(() => {
+          if (scenario.id === 'standard') assert.equal(candidate?.totalCents, 16_400);
+          if (scenario.id === 'multiple') assert.deepEqual(after.customers.map(({ customer, items }) => [
+            customer, items.map(item => item.quantity)]), [['周记', ['1']], ['林记', ['4']]]);
+          if (scenario.id === 'append') {
+            assert.equal(results[1].events.some(event => event.kind === 'change'), false);
+            assert.equal(items[0].quantity, '7');
+            assert.match(last.events.find(event => event.kind === 'change')?.payload.lines.join(' '), /4\s*箱 → 7\s*箱/);
+          }
+          if (scenario.id === 'same-name') {
+            assert.ok(after.customers[0].partyId);
+            assert.ok(candidate?.previewId);
+          }
+          if (scenario.id === 'no-price') assert.equal(candidate?.customers[0].items[0].amountCents, null);
+          if (scenario.id === 'mixed') {
+            assert.ok(results[0].events.some(event => event.kind === 'change'));
+            assert.equal(after.customers.find(customer => customer.customer === '老王').items[0].price, '82');
+            assert.equal(candidate?.totalCents, 16_400);
+          }
+          if (['injection', 'mixed-injection'].includes(scenario.id)) assert.equal(items[0].price, '82');
+          if (scenario.id === 'mixed-injection') assert.equal(after.customers[1]?.items[0].product, '鱼丸');
+          if (['injection', 'provider-failure', 'vague', 'blocked-preview'].includes(scenario.id)) assert.deepEqual(after, before);
+          if (scenario.id === 'mixed-intent') assert.equal(candidate?.totalCents, 32_800);
+          if (scenario.id === 'oral-standard') {
+            assert.equal(items[0].quantity, '5');
+            assert.equal(items[0].price, '80');
+          }
+          if (['oral-naked-price', 'oral-price-reply'].includes(scenario.id)) assert.equal(items[0].price, scenario.id === 'oral-naked-price' ? '80' : '82');
+          if (scenario.id === 'words-in-order') assert.deepEqual(items.map(item => item.quantity), ['2', '4', '2']);
+        });
+        if (scenario.id === 'standard' && candidate) {
           const formal = await confirm(api, token, candidate.previewId, randomUUID());
           assert.equal(formal.status, 200);
           assert.deepEqual(formal.data.picking.map(row => [row.quantity, row.unit]), [[2, '箱']]);
-        } else if (scenario.id === 'multiple') {
-          assert.deepEqual(after.customers.map(({ customer, items }) => [customer, items.map(item => item.quantity)]),
-            [['周记', ['1']], ['林记', ['4']]]);
-        } else if (scenario.id === 'append') {
-          assert.ok(results[1].events.some(event => event.kind === 'questions'));
-          assert.equal(results[1].events.some(event => event.kind === 'change'), false);
-          assert.equal(items[0].quantity, '7');
-          assert.match(last.events.find(event => event.kind === 'change')?.payload.lines.join(' '), /4\s*箱 → 7\s*箱/);
-        } else if (scenario.id === 'same-name') {
-          assert.ok(results[0].events.some(event => event.kind === 'questions'));
-          assert.ok(after.customers[0].partyId);
-          assert.ok(candidate?.previewId);
-        } else if (scenario.id === 'no-price') {
-          assert.equal(candidate?.customers[0].items[0].price, null);
-          assert.equal(candidate?.customers[0].items[0].amountCents, null);
-          assert.ok(results.every(result => !result.events.some(event => event.kind === 'questions')));
-        } else if (scenario.id === 'mixed') {
-          assert.ok(results[0].events.some(event => event.kind === 'change'));
-          assert.equal(after.customers.find(customer => customer.customer === '老王').items[0].price, '82');
-          assert.equal(candidate?.totalCents, 16_400);
-        } else {
-          assert.deepEqual(after, before);
-          assert.match(last.events.at(-1).payload.text, /草稿没有变化/);
         }
-        await api.stop();
+        if (errors.length) throw new AggregateError(errors, errors.map(error => error.message).join('; '));
       });
     }
   });
 }
+
+test('A1 trip history pages by issue time with account isolation, missing prices and current delivery status', { timeout: 30_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const api = await start(db);
+  const token = await login(api, 'a');
+  const other = await login(api, 'b');
+  const issue = async (session, customer, price, advance = false) => {
+    const draft = await read(api, session);
+    const [owner] = draft.customers;
+    Object.assign(owner, { customer, partyId: null });
+    Object.assign(owner.items[0], { product: '水饺', quantity: '2', unit: '箱', price });
+    const saved = await putCustomers(api, session, draft, randomUUID(), draft.customers);
+    const candidate = await preview(api, session, saved, randomUUID());
+    assert.equal(candidate.status, 200);
+    const issued = await confirm(api, session, candidate.data.preview.previewId, randomUUID());
+    assert.equal(issued.status, 200);
+    if (advance) {
+      const result = await api.request('/v1/trips/next-draft', { method: 'POST', token: session,
+        body: { draftId: draft.id, requestId: randomUUID() } });
+      assert.equal(result.status, 200);
+    }
+    return { id: draft.id, sheet: owner.id };
+  };
+  const first = await issue(token, '老王', null, true);
+  const second = await issue(token, '周记', '82');
+  const their = await issue(other, '林记', '36');
+  const complete = await sheetEndpoint(api, token, second.id, second.sheet)('delivery/complete',
+    { version: 1, statusRevision: 0, requestId: randomUUID() });
+  assert.equal(complete.status, 200);
+  assert.equal((await api.request('/v1/trips')).status, 401);
+  assert.equal((await api.request('/v1/trips?limit=500', { token })).status, 400);
+  const recent = (await api.request('/v1/trips?limit=1', { token })).data;
+  assert.equal(recent.nextBefore, second.id);
+  assert.deepEqual(recent.trips.map(({ id, current, totalCents, delivered, customers, lines }) =>
+    ({ id, current, totalCents, delivered, customers, lines })),
+    [{ id: second.id, current: true, totalCents: 16400, delivered: 1, customers: 1, lines: 1 }]);
+  const earlier = (await api.request(`/v1/trips?limit=1&before=${recent.nextBefore}`, { token })).data;
+  assert.equal(earlier.nextBefore, null);
+  assert.deepEqual(earlier.trips.map(({ id, current, totalCents, pendingPrices }) => ({ id, current, totalCents, pendingPrices })),
+    [{ id: first.id, current: false, totalCents: 0, pendingPrices: 1 }]);
+  const old = (await api.request(`/v1/trips/${first.id}`, { token })).data;
+  assert.equal(old.trip.versions[0].customers[0].items[0].amountCents, null);
+  assert.equal(old.picking[0].quantity, 2);
+  assert.deepEqual((await api.request('/v1/trips', { token: other })).data.trips.map(trip => trip.id), [their.id]);
+  assert.equal((await api.request(`/v1/trips/${first.id}`, { token: other })).status, 404);
+  assert.deepEqual((await api.request(`/v1/trips?before=${their.id}`, { token })).data.trips, []);
+});
+
+test('A1 validates direct buttons, persists the checklist, and leaves formal confirmation to the existing API', { timeout: 30_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const api = await start(db);
+  const token = await login(api, 'a');
+  const draft = await startingOrder(api, token);
+  const input = agentInput(draft, '');
+  const invalid = await agentPost(api, token, 'turns', { ...input, direct: { intent: 'confirm' } });
+  assert.equal(invalid.status, 400);
+  assert.equal(invalid.data.error, 'invalid_agent_intent');
+  assert.equal((await agentPost(api, token, 'turns', { ...input, text: '改', direct: { intent: 'draft', turnId: randomUUID(), answer: '改' } })).status, 400);
+  const submitted = await agentPost(api, token, 'turns', { ...input, direct: { intent: 'preview' } });
+  assert.equal(submitted.status, 202);
+  const turn = await waitForAgent(api, token, submitted.data.turnId);
+  checklist(turn, 'preview', { direct: true });
+  assert.ok(turn.events.at(-1).payload.elapsedMs >= 0);
+  const { rows } = await db.admin.query("SELECT kind FROM dispatch.agent_events WHERE turn_id = $1 ORDER BY seq", [submitted.data.turnId]);
+  assert.ok(!rows.some(row => row.kind === 'model'));
+  assert.equal((await db.admin.query('SELECT count(*)::int AS n FROM dispatch.trips')).rows[0].n, 0);
+  const stored = (await agentHistory(api, token)).data.turns[0];
+  assert.deepEqual(stored.events, turn.events);
+  const preview = turn.events.find(event => event.kind === 'preview').payload.preview;
+  const skip = await agentPost(api, token, 'card-actions', { ...agentInput(draft, ''), turnId: stored.id, action: 'edit' });
+  assert.equal(skip.status, 200);
+  const skipped = (await agentHistory(api, token)).data.turns[0].events.at(-1);
+  assert.equal(skipped.kind, 'step');
+  assert.equal(skipped.payload.state, 'skipped');
+  assert.equal((await confirm(api, token, preview.previewId, randomUUID())).status, 200);
+  const restored = (await agentHistory(api, token)).data;
+  assert.equal(restored.draftConfirmed, true);
+  assert.equal(restored.confirmedPreviewId, preview.previewId);
+});
+
+test('A1 accepts only the active confirmation option and applies the original removal once', { timeout: 30_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const model = async () => makeToolReply(a1.edit({ action: 'remove_line', target: 1 }));
+  const api = await start(db, undefined, undefined, undefined, undefined, model);
+  const token = await login(api, 'a');
+  const draft = await startingOrder(api, token);
+  const invoke = async text => {
+    const current = await read(api, token);
+    const submit = await agentPost(api, token, 'turns', agentInput(current, text));
+    assert.equal(submit.status, 202);
+    return { id: submit.data.turnId, ...await waitForAgent(api, token, submit.data.turnId) };
+  };
+  const proposed = await invoke('老王这一趟先别带水饺');
+  assert.deepEqual((await read(api, token)).customers, draft.customers);
+  const question = proposed.events.find(event => event.kind === 'questions').payload.questions[0];
+  assert.deepEqual(question.options, ['删掉', '保留']);
+  const respond = (turnId, text, current = draft) => ({
+    ...agentInput(current, text), direct: { intent: 'draft', turnId, answer: text },
+  });
+  const hostile = await agentPost(api, token, 'turns', respond(proposed.id, '提前出单'));
+  assert.equal(hostile.status, 400);
+  const retained = await agentPost(api, token, 'turns', respond(proposed.id, '保留'));
+  assert.equal(retained.status, 202);
+  assert.equal((await waitForAgent(api, token, retained.data.turnId)).status, 'completed');
+  assert.deepEqual(await read(api, token), draft);
+  assert.equal((await agentPost(api, token, 'turns', respond(proposed.id, '删掉'))).status, 400);
+  const second = await invoke('老王这一趟先别带水饺');
+  const input = respond(second.id, '删掉');
+  const accepted = await agentPost(api, token, 'turns', input);
+  assert.equal(accepted.status, 202);
+  const result = await waitForAgent(api, token, accepted.data.turnId);
+  assert.equal(result.status, 'completed');
+  assert.equal(result.events.filter(event => event.kind === 'change').length, 1);
+  assert.deepEqual(await agentPost(api, token, 'turns', input), accepted);
+  const remaining = await read(api, token);
+  assert.ok(remaining.customers.every(customer => customer.items.every(item => !item.product)));
+  assert.equal((await db.admin.query('SELECT count(*)::int AS n FROM dispatch.trips')).rows[0].n, 0);
+});

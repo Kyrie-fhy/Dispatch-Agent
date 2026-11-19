@@ -1,5 +1,6 @@
 import { AgentRuntime } from './agent/runtime';
 import { AgentModel, configuredAgentModel } from './agent/model';
+import { configuredIntentModel, IntentModel } from './agent/intent';
 import { readTurnInput } from './agent/store';
 import { createServer, IncomingMessage, Server, ServerResponse } from 'node:http';
 import { Pool } from 'pg';
@@ -233,6 +234,16 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
     sendJson(response, 200, { draft: await trips.nextDraft(account, input) });
     return;
   }
+  if (method === 'GET' && path === '/v1/trips') {
+    const params = new URL(request.url ?? path, 'http://127.0.0.1').searchParams;
+    const before = params.get('before');
+    const limit = params.get('limit') ?? '20';
+    if ((before !== null && !uuidPattern.test(before)) || !/^[1-9]\d?$/.test(limit) || Number(limit) > 50) {
+      throw new HttpError(400, 'invalid_trip_page', '历史趟次分页参数不正确');
+    }
+    sendJson(response, 200, await trips.history(account, before, Number(limit)));
+    return;
+  }
   if (method === 'GET' && tripId) {
     sendJson(response, 200, await trips.trip(account, tripId));
     return;
@@ -287,7 +298,7 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
 }
 
 export async function startLocalServer(pool: Pool, port: number, wechat?: WechatLogin, textModel?: TextModel,
-  imageModel?: ImageModel, speechModel?: SpeechModel, agentModel?: AgentModel): Promise<Server> {
+  imageModel?: ImageModel, speechModel?: SpeechModel, agentModel?: AgentModel, intentModel?: IntentModel): Promise<Server> {
   await requireApplicationRole(pool);
   const store = new DraftStore(pool);
   const trips = new TripStore(pool);
@@ -296,7 +307,7 @@ export async function startLocalServer(pool: Pool, port: number, wechat?: Wechat
   const amendments = new AmendmentStore(pool);
   const materials = new MaterialStore(pool);
   const textOrders = new TextOrders(pool, textModel, imageModel);
-  const agent = new AgentRuntime(pool, trips, textOrders, agentModel);
+  const agent = new AgentRuntime(pool, trips, textOrders, agentModel, intentModel);
   await agent.store.interrupt();
   const server = createServer({ requestTimeout: 15_000 }, (request, response) => {
     void handle(pool, store, trips, delivery, ledger, amendments, materials, textOrders, agent, request, response, wechat, speechModel).catch(error => {
@@ -329,7 +340,8 @@ async function main(): Promise<void> {
   pool.on('error', () => console.error('PostgreSQL 空闲连接已断开，后续请求会重新连接'));
   try {
     const server = await startLocalServer(pool, port, wechat, configuredTextModel(process.env),
-      configuredImageModel(process.env), configuredSpeechModel(process.env), configuredAgentModel(process.env));
+      configuredImageModel(process.env), configuredSpeechModel(process.env), configuredAgentModel(process.env),
+      configuredIntentModel(process.env, 'A'));
     const stop = () => {
       server.close(() => { void pool.end(); });
       server.closeIdleConnections();

@@ -32,8 +32,19 @@ function copyAssets(directory) {
 copyAssets(source);
 const app = JSON.parse(fs.readFileSync(path.join(target, 'app.json'), 'utf8'));
 if (s5) {
-  app.pages = s6 ? ['pages/agent/index', 'pages/workspace/index'] : ['pages/workspace/index'];
-  delete app.tabBar;
+  if (s6) {
+    const tabs = [
+      { pagePath: 'pages/agent/index', text: '助手' },
+      { pagePath: 'pages/trip-picking/index', text: '取货' },
+      { pagePath: 'pages/trip-delivery/index', text: '送货' },
+      { pagePath: 'pages/history/index', text: '历史' },
+    ];
+    app.pages = [...tabs.map(tab => tab.pagePath), 'pages/workspace/index'];
+    app.tabBar.list = tabs;
+  } else {
+    app.pages = ['pages/workspace/index'];
+    delete app.tabBar;
+  }
   fs.writeFileSync(path.join(target, 'app.json'), `${JSON.stringify(app, null, 2)}\n`);
   if (s6 || origin) fs.writeFileSync(path.join(target, 'services/workspace-config.js'),
     `exports.apiOrigin = ${JSON.stringify(origin ?? 'http://127.0.0.1:8787')};\nexports.deliveryMvp = ${s6};\n`);

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { Pool, PoolClient } from 'pg';
-import type { AgentEvent, AgentStatus, AgentTurn, Question } from '../../miniprogram/core/agent';
+import type { AgentEvent, AgentStatus, AgentTurn, DirectIntent, Question } from '../../miniprogram/core/agent';
 import { isObject } from '../../miniprogram/core/orders';
 import { textOrderLimit } from '../../miniprogram/core/text-order';
 import type { TripDraft } from '../../miniprogram/core/trips';
@@ -9,16 +9,31 @@ import { setAccount, transaction } from '../database';
 import { HttpError } from '../http-error';
 import { readId, readPreviewInput, validRevision } from '../request-input';
 import { readable } from '../text-orders';
+import type { PreviousQuestions } from './edit';
 
 export function readTurnInput(value: unknown) {
   const basis = readPreviewInput(value);
-  const { text = '', materialIds = [] } = value as Record<string, unknown>;
-  if (!readable(text, textOrderLimit) || !Array.isArray(materialIds) || materialIds.length > 4 || (!text.trim() && !materialIds.length)) {
+  const { text = '', materialIds = [], direct: rawDirect } = value as Record<string, unknown>;
+  let direct: DirectIntent | undefined;
+  if (rawDirect !== undefined) {
+    if (!isObject(rawDirect)) throw invalidIntent();
+    if (rawDirect.intent === 'preview' && Object.keys(rawDirect).length === 1) direct = { intent: 'preview' };
+    else if (rawDirect.intent === 'draft' && Object.keys(rawDirect).length === 3 &&
+      readable(rawDirect.answer, 100) && rawDirect.answer.trim() && rawDirect.answer === text) {
+      direct = { intent: 'draft', turnId: readId(rawDirect.turnId, '问题回合编号'), answer: rawDirect.answer };
+    } else throw invalidIntent();
+  }
+  if (direct && Array.isArray(materialIds) && materialIds.length) throw invalidIntent();
+  if (!readable(text, textOrderLimit) || !Array.isArray(materialIds) || materialIds.length > 4 || (!direct && !text.trim() && !materialIds.length)) {
     throw new HttpError(400, 'invalid_agent_message', '请输入文字或选择最多 4 张已上传的图片');
   }
   const images = materialIds.map(id => readId(id, '图片编号'));
   if (new Set(images).size !== images.length) throw new HttpError(400, 'invalid_agent_message', '请移除重复图片');
-  return { ...basis, text: text.trim(), materialIds: images };
+  return { ...basis, text: direct?.intent === 'preview' ? '生成送货单' : text.trim(), materialIds: images, ...(direct ? { direct } : {}) };
+}
+
+function invalidIntent() {
+  return new HttpError(400, 'invalid_agent_intent', '这个选项无效，请从最新问题重新选择。');
 }
 
 export const cardActions = new Set(['answer', 'undo', 'confirm', 'edit', 'picking', 'next', 'workspace', 'retry']);
@@ -64,7 +79,7 @@ async function visibleEvents(client: PoolClient, account: string, id: string, af
   const { rows } = await client.query<AgentEvent>(`
     SELECT seq::float8, kind, payload FROM dispatch.agent_events
     WHERE account_id = $1 AND turn_id = $2 AND seq > $3
-      AND kind IN ('progress', 'questions', 'preview', 'change', 'undo', 'end') ORDER BY seq`, [account, id, after]);
+      AND kind IN ('progress', 'plan', 'step', 'questions', 'preview', 'change', 'undo', 'end') ORDER BY seq`, [account, id, after]);
   return rows;
 }
 
@@ -77,7 +92,25 @@ async function endTurn(client: PoolClient, key: TurnKey, status: Exclude<AgentSt
     [key.account, key.id, status]);
   await client.query(`INSERT INTO dispatch.agent_messages (account_id, turn_id, role, content)
     VALUES ($1, $2, 'assistant', $3)`, [key.account, key.id, message]);
-  await event(client, key, 'end', { status, text: message, revision: turn.endRevision, errorCode });
+  const { rows: [timing] } = await client.query<{ elapsedMs: number }>(
+    'SELECT greatest(0, round(extract(epoch FROM clock_timestamp() - created_at) * 1000))::float8 AS "elapsedMs" FROM dispatch.agent_turns WHERE account_id = $1 AND id = $2',
+    [key.account, key.id]);
+  await event(client, key, 'end', { status, text: message, revision: turn.endRevision, errorCode, elapsedMs: timing.elapsedMs });
+}
+
+async function previousQuestions(client: PoolClient, account: string, draftId: string, revision: number, exclude?: string) {
+  const { rows: [previous] } = await client.query<PreviousQuestions>(`
+    SELECT t.id AS "turnId", m.content AS text, e.payload, confirmation.payload AS confirmation
+    FROM dispatch.agent_turns t JOIN dispatch.agent_messages m
+      ON m.account_id = t.account_id AND m.turn_id = t.id AND m.role = 'user'
+    JOIN dispatch.agent_events e ON e.account_id = t.account_id AND e.turn_id = t.id AND e.kind = 'questions'
+    LEFT JOIN dispatch.agent_events confirmation
+      ON confirmation.account_id = t.account_id AND confirmation.turn_id = t.id AND confirmation.kind = 'edit_confirmation'
+    WHERE t.account_id = $1 AND t.end_revision = $4 AND NOT t.undone AND t.status = 'completed'
+      AND t.id = (SELECT id FROM dispatch.agent_turns WHERE account_id = $1 AND draft_id = $2
+        AND ($3::uuid IS NULL OR id <> $3) ORDER BY created_at DESC, id DESC LIMIT 1)
+    ORDER BY e.seq DESC LIMIT 1`, [account, draftId, exclude ?? null, revision]);
+  return previous;
 }
 
 export class AgentStore {
@@ -93,6 +126,13 @@ export class AgentStore {
           throw new HttpError(409, 'draft_confirmed', '本趟已确认，请开始下一趟或查看取货清单。');
         }
       } else checkDraft(workspace, draftId, revision);
+      if (input.direct?.intent === 'draft') {
+        const prior = await previousQuestions(client, account, draftId, revision);
+        const { turnId, answer } = input.direct;
+        if (prior?.turnId !== turnId || !prior.payload.questions.some(question => question.options.includes(answer))) {
+          throw invalidIntent();
+        }
+      }
       reserve();
       const active = await client.query(`SELECT 1 FROM dispatch.agent_turns WHERE account_id = $1 AND status = 'running'`, [account]);
       if (active.rowCount) throw new HttpError(429, 'agent_busy', '上一条消息正在处理，请稍等。');
@@ -130,31 +170,30 @@ export class AgentStore {
         ORDER BY t.created_at DESC, t.id DESC LIMIT 60`, [account, workspace.id]);
       const turns: AgentTurn[] = [];
       for (const row of rows.reverse()) turns.push({ ...row, events: await visibleEvents(client, account, row.id, 0) });
-      return { draftId: workspace.id, revision: workspace.revision, turns,
-        draft: workspaceDraft(workspace), draftConfirmed: workspace.currentTripId === workspace.id };
+      const draftConfirmed = workspace.currentTripId === workspace.id;
+      const issued = draftConfirmed ? await client.query<{ id: string }>(
+        'SELECT source_preview_id AS id FROM dispatch.trips WHERE account_id = $1 AND id = $2', [account, workspace.id]) : null;
+      return { draftId: workspace.id, revision: workspace.revision, turns, draft: workspaceDraft(workspace),
+        draftConfirmed, confirmedPreviewId: issued?.rows[0]?.id ?? null };
     });
   }
 
-  context(key: TurnKey) {
+  context(key: TurnKey, revision: number) {
     return readAccount(this.pool, key.account, async client => {
-      const { rows } = await client.query<{ role: 'user' | 'assistant'; content: string }>(`
-        SELECT m.role, m.content FROM dispatch.agent_turns t JOIN dispatch.agent_messages m
-          ON m.account_id = t.account_id AND m.turn_id = t.id
-        WHERE t.account_id = $1 AND t.draft_id = $2 AND t.id <> $3 AND t.status = 'completed' AND NOT t.undone
-        ORDER BY t.created_at DESC, t.id DESC, m.role ASC LIMIT 20`, [key.account, key.draftId, key.id]);
-      const { rows: [previous] } = await client.query<{ text: string; payload: { questions: Question[] } }>(`
-        SELECT m.content AS text, e.payload AS payload
-        FROM dispatch.agent_turns t JOIN dispatch.agent_messages m
-          ON m.account_id = t.account_id AND m.turn_id = t.id AND m.role = 'user'
-        JOIN dispatch.agent_events e ON e.account_id = t.account_id AND e.turn_id = t.id AND e.kind = 'questions'
-        WHERE t.account_id = $1 AND t.draft_id = $2 AND t.id <> $3 AND NOT t.undone
-          AND t.status = 'completed' AND t.end_revision = (
-            SELECT start_revision FROM dispatch.agent_turns WHERE account_id = $1 AND id = $3
-          )
-          AND t.id = (SELECT id FROM dispatch.agent_turns WHERE account_id = $1 AND draft_id = $2 AND id <> $3
-            ORDER BY created_at DESC, id DESC LIMIT 1)
-        ORDER BY e.seq DESC LIMIT 1`, [key.account, key.draftId, key.id]);
-      return { messages: rows.reverse(), previous };
+      const workspace = await readWorkspace(client, key.account);
+      if (workspace.id !== key.draftId || workspace.revision !== revision) checkDraft(workspace, key.draftId, revision);
+      const { rows: [last] } = await client.query<{ seen: boolean; changed: boolean; asked: boolean; previewed: boolean }>(`
+        SELECT count(*) > 0 AS seen, coalesce(bool_or(e.kind = 'change'), false) AS changed,
+          coalesce(bool_or(e.kind = 'questions'), false) AS asked,
+          coalesce(bool_or(e.kind = 'preview'), false) AS previewed
+        FROM dispatch.agent_events e WHERE e.account_id = $1 AND e.turn_id = (
+          SELECT id FROM dispatch.agent_turns WHERE account_id = $1 AND draft_id = $2 AND id <> $3
+          ORDER BY created_at DESC, id DESC LIMIT 1
+        )`, [key.account, key.draftId, key.id]);
+      const previous = await previousQuestions(client, key.account, key.draftId, revision, key.id);
+      const lastSummary = previous && last.asked ? '有草稿问题待确认。' : last.previewed ? '已生成送货单预览。'
+        : last.changed ? '本趟草稿已整理。' : last.seen ? '草稿没有变化。' : '';
+      return { draft: workspaceDraft(workspace), previous, lastSummary };
     });
   }
 
@@ -181,7 +220,13 @@ export class AgentStore {
         const { rows: running } = await client.query<{ id: string; draft_id: string }>(
           "SELECT id, draft_id FROM dispatch.agent_turns WHERE account_id = $1 AND status = 'running'", [account]);
         for (const turn of running) {
-          await endTurn(client, { account, draftId: turn.draft_id, id: turn.id }, 'interrupted', '服务重启，上一轮已中断，可以重试。');
+          const key = { account, draftId: turn.draft_id, id: turn.id };
+          const { rows: [step] } = await client.query<{ id: string; state: string }>(`
+            SELECT payload->>'id' AS id, payload->>'state' AS state FROM dispatch.agent_events
+            WHERE account_id = $1 AND turn_id = $2 AND kind = 'step' ORDER BY seq DESC LIMIT 1`, [account, turn.id]);
+          if (step?.state === 'running') await event(client, key, 'step',
+            { id: step.id, state: 'failed', result: '服务重启，处理已中断。' });
+          await endTurn(client, key, 'interrupted', '服务重启，上一轮已中断，可以重试。');
         }
       });
     }
@@ -212,11 +257,21 @@ export class AgentStore {
       throw new HttpError(400, 'invalid_card_action', '卡片操作无效');
     }
     const action = value.action;
-    return writeAccount(this.pool, account, basis.requestId, { ...basis, action: 'agent-card', card: action }, async (client, workspace) => {
+    const turnId = action === 'edit' && value.turnId !== undefined ? readId(value.turnId, '预览回合编号') : undefined;
+    return writeAccount(this.pool, account, basis.requestId, { ...basis, action: 'agent-card', card: action, turnId }, async (client, workspace) => {
       if (workspace.id !== basis.draftId) {
         const previous = await client.query('SELECT 1 FROM dispatch.trips WHERE account_id = $1 AND id = $2',
           [account, basis.draftId]);
         if (!previous.rowCount) throw missingDraft();
+      }
+      if (turnId) {
+        const turn = await getTurn(client, account, turnId);
+        if (turn.draftId !== basis.draftId || turn.status !== 'completed') throw invalidIntent();
+        const preview = await client.query(`SELECT 1 FROM dispatch.agent_events
+          WHERE account_id = $1 AND turn_id = $2 AND kind = 'preview'`, [account, turnId]);
+        if (!preview.rowCount) throw invalidIntent();
+        await event(client, { account, id: turnId, draftId: basis.draftId }, 'step',
+          { id: 'confirm', state: 'skipped', result: '修改完成后请重新生成预览。' });
       }
       await client.query(`INSERT INTO dispatch.agent_events (account_id, draft_id, kind, payload)
         VALUES ($1, $2, 'card', $3)`, [account, basis.draftId, JSON.stringify({ action })]);

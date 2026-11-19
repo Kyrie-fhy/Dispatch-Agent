@@ -185,6 +185,7 @@ type ApplyHooks = {
   signal: AbortSignal;
   trace: (trace: ModelTrace) => void;
   saved: (client: PoolClient, draft: TripDraft, digest: string) => Promise<void>;
+  recognized?: { digest: string; output: unknown };
 };
 
 function checkBasis(current: Workspace, input: Input) {
@@ -214,6 +215,15 @@ export class TextOrders {
 
   importImage(account: string, input: ReturnType<typeof readImageOrder>, checkSession: () => Promise<unknown>, hooks: ApplyHooks) {
     return this.organize(account, input, checkSession, hooks);
+  }
+
+  async recognizeImage(account: string, input: ReturnType<typeof readImageOrder>, hooks: Pick<ApplyHooks, 'signal' | 'trace'>) {
+    const picture = await readAccount(this.pool, account, async client => {
+      checkBasis(await readWorkspace(client, account), input);
+      return readOrderImage(client, account, input.draftId, input.materialId);
+    });
+    if (!this.imageModel) throw new HttpError(503, 'image_model_unavailable', '图片识别暂未开启。图片已保留，可以先手动填写。');
+    return { digest: picture.digest, output: await this.imageModel({ content: picture.content, mime: picture.mime }, hooks) };
   }
 
   private async organize(account: string, input: Input, checkSession: () => Promise<unknown>, hooks?: ApplyHooks)
@@ -248,7 +258,10 @@ export class TextOrders {
       const { picture } = snapshot;
       if (image) {
         if (!this.imageModel || !picture) throw new HttpError(503, 'image_model_unavailable', '图片识别暂未开启。图片已保留，可以先手动填写。');
-        output = await this.imageModel({ content: picture.content, mime: picture.mime }, hooks);
+        if (hooks?.recognized) {
+          if (hooks.recognized.digest !== picture.digest) throw new HttpError(409, 'material_changed', '图片已变化，请重新选择。');
+          output = hooks.recognized.output;
+        } else output = await this.imageModel({ content: picture.content, mime: picture.mime }, hooks);
       } else {
         if (!this.model) throw new HttpError(503, 'text_model_unavailable', '文字整理暂未开启。可以保留原文，先手动填写草稿。');
         const current = targetRows(snapshot.draft).map(({ customer, item }, index) =>

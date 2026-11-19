@@ -1,46 +1,86 @@
-import type { AgentEvent, AgentStatus, AgentTurn } from '../../core/agent';
+import type { AgentEvent, AgentStatus, AgentTurn, DirectIntent, PlanStep, StepState } from '../../core/agent';
 import { materialImagePattern, Material, MaterialSource } from '../../core/materials';
-import { textOrderLimit } from '../../core/text-order';
+import { textOrderLimit, textOrderQuestions } from '../../core/text-order';
 import type { TripDraft } from '../../core/trips';
 import { agentSession } from '../../services/agent-session';
 import { newId } from '../../services/ids';
 import { chooseMaterial, forgetStaged, materialInfo, sameMaterial, stagedMaterials, stageMaterial,
   transferMaterial } from '../../services/materials';
 import { readVoiceFile, startVoiceRecording, transcribeVoice, VoiceFileError } from '../../services/voice';
-import { FormalTrip, revokeSession, wechatCode, WorkspaceError, workspaceRequest } from '../../services/workspace';
-import { errorMessage, tripView } from '../order-view';
+import { revokeSession, wechatCode, WorkspaceError, workspaceRequest } from '../../services/workspace';
+import { errorMessage, productLabel, tripView } from '../order-view';
 
-type Conversation = { draft: TripDraft; draftConfirmed: boolean; turns: AgentTurn[] };
+type Conversation = { draft: TripDraft; draftConfirmed: boolean; confirmedPreviewId?: string | null; turns: AgentTurn[] };
 type PollResult = { status: AgentStatus; events: AgentEvent[] };
 type Attachment = { id: string; name: string };
 type VoiceFile = { draft: TripDraft; path: string };
 const draftConflicts = ['draft_changed', 'draft_confirmed', 'draft_not_found', 'preview_not_found', 'material_draft_changed'];
 const imageLimit = 4;
 
-function view(turn: AgentTurn, revision: number, confirmed: boolean, last: boolean, dismissed: string) {
-  const progress = new Map<number, { text: string; done: boolean; step: number }>();
+const stepIcon: Record<StepState, string> = { pending: '○', running: '', done: '✓', needs_input: '！', failed: '✗', skipped: '–' };
+type StepView = PlanStep & { state: StepState; result?: string };
+
+function view(turn: AgentTurn, revision: number, confirmed: boolean, last: boolean, latestPreview: boolean, confirmedPreviewId: string) {
+  let plan: PlanStep[] = [];
+  const progress = new Map<string, StepView>();
   const changes: string[] = [];
   let undone = false;
   let end: Extract<AgentEvent, { kind: 'end' }>['payload'] | undefined;
   let preview: Extract<AgentEvent, { kind: 'preview' }>['payload']['preview'] | undefined;
   let questions: Extract<AgentEvent, { kind: 'questions' }>['payload']['questions'] = [];
   for (const event of turn.events) {
-    if (event.kind === 'progress') progress.set(event.payload.step, event.payload);
+    if (event.kind === 'plan') plan = event.payload.steps;
+    if (event.kind === 'step') {
+      const previous = progress.get(event.payload.id);
+      progress.set(event.payload.id, { text: previous?.text ?? '', ...event.payload });
+    }
+    if (event.kind === 'progress') {
+      const { step, text, done } = event.payload;
+      progress.set(String(step), { id: String(step), text, state: done ? 'done' : 'running' });
+    }
     if (event.kind === 'preview') preview = event.payload.preview;
     if (event.kind === 'end') end = event.payload;
     if (event.kind === 'change') changes.push(...event.payload.lines);
     if (event.kind === 'undo') undone = true;
     if (event.kind === 'questions') questions = event.payload.questions;
   }
-  const showPreview = turn.id !== dismissed;
-  return { id: turn.id, text: turn.text, pictures: turn.materialIds.length, progress: [...progress.values()], questions, changes, undone,
-    status: turn.status, reply: questions.length && end?.status === 'completed' ? '' : end?.text ?? '',
-    canAnswer: last && !confirmed && !undone && turn.status === 'completed',
+  const issued = Boolean(latestPreview && confirmed && preview && preview.previewId === confirmedPreviewId);
+  const skipped = Boolean(preview && !issued &&
+    (progress.get('confirm')?.state === 'skipped' || preview.revision !== revision || confirmed));
+  if (issued || skipped) {
+    progress.set('confirm', { id: 'confirm', text: '', state: issued ? 'done' : 'skipped',
+      result: issued ? '已确认' : '修改完成后请重新生成预览。' });
+    progress.set('issued', { id: 'issued', text: '', state: issued ? 'done' : 'skipped' });
+  }
+  if (!plan.length) plan = progress.size ? [...progress.values()] : turn.status === 'running' ?
+    [{ id: 'intent', text: '看懂你的意思' }] : [];
+  const checklist = plan.map(item => {
+    const stored = progress.get(item.id);
+    const state = stored?.state ?? (turn.status === 'running' ? (!progress.size && item.id === 'intent' && !turn.events.length ? 'running' : 'pending')
+      : turn.status === 'completed' && !skipped ? 'pending' : 'skipped');
+    return { ...item, state, icon: stepIcon[state], result: stored?.result ?? '' };
+  });
+  return { id: turn.id, text: turn.text, pictures: turn.materialIds.length, checklist, questions, changes, undone, issued,
+    status: turn.status, reply: changes.length && end?.text === '草稿已更新。' ? '' : end?.text ?? '',
+    elapsed: end?.elapsedMs === undefined ? '' : `用时 ${Math.max(1, Math.round(end.elapsedMs / 1000))} 秒`,
+    canAnswer: last && !confirmed && !undone && turn.status === 'completed' && end?.revision === revision,
     canRetry: last && (turn.status === 'failed' || turn.status === 'interrupted'),
     canUndo: !confirmed && !undone && !!changes.length && end?.revision === revision && turn.status !== 'running',
-    preview: preview && showPreview ? { ...tripView(preview), id: preview.previewId,
-      active: last && !confirmed && preview.revision === revision && turn.status === 'completed' } : null,
+    preview: preview ? { ...tripView(preview), id: preview.previewId,
+      active: !skipped && latestPreview && !confirmed && turn.status === 'completed' } : null,
   };
+}
+
+function draftSummary(draft: TripDraft, pending: number) {
+  const customers = draft.customers.map(customer => ({
+    id: customer.id, name: customer.customer || '未命名客户',
+    lines: customer.items.filter(line => line.product || line.quantity || line.price || line.brand || line.specification)
+      .map(line => ({ id: line.id, product: productLabel(line) || '未命名货品', quantity: line.quantity, unit: line.unit,
+        price: line.price ? '¥' + line.price : '待补价' })),
+  })).filter(customer => customer.lines.length);
+  const lines = customers.reduce((sum, customer) => sum + customer.lines.length, 0);
+  const issues = pending || (lines ? textOrderQuestions(draft).reduce((sum, customer) => sum + customer.issues.length, 0) : 0);
+  return { customers, label: `本趟草稿 · ${customers.length} 家 ${lines} 行${issues ? `，${issues} 处待确认` : ''}` };
 }
 
 Page({
@@ -49,14 +89,14 @@ Page({
     turns: [] as ReturnType<typeof view>[], attachments: [] as Attachment[], pendingMaterial: '', uploadLabel: '',
     draftsAvailable: false, scrollTo: '', voicePhase: '', voiceRetry: false,
     readyImages: [] as Attachment[], uploadRows: [] as (MaterialSource & { id?: string; local: boolean })[],
-    picking: [] as FormalTrip['picking'], pickingCount: 0, showPicking: false, revokeFailed: false,
+    draftStrip: null as ReturnType<typeof draftSummary> | null, draftExpanded: false, issuedCard: false, revokeFailed: false,
   },
   draft: null as TripDraft | null,
   turns: [] as AgentTurn[],
   generation: 0,
   visible: false,
   timer: null as ReturnType<typeof setTimeout> | null,
-  dismissedPreview: '',
+  confirmedPreviewId: '',
   pending: new Map<string, string>(),
   voiceCapture: null as ReturnType<typeof startVoiceRecording> | null,
   voiceFile: null as VoiceFile | null,
@@ -96,10 +136,10 @@ Page({
     this.turns = [];
     this.pending.clear();
     this.voiceFile = null;
-    this.dismissedPreview = '';
+    this.confirmedPreviewId = '';
     this.setData({ signedIn: false, busy: false, polling: false, confirmed: false, draftsAvailable: false,
       error: '', text: '', turns: [], attachments: [], readyImages: [], uploadRows: [], pendingMaterial: '',
-      scrollTo: '', picking: [], pickingCount: 0, showPicking: false, voiceRetry: false, revokeFailed: !!this.retiredToken });
+      scrollTo: '', draftStrip: null, draftExpanded: false, issuedCard: false, voiceRetry: false, revokeFailed: !!this.retiredToken });
   },
 
   async run(action: () => Promise<void>) {
@@ -143,34 +183,33 @@ Page({
     });
   },
 
-  refresh() { return this.run(() => this.reload()); },
-
   async reload(): Promise<void> {
     const token = agentSession.token;
     if (!token) return;
     const generation = this.generation;
-    const { draft, draftConfirmed, turns } = await workspaceRequest<Conversation>('GET', '/agent/conversation', token);
-    if (generation !== this.generation) return;
+    const { draft, draftConfirmed, confirmedPreviewId, turns } = await workspaceRequest<Conversation>('GET', '/agent/conversation', token);
+    if (generation !== this.generation || token !== agentSession.token) return;
     const sameTrip = !this.draft || this.draft.id === draft.id;
     this.draft = draft;
     this.turns = turns;
+    this.confirmedPreviewId = confirmedPreviewId ?? '';
     const active = this.turns.find(turn => turn.status === 'running');
     this.setData({ confirmed: draftConfirmed, draftsAvailable: true, polling: !!active,
-      ...(!sameTrip ? { attachments: [], readyImages: [], uploadRows: [], showPicking: false, pendingMaterial: '' } : {}),
-      ...(!draftConfirmed ? { picking: [], pickingCount: 0 } : {}) });
+      ...(!sameTrip ? { attachments: [], readyImages: [], uploadRows: [], draftExpanded: false, pendingMaterial: '' } : {}) });
     this.render();
     if (active) this.schedule();
-    if (draftConfirmed) {
-      const { picking } = await workspaceRequest<FormalTrip>('GET', `/trips/${draft.id}`, token);
-      if (generation === this.generation) this.setData({ picking, pickingCount: picking.length });
-    }
+
   },
 
   render() {
     const revision = this.draft?.revision ?? -1;
+    const preview = [...this.turns].reverse().find(turn => turn.events.some(event => event.kind === 'preview') &&
+      !turn.events.some(event => event.kind === 'step' && event.payload.id === 'confirm' && event.payload.state === 'skipped'));
     const turns = this.turns.map((turn, index) => view(turn, revision, this.data.confirmed,
-      index === this.turns.length - 1, this.dismissedPreview));
-    this.setData({ turns, scrollTo: '' });
+      index === this.turns.length - 1, preview?.id === turn.id, this.confirmedPreviewId));
+    const recent = turns[turns.length - 1];
+    this.setData({ turns, scrollTo: '', issuedCard: turns.some(turn => turn.issued),
+      draftStrip: this.draft && draftSummary(this.draft, recent?.canAnswer ? recent.questions.length : 0) });
     this.setData({ scrollTo: 'latest' });
   },
 
@@ -192,7 +231,7 @@ Page({
     try {
       const after = turn.events[turn.events.length - 1]?.seq ?? 0;
       const result = await workspaceRequest<PollResult>('GET', `/agent/turns/${turn.id}/events?after=${after}`, token);
-      if (generation !== this.generation || this.turns.find(item => item.id === turn.id) !== turn) return;
+      if (generation !== this.generation || token !== agentSession.token || this.turns.find(item => item.id === turn.id) !== turn) return;
       turn.events.push(...result.events);
       turn.status = result.status;
       this.setData({ polling: result.status === 'running', error: '' });
@@ -202,7 +241,10 @@ Page({
     } catch (error) {
       if (generation !== this.generation) return;
       this.showError(error);
-      if (agentSession.token) this.setData({ error: `${errorMessage(error)}。消息仍在，可点刷新对话恢复进度。` });
+      if (agentSession.token) {
+        this.setData({ error: `${errorMessage(error)}。正在尝试恢复进度。` });
+        this.schedule();
+      }
     }
   },
 
@@ -230,39 +272,51 @@ Page({
     void workspaceRequest('POST', '/agent/card-actions', agentSession.token, { action, requestId: newId(), draftId, revision }).catch(() => {});
   },
 
-  send() {
+  send(): Promise<void> | undefined {
+    return this.submit(this.data.text.trim(), this.data.attachments.map(item => item.id));
+  },
+
+  previewShortcut(): Promise<void> | undefined {
+    return this.submit('生成送货单', [], { intent: 'preview' });
+  },
+
+  toggleDraft(): void { this.setData({ draftExpanded: !this.data.draftExpanded }); },
+
+  submit(text: string, materialIds: string[], direct?: DirectIntent): Promise<void> | undefined {
     const draft = this.draft;
-    const text = this.data.text.trim();
-    const materialIds = this.data.attachments.map(item => item.id);
-    if (!draft || !agentSession.token || this.data.polling || (!text && !materialIds.length)) return;
+    if (!draft || !agentSession.token || this.data.busy || this.data.polling || (!text && !materialIds.length)) return;
+    const local: AgentTurn = { id: 'sending', text, materialIds, revision: draft.revision, events: [], status: 'running' };
+    this.turns.push(local);
+    this.render();
     return this.run(async () => {
       const generation = this.generation;
+      const token = agentSession.token;
       try {
         const { turnId } = await this.request<{ turnId: string }>('/agent/turns',
-          { draftId: draft.id, revision: draft.revision, text, materialIds });
-        if (generation !== this.generation) return;
-        if (!this.turns.some(turn => turn.id === turnId)) this.turns.push({ id: turnId, text, materialIds,
-          revision: draft.revision, events: [], status: 'running' });
-        this.setData({ text: '', attachments: [], readyImages: [], polling: true });
+          { draftId: draft.id, revision: draft.revision, text, materialIds, ...(direct ? { direct } : {}) });
+        if (generation !== this.generation || token !== agentSession.token) return;
+        this.turns = this.turns.filter(turn => turn !== local);
+        if (!this.turns.some(turn => turn.id === turnId)) this.turns.push({ ...local, id: turnId });
+        this.setData({ ...(!direct ? { text: '', attachments: [], readyImages: [] } : {}), polling: true });
         this.render();
         this.schedule();
       } catch (error) {
-        if (generation === this.generation && error instanceof WorkspaceError && draftConflicts.includes(error.code)) await this.reload();
+        if (generation === this.generation && token === agentSession.token) {
+          this.turns = this.turns.filter(turn => turn !== local);
+          this.render();
+          if (error instanceof WorkspaceError && draftConflicts.includes(error.code)) await this.reload();
+        }
         throw error;
       }
     });
   },
 
-  answer(event: WechatMiniprogram.TouchEvent) {
-    if (this.data.busy || this.data.polling) return;
-    const text = String(event.currentTarget.dataset.option ?? '');
-    if (this.data.text.trim() || this.data.attachments.length) {
-      this.setData({ error: '输入框已有内容，请先发送或清空。' });
-      return;
-    }
+  answer(event: WechatMiniprogram.TouchEvent): Promise<void> | undefined {
+    const { option, turn } = event.currentTarget.dataset;
+    const parent = this.data.turns.find(item => item.id === turn && item.canAnswer);
+    if (!parent || typeof option !== 'string' || !parent.questions.some(question => question.options.includes(option))) return;
     this.card('answer');
-    this.setData({ text });
-    return this.send();
+    return this.submit(option, [], { intent: 'draft', turnId: parent.id, answer: option });
   },
 
   retry(event: WechatMiniprogram.TouchEvent) {
@@ -289,13 +343,12 @@ Page({
     this.card('confirm');
     return this.run(async () => {
       try {
-        const { picking } = await this.request<FormalTrip>('/trips/confirm', { previewId });
-        this.setData({ confirmed: true, picking, pickingCount: picking.length });
+        await this.request('/trips/confirm', { previewId });
+        this.confirmedPreviewId = previewId;
+        this.setData({ confirmed: true });
         this.render();
       } catch (error) {
         if (error instanceof WorkspaceError && draftConflicts.includes(error.code)) {
-          this.dismissedPreview = turn.id;
-          this.render();
           await this.reload();
           if (!this.data.confirmed) this.setData({ text: this.data.text || '生成送货单' });
         }
@@ -305,9 +358,13 @@ Page({
   },
 
   continueEditing(event: WechatMiniprogram.TouchEvent) {
-    this.card('edit');
-    this.dismissedPreview = String(event.currentTarget.dataset.turn ?? '');
-    this.render();
+    const draft = this.draft;
+    if (!draft || this.data.polling || !this.data.turns.some(turn => turn.id === event.currentTarget.dataset.turn && turn.preview?.active)) return;
+    return this.run(async () => {
+      await this.request('/agent/card-actions', { action: 'edit', draftId: draft.id, revision: draft.revision,
+        turnId: event.currentTarget.dataset.turn });
+      await this.reload();
+    });
   },
 
   openWorkspace() {
@@ -318,18 +375,7 @@ Page({
 
   showPickingList() {
     this.card('picking');
-    this.setData({ showPicking: true });
-    this.render();
-  },
-
-  nextTrip() {
-    if (!this.draft || !this.data.confirmed || this.data.polling) return;
-    const draftId = this.draft.id;
-    this.card('next');
-    return this.run(async () => {
-      await this.request('/trips/next-draft', { draftId });
-      await this.reload();
-    });
+    wx.switchTab({ url: '/pages/trip-picking/index' });
   },
 
   chooseImage(event: WechatMiniprogram.TouchEvent) {

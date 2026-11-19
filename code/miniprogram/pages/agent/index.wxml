@@ -7,75 +7,87 @@
     <text wx:if="{{error}}" class="error">{{error}}</text>
   </view>
   <block wx:else>
-    <view class="toolbar">
-      <button size="mini" bindtap="openWorkspace" disabled="{{busy}}">打开表单手动改</button>
-      <button size="mini" bindtap="refresh" disabled="{{busy}}">刷新对话</button>
-      <button size="mini" bindtap="logout" disabled="{{busy}}">退出</button>
+    <view class="draft-strip" wx:if="{{draftStrip}}">
+      <view class="draft-header">
+        <button size="mini" class="draft-toggle" bindtap="toggleDraft">{{draftStrip.label}} {{draftExpanded ? '▴' : '▾'}}</button>
+        <button wx:if="{{!confirmed}}" size="mini" bindtap="openWorkspace" disabled="{{busy}}">手动改</button>
+      </view>
+      <scroll-view wx:if="{{draftExpanded}}" scroll-y class="draft-detail">
+        <view wx:for="{{draftStrip.customers}}" wx:for-item="customer" wx:key="id" class="detail">
+          <text class="card-title">{{customer.name}}</text>
+          <view class="preview-line" wx:for="{{customer.lines}}" wx:for-item="line" wx:key="id">
+            <text>{{line.product}} {{line.quantity}} {{line.unit}}</text><text>{{line.price}}</text>
+          </view>
+        </view>
+        <text wx:if="{{!draftStrip.customers.length}}" class="muted">草稿里还没有货品</text>
+      </scroll-view>
     </view>
     <scroll-view scroll-y class="conversation" scroll-into-view="{{scrollTo}}">
       <view wx:if="{{!turns.length && !confirmed}}" class="welcome">
         <text class="title">这趟送什么？</text>
-        <text class="muted">可以连着发几条。录完后说「生成送货单」。</text>
+        <text class="muted">发文字、图片或语音，录完后可以生成送货单。</text>
       </view>
       <view wx:for="{{turns}}" wx:for-item="turn" wx:key="id" class="turn">
-        <view class="user bubble">
-          <text wx:if="{{turn.text}}">{{turn.text}}</text>
-          <text wx:if="{{turn.pictures}}" class="inline">{{turn.pictures}} 张图片</text>
-        </view>
-        <view wx:if="{{turn.progress.length || turn.status === 'running'}}" class="card progress">
-          <text wx:if="{{!turn.progress.length}}">正在处理这条消息…</text>
-          <view wx:for="{{turn.progress}}" wx:key="step" class="progress-row">
-            <text class="{{item.done ? 'check' : 'waiting'}}">{{item.done ? '✓' : (turn.status === 'running' ? '·' : '–')}}</text>
-            <text>{{item.text}}{{item.done ? '' : (turn.status === 'running' ? '…' : '未完成')}}</text>
+        <view class="user-row">
+          <view class="user bubble">
+            <text wx:if="{{turn.text}}">{{turn.text}}</text>
+            <text wx:if="{{turn.pictures}}" class="inline">{{turn.pictures}} 张图片</text>
           </view>
+          <view class="avatar mine">我</view>
         </view>
-        <view wx:if="{{turn.reply}}" class="assistant bubble">{{turn.reply}}</view>
-        <view wx:if="{{turn.questions.length}}" class="card question">
-          <text class="card-title">有 {{turn.questions.length}} 个问题要确认</text>
-          <view wx:for="{{turn.questions}}" wx:for-item="question" wx:key="text" class="detail">
-            <text>{{question.customer ? question.customer + ' · ' : ''}}{{question.text}}</text>
-            <view wx:if="{{turn.canAnswer}}" class="actions">
-              <button wx:for="{{question.options}}" wx:for-item="option" wx:key="*this" size="mini" disabled="{{busy || polling}}"
-                data-option="{{option}}" bindtap="answer">{{option}}</button>
+        <view class="assistant-row" wx:if="{{turn.checklist.length || turn.reply || turn.changes.length || turn.questions.length || turn.preview || turn.canRetry}}">
+          <view class="avatar helper">✦</view>
+          <view class="assistant-content">
+            <text class="assistant-name">录单助手</text>
+            <view class="card">
+              <view wx:for="{{turn.checklist}}" wx:for-item="step" wx:key="id" class="step step-{{step.state}}">
+                <view class="step-icon">{{step.icon}}</view>
+                <view class="step-text">
+                  <text class="step-label">{{step.text}}</text>
+                  <text wx:if="{{step.result}}" class="step-result">{{step.result}}</text>
+                </view>
+              </view>
+              <text wx:if="{{turn.reply}}" class="line">{{turn.reply}}</text>
+              <view wx:if="{{turn.changes.length && turn.status !== 'running'}}" class="detail">
+                <text class="card-title">{{turn.undone ? '这一步已撤销' : '草稿改动'}}</text>
+                <text wx:for="{{turn.changes}}" wx:key="*this" class="line">{{item}}</text>
+                <button wx:if="{{turn.canUndo}}" class="minor-action" size="mini" disabled="{{busy || polling}}" data-id="{{turn.id}}" bindtap="undo">撤销这一步</button>
+              </view>
+              <view wx:if="{{turn.questions.length}}" class="question detail">
+                <view wx:for="{{turn.questions}}" wx:for-item="question" wx:key="text" class="question-item">
+                  <text>{{question.customer ? question.customer + ' · ' : ''}}{{question.text}}</text>
+                  <view wx:if="{{turn.canAnswer && question.options.length}}" class="actions">
+                    <button wx:for="{{question.options}}" wx:for-item="option" wx:key="*this" size="mini" disabled="{{busy || polling}}"
+                      data-option="{{option}}" data-turn="{{turn.id}}" bindtap="answer">{{option}}</button>
+                  </view>
+                </view>
+              </view>
+              <view wx:if="{{turn.preview}}" class="detail">
+                <text class="card-title">送货单预览</text>
+                <text class="amount">{{turn.preview.totalLabel}}</text>
+                <view wx:for="{{turn.preview.customers}}" wx:for-item="customer" wx:key="id" class="detail">
+                  <text class="card-title">{{customer.customer}}</text>
+                  <view wx:for="{{customer.items}}" wx:for-item="line" wx:key="id" class="preview-line">
+                    <text>{{line.productLabel}} · {{line.quantity}} {{line.unit}}</text><text>{{line.amountLabel}}</text>
+                  </view>
+                </view>
+              </view>
+              <view wx:if="{{turn.preview.active || turn.issued || turn.canRetry}}" class="actions">
+                <block wx:if="{{turn.preview.active}}">
+                  <button class="primary" size="mini" disabled="{{busy || polling}}" data-id="{{turn.preview.id}}" bindtap="confirm">确认出单</button>
+                  <button size="mini" disabled="{{busy || polling}}" data-turn="{{turn.id}}" bindtap="continueEditing">继续修改</button>
+                </block>
+                <button wx:if="{{turn.issued}}" size="mini" class="primary" bindtap="showPickingList">去取货</button>
+                <button wx:if="{{turn.canRetry}}" size="mini" disabled="{{busy || polling}}" data-id="{{turn.id}}" bindtap="retry">把原消息放回输入框</button>
+              </view>
+              <text wx:if="{{turn.elapsed}}" class="elapsed">{{turn.elapsed}}</text>
             </view>
           </view>
         </view>
-        <view wx:if="{{turn.changes.length && turn.status !== 'running'}}" class="card">
-          <text class="card-title">{{turn.undone ? '这一步已撤销' : '这一步改了草稿'}}</text>
-          <text wx:for="{{turn.changes}}" wx:key="*this" class="line">{{item}}</text>
-          <button wx:if="{{turn.canUndo}}" size="mini" disabled="{{busy || polling}}" data-id="{{turn.id}}" bindtap="undo">撤销这一步</button>
-        </view>
-        <view wx:if="{{turn.preview}}" class="card preview">
-          <text class="card-title">整趟送货单预览</text>
-          <text class="amount">{{turn.preview.totalLabel}}</text>
-          <view wx:for="{{turn.preview.customers}}" wx:for-item="customer" wx:key="id" class="detail">
-            <text class="card-title">{{customer.customer}}</text>
-            <view wx:for="{{customer.items}}" wx:for-item="line" wx:key="id" class="preview-line">
-              <text>{{line.productLabel}} · {{line.quantity}} {{line.unit}}</text><text>{{line.amountLabel}}</text>
-            </view>
-          </view>
-          <view wx:if="{{turn.preview.active}}" class="actions">
-            <button class="primary" size="mini" disabled="{{busy || polling}}" data-id="{{turn.preview.id}}" bindtap="confirm">确认出单</button>
-            <button size="mini" disabled="{{busy || polling}}" data-turn="{{turn.id}}" bindtap="continueEditing">继续修改</button>
-          </view>
-          <text wx:else class="muted">历史预览</text>
-        </view>
-        <button wx:if="{{turn.canRetry}}" size="mini" disabled="{{busy || polling}}" data-id="{{turn.id}}" bindtap="retry">把原消息放回输入框</button>
       </view>
-      <view wx:if="{{confirmed}}" class="card success">
-        <text class="card-title">已生成送货单</text>
-        <text class="line">取货清单有 {{pickingCount}} 种明细</text>
-        <view class="actions">
-          <button size="mini" class="primary" bindtap="showPickingList">看取货清单</button>
-          <button size="mini" disabled="{{busy || polling}}" bindtap="nextTrip">开始下一趟</button>
-        </view>
-      </view>
-      <view wx:if="{{confirmed && showPicking}}" class="card">
-        <text class="card-title">取货清单</text>
-        <view wx:for="{{picking}}" wx:key="id" class="preview-line">
-          <text>{{item.brand}} {{item.product}} {{item.specification}}</text>
-          <text>{{item.quantity}} {{item.unit}}</text>
-        </view>
+      <view wx:if="{{confirmed && !issuedCard}}" class="card success">
+        <text class="card-title">本趟已出单</text>
+        <view class="actions"><button size="mini" class="primary" bindtap="showPickingList">去取货</button></view>
       </view>
       <view id="latest" />
     </scroll-view>
@@ -106,8 +118,10 @@
           <button wx:else size="mini" disabled="{{busy || polling || !draftsAvailable}}" bindtap="record">录音</button>
           <button wx:if="{{voiceRetry}}" size="mini" disabled="{{busy || polling}}" bindtap="retryVoice">重试转写</button>
         </block>
+        <button wx:if="{{!confirmed}}" size="mini" bindtap="previewShortcut" disabled="{{busy || polling || !draftsAvailable}}">生成送货单</button>
         <button size="mini" class="primary send" disabled="{{busy || polling || !draftsAvailable || (!text && !attachments.length)}}" bindtap="send">发送</button>
       </view>
+      <button class="logout" size="mini" bindtap="logout" disabled="{{busy}}">退出登录</button>
     </view>
   </block>
 </view>

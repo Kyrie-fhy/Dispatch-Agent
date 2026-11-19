@@ -1,10 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { Pool, PoolClient } from 'pg';
-import { DeliveryEdits } from '../miniprogram/core/delivery-execution';
+import { DeliveryEdits, deliveryLines, deliverySummary } from '../miniprogram/core/delivery-execution';
 import { Account, Party } from '../miniprogram/core/settlement';
 import {
   emptyTrip, latest, PickingLine, pickingList, previewTrip, resolveCustomerChoices, statusesFor,
-  Trip, TripDraft, TripPreview, TripVersion,
+  Trip, TripDraft, TripHistoryPage, TripPreview, TripVersion,
 } from '../miniprogram/core/trips';
 import { readAccount, readParties, readWorkspace, workspaceDraft, writeAccount } from './account-workspace';
 import { HttpError } from './http-error';
@@ -14,7 +14,7 @@ type OrderSummary = Pick<TripVersion, 'customers' | 'totalCents'>;
 
 interface FormalTrip {
   trip: Trip;
-  sheets: Account[];
+  sheets: (Account & { deliveryCompleted: boolean })[];
   picking: PickingLine[];
   deliveryEdits: DeliveryEdits;
 }
@@ -59,6 +59,35 @@ export class TripStore {
 
   async trip(accountId: string, tripId: string): Promise<FormalTrip> {
     return readAccount(this.pool, accountId, client => this.readTrip(client, accountId, tripId));
+  }
+
+  async history(accountId: string, before: string | null, limit: number): Promise<TripHistoryPage> {
+    return readAccount(this.pool, accountId, async client => {
+      const workspace = await readWorkspace(client, accountId);
+      const { rows } = await client.query<{
+        id: string; issuedAt: Date; customers: TripVersion['customers']; deliveryEdits: DeliveryEdits; delivered: number;
+      }>(`
+        SELECT t.id, first.saved_at AS "issuedAt", head.customers, t.delivery_edits AS "deliveryEdits",
+          (SELECT count(*)::int FROM dispatch.sheets s
+           WHERE s.account_id = t.account_id AND s.trip_id = t.id AND s.delivery_completed) AS delivered
+        FROM dispatch.trips t
+        JOIN dispatch.trip_versions first ON first.account_id = t.account_id AND first.trip_id = t.id AND first.version = 1
+        CROSS JOIN LATERAL (
+          SELECT customers FROM dispatch.trip_versions
+          WHERE account_id = t.account_id AND trip_id = t.id ORDER BY version DESC LIMIT 1
+        ) head
+        WHERE t.account_id = $1 AND ($2::uuid IS NULL OR (first.saved_at, t.id) < (
+          SELECT saved_at, trip_id FROM dispatch.trip_versions
+          WHERE account_id = $1 AND trip_id = $2 AND version = 1
+        ))
+        ORDER BY first.saved_at DESC, t.id DESC LIMIT $3`, [accountId, before, limit + 1]);
+      const trips = rows.slice(0, limit).map(row => {
+        const lines = row.customers.flatMap(customer => deliveryLines(customer, row.deliveryEdits));
+        return { id: row.id, issuedAt: row.issuedAt.toISOString(), customers: row.customers.length, lines: lines.length,
+          ...deliverySummary(lines), delivered: row.delivered, current: row.id === workspace.id && row.id === workspace.currentTripId };
+      });
+      return { trips, nextBefore: rows.length > limit ? trips[trips.length - 1].id : null };
+    });
   }
 
   async preview(accountId: string, { requestId, draftId, revision }: ReturnType<typeof readPreviewInput>, signal?: AbortSignal): Promise<TripPreview> {
@@ -180,8 +209,8 @@ export class TripStore {
       ...(row.amendmentId ? { amendmentId: row.amendmentId } : {}),
     }));
     const trip: Trip = { id: tripId, origin: 's2', versions, statuses: row.statuses, statusRevision: row.statusRevision };
-    const { rows: sheets } = await client.query<Account>(`
-      SELECT trip_id AS "tripId", id AS "sheetId", party_id AS "partyId", reviewed
+    const { rows: sheets } = await client.query<FormalTrip['sheets'][number]>(`
+      SELECT trip_id AS "tripId", id AS "sheetId", party_id AS "partyId", reviewed, delivery_completed AS "deliveryCompleted"
       FROM dispatch.sheets WHERE account_id = $1 AND trip_id = $2 ORDER BY id
     `, [accountId, tripId]);
     return { trip, sheets, deliveryEdits: row.deliveryEdits, picking: pickingList(latest(trip).customers) };

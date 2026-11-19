@@ -1,0 +1,28 @@
+<view class="container">
+  <view class="title">历史趟次</view>
+  <view wx:if="{{error}}" class="error">{{error}}</view>
+  <button wx:if="{{!signedIn}}" class="primary" bindtap="goAssistant">去助手登录</button>
+  <block wx:elif="{{formal}}">
+    <button size="mini" bindtap="backToList" disabled="{{busy}}">返回趟次列表</button>
+    <include src="../workspace/picking.wxml" />
+    <view wx:for="{{formal.customers}}" wx:for-item="customer" wx:key="id" class="card">
+      <view class="section-title">{{customer.customer}}</view>
+      <view class="hint">{{formal.deliveryRows[index].completed ? '已确认送达' : '未确认送达'}}</view>
+      <view wx:for="{{formal.deliveryRows[index].lines}}" wx:for-item="line" wx:key="id" class="line">
+        <view class="product">{{line.productLabel}}</view>
+        <view>原订 {{line.originalQuantity}} {{line.unit}} · 实收 {{line.quantity}} {{line.unit}}</view>
+        <view class="hint">{{formal.statuses[line.id] || '未记录'}} · {{line.amountLabel}}</view>
+      </view>
+      <view class="subtotal">{{formal.deliveryRows[index].totalLabel}}</view>
+    </view>
+  </block>
+  <block wx:else>
+    <view wx:if="{{!trips.length}}" class="hint">{{busy ? '正在读取趟次…' : '还没有正式送货单。'}}</view>
+    <button wx:for="{{trips}}" wx:key="id" class="card history-item" bindtap="openTrip" data-id="{{item.id}}" disabled="{{busy}}">
+      <view class="section-title">{{item.time}}<text wx:if="{{item.current}}" class="history-current">进行中</text></view>
+      <view class="history-meta">{{item.customers}} 家 · {{item.lines}} 行 · {{item.delivered}}/{{item.customers}} 家已送达</view>
+      <view>{{item.total}}</view>
+    </button>
+    <button wx:if="{{nextBefore}}" bindtap="loadMore" loading="{{busy}}" disabled="{{busy}}">查看更早趟次</button>
+  </block>
+</view>

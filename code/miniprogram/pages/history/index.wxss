@@ -1,0 +1,4 @@
+@import "../workspace/index.wxss";
+.history-item { width: 100%; text-align: left; padding: 26rpx; margin: 0 0 18rpx; line-height: 1.65; }
+.history-meta { font-size: 26rpx; color: #63716b; }
+.history-current { color: #12664d; font-weight: 650; margin-left: 18rpx; }

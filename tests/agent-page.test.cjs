@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { emptyTrip, previewTrip } = require('../code/dist/core/trips');
+const { emptyTrip, previewTrip, pickingList, statusesFor } = require('../code/dist/core/trips');
 const { agentSession } = require('../code/dist/services/agent-session');
 
 const token = 'a'.repeat(43);
@@ -20,6 +20,7 @@ function setup(t, initialDraft) {
   const navigation = [];
   let draft = initialDraft;
   let confirmed = false;
+  let confirmedPreviewId = null;
   let turns = [];
   let onRequest;
   let sequence = 0;
@@ -52,16 +53,17 @@ function setup(t, initialDraft) {
       if (path === '/session') return entry.ok(null, 204);
       if (path === '/agent/card-actions') return entry.ok({ recorded: true });
       if (onRequest?.(entry)) return;
-      if (path === '/agent/conversation') return entry.ok({ draft: structuredClone(draft), draftConfirmed: confirmed, turns: structuredClone(turns) });
+      if (path === '/agent/conversation') return entry.ok({ draft: structuredClone(draft), draftConfirmed: confirmed, confirmedPreviewId, turns: structuredClone(turns) });
       if (path === '/workspace') return entry.ok({ draft: structuredClone(draft), parties: [], draftConfirmed: confirmed, currentTrip: null });
       assert.fail(`Unhandled request ${entry.method} ${path}`);
     },
     navigateTo: ({ url }) => navigation.push(url),
+    switchTab: ({ url }) => navigation.push(url),
   };
   const page = pageFor('agent');
   t.after(() => { page.onHide(); agentSession.token = ''; agentSession.unsaved = null; });
   return { page, pageFor, requests, navigation, event, card,
-    setDraft(value) { draft = value; }, setConfirmed(value) { confirmed = value; },
+    setDraft(value) { draft = value; }, setConfirmed(value, id = null) { confirmed = value; confirmedPreviewId = id; },
     setTurns(value) { turns = value; }, handle(fn) { onRequest = fn; },
   };
 }
@@ -72,10 +74,15 @@ test('A1 chat restores original input on failed submission, then polls progress 
   await page.onShow();
   await page.login();
   assert.equal(page.data.signedIn, true);
-  const progress = event('progress', { text: '核对这趟草稿', step: 1, done: true });
+  const plan = event('plan', { steps: [{ id: 'intent', text: '看懂你的意思' }, { id: 'edit', text: '整理进草稿' },
+    { id: 'check', text: '核对缺项' }, { id: 'summary', text: '汇报' }, { id: 'preview', text: '生成预览' }] });
+  const progress = event('step', { id: 'intent', state: 'done' });
+  const needs = event('step', { id: 'edit', state: 'needs_input' });
+  const failure = event('step', { id: 'check', state: 'failed', result: '读取失败' });
+  const skip = event('step', { id: 'summary', state: 'skipped' });
   const question = event('questions', { questions: [{ customer: '老王', text: '改成还是追加？', options: ['追加 3 箱'] }] });
   const end = event('end', { text: '待确认', revision: 1, status: 'completed' });
-  const first = { id: 'turn-1', text: '再要三箱', materialIds: [], revision: 1, status: 'completed', events: [progress, question, end] };
+  const first = { id: 'turn-1', text: '再要三箱', materialIds: [], revision: 1, status: 'completed', events: [plan, progress, needs, failure, skip, question, end] };
   let submits = 0;
   let polls = 0;
   handle(request => {
@@ -88,36 +95,42 @@ test('A1 chat restores original input on failed submission, then polls progress 
     if (request.path === '/agent/turns/turn-1/events') {
       polls++;
       assert.equal(Number(request.query.get('after')), polls === 1 ? 0 : progress.seq);
-      if (polls === 1) request.ok({ status: 'running', events: [progress] });
+      if (polls === 1) request.ok({ status: 'running', events: [plan, progress] });
       else {
         setTurns([first]);
-        request.ok({ status: 'completed', events: [question, end] });
+        request.ok({ status: 'completed', events: [needs, failure, skip, question, end] });
       }
       return true;
     }
   });
   page.editText({ detail: { value: first.text } });
-  await page.send();
+  const submission = page.send();
+  assert.equal(page.data.turns[0].checklist[0].state, 'running');
+  assert.equal(page.data.turns[0].checklist[0].text, '看懂你的意思');
+  await submission;
   assert.equal(page.data.text, first.text);
   assert.match(page.data.error, /无法连接/);
   await page.send();
   assert.equal(page.data.text, '');
   assert.equal(page.data.polling, true);
   await page.poll();
-  assert.equal(page.data.turns[0].progress[0].done, true);
+  assert.deepEqual(page.data.turns[0].checklist.map(step => step.icon), ['✓', '○', '○', '○', '○']);
   await page.poll();
   assert.equal(page.data.polling, false);
   assert.deepEqual(page.data.turns[0].questions[0].options, ['追加 3 箱']);
-  await page.answer(tap({ option: '追加 3 箱' }));
+  assert.deepEqual(page.data.turns[0].checklist.map(step => step.icon), ['✓', '！', '✗', '–', '○']);
+  assert.equal(page.data.turns[0].checklist[2].result, '读取失败');
+  await page.answer(tap({ option: '追加 3 箱', turn: first.id }));
   const sent = requests.filter(request => request.path === '/agent/turns');
   assert.equal(sent[0].data.requestId, sent[1].data.requestId);
   assert.equal(sent[2].data.text, '追加 3 箱');
+  assert.deepEqual(sent[2].data.direct, { intent: 'draft', answer: '追加 3 箱', turnId: first.id });
   assert.ok(requests.some(request => request.path === '/agent/card-actions' && request.data.action === 'answer'));
 });
 
 test('A1 restores failed messages, renders revision-safe undo and only confirms through the existing trip API', async t => {
   const base = order();
-  const { page, requests, card, event, handle, setDraft, setConfirmed, setTurns } = setup(t, base);
+  const { page, requests, navigation, card, event, handle, setDraft, setConfirmed, setTurns } = setup(t, base);
   const change = event('change', { lines: ['老王 水饺 数量：1箱 → 2箱'] });
   const saved = event('end', { text: '已整理', status: 'completed', revision: 1 });
   const failure = event('end', { text: '处理失败。草稿没有变化。', status: 'failed', revision: 1 });
@@ -132,7 +145,9 @@ test('A1 restores failed messages, renders revision-safe undo and only confirms 
   const undone = event('undo', { revision: 2 });
   const nextDraft = { ...base, revision: 2 };
   const previewTurn = (preview, id) => ({ id, text: '生成送货单', materialIds: [], status: 'completed', revision: preview.revision,
-    events: [event('preview', { preview }), event('end', { status: 'completed', text: '请确认', revision: preview.revision })] });
+    events: [event('plan', { steps: [{ id: 'confirm', text: '等你确认出单' }, { id: 'issued', text: '出单完成' }] }),
+      event('step', { id: 'confirm', state: 'needs_input' }), event('preview', { preview }),
+      event('end', { status: 'completed', text: '请确认', revision: preview.revision, elapsedMs: 4000 })] });
   const firstPreview = { ...card, revision: 2 };
   const secondPreview = { ...card, revision: 3, previewId: 'pre-2' };
   const old = previewTurn(firstPreview, 'old');
@@ -150,7 +165,7 @@ test('A1 restores failed messages, renders revision-safe undo and only confirms 
         request.ok({ error: 'draft_changed', message: '草稿已变化，请重新预览' }, 409);
       } else {
         assert.equal(request.data.previewId, secondPreview.previewId);
-        setConfirmed(true);
+        setConfirmed(true, secondPreview.previewId);
         request.ok({ picking: [{ id: 'row', product: '水饺', quantity: 2, unit: '箱' }] });
       }
       return true;
@@ -173,21 +188,27 @@ test('A1 restores failed messages, renders revision-safe undo and only confirms 
   await page.undo(tap({ id: 'edit' }));
   assert.equal(page.data.turns[0].undone, true);
   setTurns([old]);
-  await page.refresh();
+  await page.onShow();
   assert.equal(page.data.turns[0].preview.totalLabel, '整趟订单金额 ¥164.00');
   assert.equal(page.data.turns[0].preview.customers[0].items[0].productLabel, '水饺');
   assert.equal(requests.filter(r => r.path === '/trips/confirm').length, 0);
   await page.confirm(tap({ id: firstPreview.previewId }));
   assert.match(page.data.error, /重新预览/);
   assert.equal(page.data.confirmed, false);
-  await page.send();
+  await page.previewShortcut();
   await page.poll();
   assert.equal(retried, true);
+  assert.deepEqual(requests.find(r => r.path === '/agent/turns').data.direct, { intent: 'preview' });
+  assert.equal(page.data.turns.at(-1).elapsed, '用时 4 秒');
   await page.confirm(tap({ id: secondPreview.previewId }));
   assert.equal(page.data.confirmed, true);
   page.showPickingList();
-  assert.equal(page.data.showPicking, true);
-  assert.equal(page.data.picking[0].quantity, 2);
+  assert.equal(navigation.at(-1), '/pages/trip-picking/index');
+  assert.equal(page.data.turns.at(-1).checklist[0].state, 'done');
+  page.onHide();
+  await page.onShow();
+  assert.equal(page.data.turns.at(-1).checklist[0].state, 'done');
+  assert.equal(page.data.turns.at(-1).issued, true);
   assert.ok(requests.filter(r => r.path === '/trips/confirm').every(r => r.data.requestId));
 });
 
@@ -196,6 +217,9 @@ test('A1 manual form uses the same session and detects an unsaved edit after cha
   const { page, pageFor, navigation, requests, setDraft } = setup(t, base);
   await page.onShow();
   await page.login();
+  assert.match(page.data.draftStrip.label, /1 家 1 行/);
+  page.toggleDraft();
+  assert.equal(page.data.draftExpanded, true);
   page.openWorkspace();
   assert.equal(navigation[0], '/pages/workspace/index?from=agent');
   page.onHide();
@@ -217,4 +241,114 @@ test('A1 manual form uses the same session and detects an unsaved edit after cha
   await reopened.useSavedDraft();
   assert.equal(reopened.data.active.customer, '老王');
   assert.equal(reopened.data.dirty, false);
+});
+
+test('A1 tabs share login, refresh the current trip and page through read-only history', async t => {
+  const draft = order();
+  const { deliveryLines, deliverySummary } = require('../code/dist/core/delivery-execution');
+  const { page, pageFor, requests, navigation, handle } = setup(t, draft);
+  const picking = pageFor('trip-picking');
+  const delivery = pageFor('trip-delivery');
+  const history = pageFor('history');
+  await picking.onShow();
+  assert.equal(picking.data.signedIn, false);
+  picking.goAssistant();
+  assert.equal(navigation.at(-1), '/pages/agent/index');
+  await page.login();
+  await picking.onShow();
+  assert.equal(picking.data.formal, null);
+  assert.equal(picking.data.signedIn, true);
+  const summary = previewTrip(draft, true);
+  const formal = { trip: { id: draft.id, origin: 's2', versions: [{ ...summary, version: 1, savedAt: '2026-11-19T00:00:00Z' }],
+    statuses: statusesFor(summary.customers, 'pending'), statusRevision: 0 }, picking: pickingList(summary.customers),
+    sheets: [{ sheetId: draft.customers[0].id, reviewed: false, deliveryCompleted: false }] };
+  const current = { id: draft.id, issuedAt: '2026-11-19T00:00:00Z', customers: 1, lines: 1, totalCents: 16400,
+    pendingPrices: 0, delivered: 0, current: true };
+  const old = { ...current, id: 'old', current: false, pendingPrices: 1, delivered: 1 };
+  let delivered = false;
+  let advanced = false;
+  let revision = 0;
+  let edits = {};
+  const route = '/trips/' + draft.id + '/sheets/' + draft.customers[0].id;
+  const latestTrip = () => ({
+    ...formal, deliveryEdits: edits, sheets: formal.sheets.map(sheet => ({ ...sheet, deliveryCompleted: delivered, reviewed: delivered })),
+    trip: { ...formal.trip, statusRevision: revision, statuses: statusesFor(summary.customers, delivered ? 'delivered' : 'pending') },
+  });
+  const details = () => {
+    const customer = summary.customers[0];
+    const lines = deliveryLines(customer, edits);
+    const execution = deliverySummary(lines);
+    return { sheet: { tripId: draft.id, sheetId: customer.id, customer: customer.customer, version: 1,
+      statusRevision: revision, reviewed: delivered, deliveryCompleted: delivered, orderCents: customer.totalCents, execution,
+      amounts: { due: delivered ? execution.totalCents : 0, remaining: 0, paid: 0, excess: 0 },
+      lines: lines.map(item => ({ ...item, status: delivered ? 'delivered' : 'pending' })),
+    } };
+  };
+  handle(r => {
+    if (r.path === '/workspace') {
+      r.ok({ draft: advanced ? { ...draft, id: 'next', revision: 0 } : draft, parties: [],
+        draftConfirmed: !advanced, currentTrip: { id: draft.id } });
+      return true;
+    }
+    if (r.path === route) { r.ok(details()); return true; }
+    if (r.path === route + '/delivery/line') {
+      assert.equal(r.data.receivedQuantity, '1');
+      edits = { [r.data.lineId]: { receivedQuantity: 1, unitPriceCents: 8200 } };
+      revision++;
+      r.ok(details());
+      return true;
+    }
+    if (r.path === route + '/delivery/complete') {
+      assert.equal(r.data.statusRevision, 1);
+      delivered = true;
+      revision++;
+      r.ok(details());
+      return true;
+    }
+    if (r.path === '/trips/next-draft') {
+      assert.equal(r.data.draftId, draft.id);
+      advanced = true;
+      r.ok({ draft: { ...draft, id: 'next', revision: 0 } });
+      return true;
+    }
+    if (r.path === '/trips') { r.ok(r.query.get('before') ? { trips: [old], nextBefore: null } : { trips: [current], nextBefore: current.id }); return true; }
+    if (r.path === '/trips/' + draft.id || r.path === '/trips/old') {
+      r.ok({ ...latestTrip(), trip: { ...latestTrip().trip, id: r.path.split('/').at(-1) } }); return true;
+    }
+  });
+  await picking.onShow();
+  assert.equal(picking.data.formal.picking[0].quantity, 2);
+  await delivery.onShow();
+  assert.deepEqual(delivery.data.formal.unfinished, ['老王']);
+  let modal;
+  wx.showModal = spec => { modal = spec; };
+  await delivery.nextTrip();
+  assert.match(modal.content, /还有 1 家没确认送达：老王/);
+  modal.success({ confirm: false });
+  assert.ok(!requests.some(r => r.path.endsWith('next-draft')));
+  await history.onShow();
+  assert.equal(history.data.trips[0].current, true);
+  await history.loadMore();
+  assert.equal(history.data.trips.length, 2);
+  assert.match(history.data.trips[1].total, /待补价/);
+  await history.openTrip(tap({ id: old.id }));
+  assert.equal(history.data.formal.id, old.id);
+  assert.equal(history.data.formal.deliveryRows[0].lines[0].originalQuantity, '2');
+  assert.equal(history.data.formal.deliveryRows[0].lines[0].quantity, '2');
+  assert.equal(history.saveFieldEdit, undefined);
+  await delivery.openSheet(tap({ tripId: draft.id, sheetId: draft.customers[0].id }));
+  delivery.beginFieldEdit(tap({ id: draft.customers[0].items[0].id }));
+  delivery.editDeliveryField({ ...tap({ field: 'receivedQuantity' }), detail: { value: '1' } });
+  await delivery.saveFieldEdit();
+  assert.equal(delivery.data.sheet.lines[0].receivedQuantity, 1);
+  await delivery.completeDelivery();
+  assert.equal(delivery.data.sheet.balance.due, '82.00');
+  await delivery.closeSheet();
+  assert.deepEqual(delivery.data.formal.unfinished, []);
+  wx.showModal = () => assert.fail('全部送达时直接开始下一趟');
+  await delivery.nextTrip();
+  assert.equal(navigation.at(-1), '/pages/agent/index');
+  await picking.onShow();
+  assert.equal(picking.data.formal, null);
+  assert.equal(requests.filter(r => r.path === '/session/wechat').length, 1);
 });

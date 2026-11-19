@@ -27,6 +27,17 @@ export interface Trip {
   statuses: Record<string, DeliveryStatus>;
   statusRevision: number;
 }
+export interface TripHistoryRow {
+  id: string;
+  issuedAt: string;
+  customers: number;
+  lines: number;
+  totalCents: number;
+  pendingPrices: number;
+  delivered: number;
+  current: boolean;
+}
+export interface TripHistoryPage { trips: TripHistoryRow[]; nextBefore: string | null }
 export interface TripState { schemaVersion: 3; draft: TripDraft; trips: Trip[]; ledger: Ledger; assistant?: AssistantNotes }
 export interface TripStorage { read(): unknown; write(state: TripState): void }
 export interface PickingLine { id: string; product: string; brand: string; specification: string; unit: string; quantity: number }

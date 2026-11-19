@@ -15,7 +15,7 @@ export interface FormalTrip {
   trip: Trip;
   picking: PickingLine[];
   deliveryEdits?: DeliveryEdits;
-  sheets?: Account[];
+  sheets?: (Account & { deliveryCompleted?: boolean })[];
 }
 
 export type { TripPreview } from '../core/trips';

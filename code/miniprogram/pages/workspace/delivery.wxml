@@ -1,0 +1,19 @@
+        <view wx:if="{{!formal}}" class="card">
+          <button wx:if="{{onTripTab}}" bindtap="goAssistant">这趟还没出单，去助手录单</button>
+          <text wx:else>还没有正式送货单。</text>
+        </view>
+        <block wx:else>
+          <view class="section-title">本趟送货单 · 第 {{formal.version}} 版</view>
+          <view wx:for="{{formal.customers}}" wx:for-item="customer" wx:key="id" class="card">
+            <view class="section-title">{{customer.customer}}</view>
+            <view wx:for="{{deliveryMvp ? formal.deliveryRows[index].lines : customer.items}}" wx:for-item="line" wx:key="id" class="line">
+              <template is="order-line" data="{{line: line}}" />
+              <view wx:if="{{onTripTab}}" class="hint">原订 {{line.originalQuantity}} {{line.unit}} · 实收 {{line.quantity}} {{line.unit}}</view>
+              <view class="muted">{{formal.statuses[line.id] || '未记录'}}</view>
+            </view>
+            <view class="subtotal">{{deliveryMvp ? formal.deliveryRows[index].totalLabel : customer.totalLabel}}</view>
+            <view wx:if="{{onTripTab && formal.deliveryRows[index].completed}}" class="hint">已确认送达</view>
+            <button bindtap="openSheet" data-trip-id="{{formal.id}}" data-sheet-id="{{customer.id}}" disabled="{{busy}}">打开客户单</button>
+          </view>
+          <button wx:if="{{onTripTab && draftConfirmed}}" class="{{formal.unfinished.length ? '' : 'primary'}}" bindtap="nextTrip" disabled="{{busy}}" loading="{{busy}}">开始下一趟</button>
+        </block>

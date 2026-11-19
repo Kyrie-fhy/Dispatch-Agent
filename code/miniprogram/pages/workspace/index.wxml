@@ -19,7 +19,7 @@
       <button wx:else class="primary" bindtap="reload">重试恢复</button>
     </view>
     <block wx:else>
-      <view class="workspace-actions" wx:if="{{!sheetTarget}}">
+      <view class="workspace-actions" wx:if="{{!sheetTarget && !deliveryMvp}}">
         <button size="mini" class="{{section === 'draft' ? 'option-active' : ''}}" data-section="draft" bindtap="selectSection" disabled="{{busy}}">录单</button>
         <button size="mini" class="{{section === 'picking' ? 'option-active' : ''}}" data-section="picking" bindtap="selectSection" disabled="{{busy}}">取货</button>
         <button size="mini" class="{{section === 'delivery' ? 'option-active' : ''}}" data-section="delivery" bindtap="selectSection" disabled="{{busy}}">{{deliveryMvp ? '送货' : '送货单'}}</button>
@@ -36,7 +36,7 @@
           <view class="card">
             <view class="section-title">已出单 · 第 {{formal.version}} 版</view>
             <view class="amount">{{formal.totalLabel}}</view>
-            <button class="primary" bindtap="nextTrip" disabled="{{busy}}" loading="{{busy}}">开始下一趟</button>
+            <button wx:if="{{!deliveryMvp}}" class="primary" bindtap="nextTrip" disabled="{{busy}}" loading="{{busy}}">开始下一趟</button>
           </view>
           <template is="trip-customers" data="{{summary: formal}}" />
         </block>
@@ -108,24 +108,7 @@
       </block>
 
       <block wx:elif="{{section === 'picking'}}">
-        <view wx:if="{{!formal}}" class="card">还没有正式送货单。</view>
-        <block wx:else>
-          <view wx:if="{{formal.version > 1}}" class="card">
-            <view class="section-title">第 {{formal.version}} 版取货变化</view>
-            <view wx:if="{{!formal.changes.length}}" class="hint">本次取货数量无变化</view>
-            <view wx:for="{{formal.changes}}" wx:key="id" class="line">
-              <view>{{item.brand ? item.brand + ' ' : ''}}{{item.product}}{{item.specification ? ' · ' + item.specification : ''}}</view>
-              <view>{{item.before}} → {{item.after}} {{item.unit}}</view>
-            </view>
-          </view>
-          <view class="card">
-            <view class="section-title">本趟应取 · 第 {{formal.version}} 版</view>
-            <view wx:for="{{formal.picking}}" wx:key="id" class="line">
-              <view class="product">{{item.brand ? item.brand + ' ' : ''}}{{item.product}}{{item.specification ? ' · ' + item.specification : ''}}</view>
-              <view>{{item.quantity}} {{item.unit}}</view>
-            </view>
-          </view>
-        </block>
+        <include src="./picking.wxml" />
       </block>
 
       <block wx:elif="{{section === 'materials'}}">
@@ -134,19 +117,7 @@
       </block>
 
       <block wx:else>
-        <view wx:if="{{!formal}}" class="card">还没有正式送货单。</view>
-        <block wx:else>
-          <view class="section-title">本趟送货单 · 第 {{formal.version}} 版</view>
-          <view wx:for="{{formal.customers}}" wx:for-item="customer" wx:key="id" class="card">
-            <view class="section-title">{{customer.customer}}</view>
-            <view wx:for="{{deliveryMvp ? formal.deliveryRows[index].lines : customer.items}}" wx:for-item="line" wx:key="id" class="line">
-              <template is="order-line" data="{{line: line}}" />
-              <view class="muted">{{formal.statuses[line.id] || '未记录'}}</view>
-            </view>
-            <view class="subtotal">{{deliveryMvp ? formal.deliveryRows[index].totalLabel : customer.totalLabel}}</view>
-            <button bindtap="openSheet" data-trip-id="{{formal.id}}" data-sheet-id="{{customer.id}}" disabled="{{busy}}">打开客户单</button>
-          </view>
-        </block>
+        <include src="./delivery.wxml" />
       </block>
     </block>
   </block>

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { isObject } from '../../miniprogram/core/orders';
+import { hasSpokenNumber, spokenNumbers } from '../../miniprogram/core/spoken-numbers';
 import { textFields } from '../../miniprogram/core/text-order';
 import { emptyCustomer, TripDraft } from '../../miniprogram/core/trips';
 import type { Party } from '../../miniprogram/core/settlement';
@@ -11,38 +12,42 @@ export function invalidTool(): never {
   throw new HttpError(502, 'invalid_agent_tool', '助手无法读取本次整理结果，可以重试或手动填写。');
 }
 
-export type PreviousQuestions = { text: string; payload: { questions: Question[] } };
+export type EditConfirmation = { operations: unknown[]; accept: string };
+export type PreviousQuestions = {
+  turnId: string;
+  text: string;
+  payload: { questions: Question[] };
+  confirmation?: EditConfirmation | null;
+};
 
 function includesValue(source: string, value: string) {
-  if (!/^\d+(\.\d+)?$/.test(value)) return source.includes(value);
-  const literals = source.match(/\d+(?:\.\d+)?/g) ?? [];
-  return literals.some(literal => Number(literal) === Number(value));
+  return /^\d+(\.\d+)?$/.test(value) ? hasSpokenNumber(source, value) : source.includes(normalized(value));
 }
 
 function statedQuantity(source: string, unit: string): number | undefined {
-  const token = source.match(/(?:追加|加|再要)\s*(\d+|[一二两三四五六七八九十]+)\s*(.*)/);
-  if (!token || (token[2] && !token[2].startsWith(unit))) return;
-  if (/^\d+$/.test(token[1])) return Number(token[1]);
-  const digits = '零一二三四五六七八九';
-  const value = token[1].replace(/两/g, '二');
-  if (value.length === 1 && value !== '十') return digits.indexOf(value);
-  if (!/^[一二三四五六七八九]?十[一二三四五六七八九]?$/.test(value)) return;
-  const [tens, ones] = value.split('十');
-  return (tens ? digits.indexOf(tens) : 1) * 10 + (ones ? digits.indexOf(ones) : 0);
+  const afterVerb = source.match(/(?:追加|再加|加上|加|再要|再来)\s*(.+)/)?.[1];
+  if (!afterVerb) return;
+  const [token] = spokenNumbers(afterVerb);
+  if (token?.start !== 0 || token.value === null || !Number.isInteger(token.value)) return;
+  const suffix = afterVerb.slice(token.end).trim();
+  if (suffix && !suffix.startsWith(unit) && !/^[，,。；;！!]/.test(suffix)) return;
+  return token.value;
 }
 
-export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[], source: string, previous?: PreviousQuestions) {
+export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[], source: string, previous?: PreviousQuestions, confirmed = false) {
   if (!isObject(value) || !Array.isArray(value.operations) || !value.operations.length || value.operations.length > 24) invalidTool();
   const edits = value.operations.filter((op: unknown) => isObject(op) && (op.action === 'add' || op.action === 'fill'));
   const next = structuredClone(draft);
   const initial = targetRows(draft);
   const lines: string[] = [];
+  const confirmations: string[] = [];
+  let deleting = false;
   const names = new Set(parties.map(party => normalized(party.name)));
   const response = normalized(source);
   const options = previous?.payload.questions.flatMap(question => question.options) ?? [];
   const matches = options.filter(option => {
     const candidate = normalized(option);
-    return candidate === response || (response === '追加' && candidate.startsWith('追加'));
+    return candidate === response || (response === '追加' && candidate.startsWith('追加')) || (response === '改成' && candidate.startsWith('改成'));
   });
   const selected = matches.length === 1 ? normalized(matches[0]) : '';
   const issues = (message: string) => ({ issues: [{ code: 'edit_needs_review', message }] });
@@ -50,7 +55,10 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
   if (edits.length) {
     if (edits.some(op => isObject(op) && typeof op.price === 'string' && op.price.trim() &&
       !includesValue(response, op.price.trim()))) return issues('请明确说明要填写的单价。');
-    const merged = mergeOrder(next, { operations: edits }, names, source);
+    if (edits.some(op => isObject(op) && typeof op.quantity === 'string' && op.quantity.trim() &&
+      !includesValue(response, op.quantity.trim()))) return issues('请说明要填写的确切数量。');
+    const contextSource = previous?.text ? `${source} ${previous.text}` : source;
+    const merged = mergeOrder(next, { operations: edits }, names, contextSource);
     if (!merged.draft) return { issues: merged.issues };
     next.customers = merged.draft.customers;
   }
@@ -86,15 +94,21 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
     const row = old && targetRows(next).find(entry => entry.item.id === old.item.id);
     if (!row || isPlaceholder(row.item)) return issues('请指明要修改的货品明细。');
     const label = `${row.customer.customer} ${row.item.product}`.trim();
-    const hasTarget = (row.item.product && response.includes(normalized(row.item.product))) ||
-      (initial.filter(entry => !isPlaceholder(entry.item)).length === 1) ||
-      (row.customer.customer && response.includes(normalized(row.customer.customer)) &&
-        row.customer.items.filter(item => !isPlaceholder(item)).length === 1);
-    if (!hasTarget && !(selected && previous?.text.includes(row.customer.customer))) {
+    const actualRows = initial.filter(entry => !isPlaceholder(entry.item));
+    const targetSource = selected && previous ? response + normalized(previous.text) : response;
+    const matchScore = ({ item, customer }: typeof row) =>
+      Number(Boolean(item.product && targetSource.includes(normalized(item.product)))) +
+      Number(Boolean(customer.customer && targetSource.includes(normalized(customer.customer))));
+    const score = matchScore(old);
+    if (actualRows.length !== 1 && (!score || actualRows.some(candidate => candidate !== old && matchScore(candidate) >= score))) {
       return issues('请带上客户和货品名称，指明要改哪一行。');
     }
     if (op.action === 'remove_line') {
-      if (!/删除|删掉|去掉|不要了|取消这条/.test(response)) return issues('请明确说明是否删除这条货品。');
+      if (!confirmed && !/删除|删掉|去掉|不要了|取消这条/.test(response)) {
+        if (!score) return issues('请带上客户或货品名称，指明要删哪一行。');
+        deleting = true;
+        confirmations.push(`删掉 ${label} ${row.item.quantity} ${row.item.unit}`);
+      }
       row.customer.items = row.customer.items.filter(item => item.id !== row.item.id);
       if (!row.customer.items.length) next.customers = next.customers.filter(entry => entry !== row.customer);
       lines.push(`删除 ${label} ${row.item.quantity} ${row.item.unit}`);
@@ -104,7 +118,7 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
     for (const field of textFields) {
       const value = fields[field];
       if (typeof value !== 'string' || value === row.item[field]) continue;
-      const explicit = /改成|改为|改到|改一下|更正|换成|调整|重填|单价改|价格改/.test(response + selected);
+      const explicit = /改成|改为|改到|改一下|更正|换成|调整|重填|覆盖|单价改|价格改/.test(response + selected);
       const increment = field === 'quantity'
         ? (selected && previous && statedQuantity(normalized(previous.text), row.item.unit)) ||
           statedQuantity(selected || response, row.item.unit)
@@ -112,11 +126,24 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
       const append = typeof increment === 'number' && increment > 0 && /追加|加/.test(selected || response)
         && Number(row.item.quantity) + increment === Number(value);
       const eligible = field !== 'price' || /单价|价格|每[公斤斤箱袋件个包]/.test(response);
-      if (!(eligible && explicit && (includesValue(response, value) || includesValue(selected, value))) && !append) {
-        return issues('这条明细已有内容，请明确要改成什么，或点选追问里的选项。');
+      if (!includesValue(response, value) && !includesValue(selected, value) && !append) {
+        return issues('请说明本轮要改成的值。');
+      }
+      if (!confirmed && !append && !(eligible && explicit)) {
+        const unit = field === 'price' ? '元' : field === 'quantity' ? row.item.unit : '';
+        confirmations.push(`${label} ${row.item[field] || '空'}${unit}改成 ${value}${unit}`);
       }
       row.item[field] = value;
     }
+  }
+
+  if (confirmations.length) {
+    const accept = deleting ? '删掉' : '改';
+    const reject = deleting ? '保留' : '不改';
+    const description = confirmations.join('；');
+    const question: Question = { customer: '', text: `确认${description}？`,
+      options: [accept, reject] };
+    return { confirmation: { operations: value.operations, accept }, question };
   }
 
   if (!next.customers.length) next.customers = [emptyCustomer(randomUUID)];

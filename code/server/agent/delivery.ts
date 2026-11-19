@@ -52,7 +52,18 @@ function resolve(trip: Trip, sheets: Sheet[], output: unknown, source: string): 
   if (output.tool === 'ask_delivery_user') {
     if (typeof args.text !== 'string' || !args.text.trim() || args.text.length > 300 || !Array.isArray(args.options) ||
         args.options.some(option => typeof option !== 'string' || !option.trim() || option.length > 100)) throw intentError();
-    return question(args.text, [...new Set<string>(args.options)].slice(0, 20));
+    const options: string[] = args.options;
+    if (options.length >= 2) {
+      const unlocked = sheets.filter(item => !locked(item));
+      const customers = options.map(option => {
+        const matches = unlocked.filter(item => mentions(option, item.customer));
+        return matches.length === 1 ? matches[0].customer : undefined;
+      });
+      if (customers.every(customer => customer !== undefined) && new Set(customers).size === options.length) {
+        return question(args.text, customers.slice(0, 20));
+      }
+    }
+    return question(args.text, [...new Set(options)].slice(0, 20));
   }
   if (output.tool !== 'propose_delivery' || !Array.isArray(args.edits) || args.edits.length > 200 || typeof args.readyToComplete !== 'boolean') throw intentError();
   const named = sheets.filter(item => mentions(source, item.customer));

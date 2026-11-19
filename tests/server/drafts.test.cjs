@@ -1814,7 +1814,7 @@ test('A2 agent voice transcribes the confirmed current trip without writing orde
   assert.equal(calls, 2);
 });
 
-test('A2 sends one candidate tool call and records the v2 prompt version', async t => {
+test('A2 sends one candidate tool call and records the v3 prompt version', async t => {
   const originalFetch = global.fetch;
   t.after(() => { global.fetch = originalFetch; });
   const proposal = { edits: [], readyToComplete: false, blockedReason: 'locked_sheet' };
@@ -1830,7 +1830,7 @@ test('A2 sends one candidate tool call and records the v2 prompt version', async
   assert.equal(requests.length, 1);
   assert.equal(requests[0].parallel_tool_calls, false);
   assert.equal(requests[0].tool_choice, 'required');
-  assert.equal(traces[0].promptVersion, 'a2-delivery-v2');
+  assert.equal(traces[0].promptVersion, 'a2-delivery-v3');
 });
 
 test('A2 validates changed numbers and resolves uniquely named shops when the candidate omits the sheet number', async t => {
@@ -1881,6 +1881,43 @@ test('A2 validates changed numbers and resolves uniquely named shops when the ca
   assert.equal(locked.questions, undefined);
   assert.equal(locked.delivery_proposal, undefined);
   assert.match(locked.end.text, /西桥食堂.*应收已锁定/);
+});
+
+test('A2 normalizes decorated shop choices and accepts the canonical name on direct selection', async t => {
+  const db = await isolatedDatabase(t);
+  const api = await start(db, undefined, undefined, undefined, undefined, undefined, undefined, async (phase, input) => {
+    if (phase === 'intent') return { adjust: true, query: false, answering: false };
+    if (input.previous) return { tool: 'propose_delivery', args: {
+      sheetNumber: 2, edits: [{ lineNumber: 1, receivedQuantity: 3 }], readyToComplete: false,
+    } };
+    return { tool: 'ask_delivery_user', args: {
+      text: '要改哪家店的水饺？', options: ['北街餐馆（水饺 5箱）', '西桥食堂（水饺 4箱）'],
+    } };
+  });
+  const token = await login(api, 'a');
+  const { draft } = await deliveryFixture(api, token, [
+    a2.shop('north', '北街餐馆', [a2.item('dumpling')]),
+    a2.shop('west', '西桥食堂', [a2.item('west-dumpling', '水饺', '4')]),
+  ]);
+  const before = await deliverySnapshot(db);
+  const submitted = await agentPost(api, token, 'turns', agentInput(draft, '这批水饺实收三箱'));
+  assert.equal(submitted.status, 202, JSON.stringify(submitted.data));
+  const turnId = submitted.data.turnId;
+  const question = await waitForAgent(api, token, turnId);
+  assert.equal(question.status, 'completed');
+  const { options } = question.events.find(event => event.kind === 'questions').payload.questions[0];
+  assert.deepEqual(options, ['北街餐馆', '西桥食堂']);
+
+  const answer = options[1];
+  const selected = await agentPost(api, token, 'turns', { ...agentInput(draft, answer),
+    direct: { intent: 'draft', turnId, answer } });
+  assert.equal(selected.status, 202, JSON.stringify(selected.data));
+  const confirmed = await waitForAgent(api, token, selected.data.turnId);
+  assert.equal(confirmed.status, 'completed');
+  const card = confirmed.events.find(event => event.kind === 'delivery_proposal').payload;
+  assert.equal(card.sheetId, 'west');
+  assert.equal(card.edits[0].receivedQuantity, 3);
+  assert.deepEqual(await deliverySnapshot(db), before);
 });
 
 test('A2 Harness: 全量十类现场场景', { timeout: 1_200_000 }, async t => {

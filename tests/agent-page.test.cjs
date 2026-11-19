@@ -30,7 +30,8 @@ function setup(t, initialDraft) {
   const pageFor = name => {
     let page;
     global.Page = config => {
-      page = { ...config, data: structuredClone(config.data), setData(newData) { Object.assign(this.data, newData); } };
+      page = { ...config, data: structuredClone(config.data),
+        setData(newData, callback) { Object.assign(this.data, newData); callback?.(); } };
     };
     const resolved = require.resolve(`../code/dist/pages/${name}/index`);
     delete require.cache[resolved];
@@ -293,13 +294,15 @@ test('A1 tabs share login, refresh the current trip and page through read-only h
     if (r.path === route) { r.ok(details()); return true; }
     if (r.path === route + '/delivery/line') {
       assert.equal(r.data.receivedQuantity, '1');
+      assert.equal(r.data.statusRevision, 1);
+      assert.equal(r.data.price, '82.00');
       edits = { [r.data.lineId]: { receivedQuantity: 1, unitPriceCents: 8200 } };
       revision++;
       r.ok(details());
       return true;
     }
     if (r.path === route + '/delivery/complete') {
-      assert.equal(r.data.statusRevision, 1);
+      assert.equal(r.data.statusRevision, 2);
       delivered = true;
       revision++;
       r.ok(details());
@@ -337,10 +340,27 @@ test('A1 tabs share login, refresh the current trip and page through read-only h
   assert.equal(history.data.formal.deliveryRows[0].lines[0].quantity, '2');
   assert.equal(history.saveFieldEdit, undefined);
   await delivery.openSheet(tap({ tripId: draft.id, sheetId: draft.customers[0].id }));
-  delivery.beginFieldEdit(tap({ id: draft.customers[0].items[0].id }));
-  delivery.editDeliveryField({ ...tap({ field: 'receivedQuantity' }), detail: { value: '1' } });
-  await delivery.saveFieldEdit();
+  delivery.beginDeliveryConversation();
+  delivery.editDeliveryMessage({ detail: { value: '水饺只收一箱' } });
+  delivery.sendDeliveryMessage();
+  assert.deepEqual(delivery.data.deliveryChat.proposal.changes, ['实收 2 → 1 箱']);
+  // Another session updated the same trip while the delivery tab was hidden.
+  revision++;
+  await delivery.onShow();
+  assert.equal(delivery.data.deliveryChat.proposal, null);
+  assert.equal(delivery.data.deliveryChat.text, '水饺只收一箱');
+  await delivery.saveDeliveryProposal();
+  assert.ok(!requests.some(r => r.path.endsWith('/delivery/line')));
+  delivery.sendDeliveryMessage();
+  await delivery.saveDeliveryProposal();
   assert.equal(delivery.data.sheet.lines[0].receivedQuantity, 1);
+  let selector;
+  wx.pageScrollTo = options => { selector = options.selector; };
+  delivery.editDeliveryMessage({ detail: { value: '确认送达' } });
+  delivery.sendDeliveryMessage();
+  assert.equal(delivery.data.deliveryChat, null);
+  assert.equal(selector, '#confirm-delivery');
+  assert.ok(!requests.some(r => r.path.endsWith('/delivery/complete')));
   await delivery.completeDelivery();
   assert.equal(delivery.data.sheet.balance.due, '82.00');
   await delivery.closeSheet();

@@ -753,7 +753,7 @@ test('delivery MVP shows unpriced totals and edits existing lines with a retry b
   const first = customer.items[0];
   Object.assign(first, { quantity: '5', brand: '', specification: '', price: null });
   customer.items.push({ ...first, id: 'wont-receive', product: '馄饨', quantity: '1' },
-    { ...first, id: 'priced', product: '包子', quantity: '2', price: '1.23' });
+    { ...first, id: 'priced', brand: '别牌', quantity: '2', price: '1.23' });
   const summary = previewTrip(workspace.draft, true);
   const [issued] = summary.customers;
   const result = { trip: { id: tripId, origin: 's2', versions: [{ ...summary, version: 1, savedAt: '2026-11-18T00:00:00Z' }],
@@ -793,15 +793,31 @@ test('delivery MVP shows unpriced totals and edits existing lines with a retry b
   assert.match(page.data.error, /水饺、馄饨/);
   assert.equal(page.data.sheetNeedsRefresh, false);
 
-  page.beginFieldEdit(tap({ id: first.id }));
-  page.editDeliveryField(input({ field: 'receivedQuantity' }, '3'));
-  page.editDeliveryField(input({ field: 'price' }, '12.34'));
-  const saving = page.saveFieldEdit();
+  page.beginDeliveryConversation();
+  page.editDeliveryMessage(input({}, '水饺实收三袋'));
+  page.sendDeliveryMessage();
+  assert.match(page.data.deliveryChat.reply, /单位与客户单不符/);
+  page.editDeliveryMessage(input({}, '水饺补价十二块三毛'));
+  page.sendDeliveryMessage();
+  assert.deepEqual(page.data.deliveryChat.choices.map(choice => choice.id), [first.id, 'priced']);
+  page.chooseDeliveryLine(tap({ id: first.id }));
+  assert.equal(page.data.deliveryChat.proposal.receivedQuantity, '5');
+  assert.equal(page.data.deliveryChat.proposal.price, '12.30');
+  page.editDeliveryMessage(input({}, '实收三箱，单价 12.34 元'));
+  page.sendDeliveryMessage();
+  assert.equal(page.data.deliveryChat.choices.length, 3);
+  page.chooseDeliveryLine(tap({ id: first.id }));
+  assert.match(page.data.deliveryChat.proposal.total, /¥39.48.*含 1 项待补价/);
+  assert.equal(page.data.sheet.lines[0].receivedQuantity, 5);
+  assertIdle();
+  const saving = page.saveDeliveryProposal();
   const submitted = await take('POST', route + '/delivery/line', tokenA);
   assert.equal(submitted.data.receivedQuantity, '3');
+  assert.equal(submitted.data.price, '12.34');
   submitted.timeout();
   await saving;
   assert.equal(page.data.sheetRetry, true);
+  assert.match(page.data.error, /暂未收到保存结果/);
   const edits = { [first.id]: { receivedQuantity: 3, unitPriceCents: 1234 } };
   const retry = page.retrySheetWrite();
   (await take('POST', route + '/delivery/line', tokenA, submitted.data)).respond(200, sheet(edits, 1));
@@ -812,7 +828,9 @@ test('delivery MVP shows unpriced totals and edits existing lines with a retry b
   assert.equal(page.data.sheet.lines[0].receivedQuantity, 3);
   assert.match(page.data.sheet.executionLabel, /¥39.48.*含 1 项待补价/);
   assert.deepEqual(page.data.formal.picking, result.picking);
+  assert.equal(page.data.deliveryChat.reply, '修改已保存。');
 
+  page.cancelSheetAction();
   page.beginFieldEdit(tap({ id: 'wont-receive' }));
   page.editDeliveryField(input({ field: 'receivedQuantity' }, '0'));
   const rejectLine = page.saveFieldEdit();

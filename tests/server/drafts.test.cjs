@@ -1814,6 +1814,75 @@ test('A2 agent voice transcribes the confirmed current trip without writing orde
   assert.equal(calls, 2);
 });
 
+test('A2 sends one candidate tool call and records the v2 prompt version', async t => {
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+  const proposal = { edits: [], readyToComplete: false, blockedReason: 'locked_sheet' };
+  const requests = [];
+  global.fetch = async (_url, options) => {
+    requests.push(JSON.parse(options.body));
+    return new Response(JSON.stringify({ choices: [{ finish_reason: 'tool_calls', message: makeToolReply(['propose_delivery', proposal]) }] }));
+  };
+  const model = configuredDeliveryModel({ DISPATCH_TEXT_MODEL_KEY: 'fixture-key' });
+  const traces = [];
+  const output = await model('candidate', { text: '尝试修改已签收的客户单' }, new AbortController().signal, trace => traces.push(trace));
+  assert.deepEqual(output, { tool: 'propose_delivery', args: proposal });
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].parallel_tool_calls, false);
+  assert.equal(requests[0].tool_choice, 'required');
+  assert.equal(traces[0].promptVersion, 'a2-delivery-v2');
+});
+
+test('A2 validates changed numbers and resolves uniquely named shops when the candidate omits the sheet number', async t => {
+  const db = await isolatedDatabase(t);
+  let candidate;
+  const api = await start(db, undefined, undefined, undefined, undefined, undefined, undefined, async phase =>
+    phase === 'candidate' ? { tool: 'propose_delivery', args: candidate } : { adjust: true, query: false, answering: false });
+  const token = await login(api, 'a');
+  const { draft } = await deliveryFixture(api, token, [
+    a2.shop('north', '北街餐馆', [a2.item('dumpling'), a2.item('wonton', '馄饨', '5', null)]),
+    a2.shop('west', '西桥食堂', [a2.item('fish-ball', '鱼丸')]),
+  ]);
+  const lock = await sheetEndpoint(api, token, draft.id, 'west')('delivery/complete', { requestId: randomUUID(), version: 1, statusRevision: 0 });
+  assert.equal(lock.status, 200, JSON.stringify(lock.data));
+  const before = await deliverySnapshot(db);
+  const turn = async (text, args) => {
+    candidate = { edits: [], readyToComplete: false, ...args };
+    const submitted = await agentPost(api, token, 'turns', agentInput(draft, text));
+    assert.equal(submitted.status, 202, JSON.stringify(submitted.data));
+    const result = await waitForAgent(api, token, submitted.data.turnId);
+    assert.equal(result.status, 'completed');
+    assert.deepEqual(await deliverySnapshot(db), before);
+    return Object.fromEntries(result.events.map(({ kind, payload }) => [kind, payload]));
+  };
+
+  for (const { text, edit, quantity, price } of [
+    { text: '北街餐馆的水饺少签收两箱', edit: { lineNumber: 1, receivedQuantity: 3, price: '80.00' }, quantity: 3, price: '80.00' },
+    { text: '北街餐馆水饺每箱按八十三元算', edit: { lineNumber: 1, receivedQuantity: 5, price: '83' }, quantity: 5, price: '83.00' },
+    { text: '北街餐馆的馄饨只要四箱', edit: { lineNumber: 2, receivedQuantity: 4, price: null }, quantity: 4, price: null },
+  ]) {
+    const result = await turn(text, { sheetNumber: 1, edits: [edit] });
+    assert.equal(result.questions, undefined, text);
+    assert.equal(result.delivery_proposal.edits.length, 1);
+    assert.equal(result.delivery_proposal.edits[0].receivedQuantity, quantity);
+    assert.equal(result.delivery_proposal.edits[0].price, price);
+  }
+
+  const unsupported = await turn('北街餐馆的水饺少收两箱', { sheetNumber: 1, edits: [{ lineNumber: 1, receivedQuantity: 3, price: '81' }] });
+  assert.equal(unsupported.delivery_proposal, undefined);
+  assert.match(unsupported.questions.questions[0].text, /单价/);
+
+  const ready = await turn('北街餐馆的货已经收齐', { readyToComplete: true });
+  assert.equal(ready.questions, undefined);
+  assert.equal(ready.delivery_proposal.sheetId, 'north');
+  assert.deepEqual(ready.delivery_proposal.edits, []);
+
+  const locked = await turn('西桥食堂的鱼丸只收三箱', { blockedReason: 'locked_sheet' });
+  assert.equal(locked.questions, undefined);
+  assert.equal(locked.delivery_proposal, undefined);
+  assert.match(locked.end.text, /西桥食堂.*应收已锁定/);
+});
+
 test('A2 Harness: 全量十类现场场景', { timeout: 1_200_000 }, async t => {
   const model = a2Live ? configuredDeliveryModel({ ...process.env, DISPATCH_A2_MODEL: 'deepseek-flash' }) : null;
   if (a2Live) assert.ok(model, '请在当前进程配置 DISPATCH_TEXT_MODEL_KEY；未执行真实模型评测。');

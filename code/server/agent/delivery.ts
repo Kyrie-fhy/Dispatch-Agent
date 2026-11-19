@@ -55,8 +55,9 @@ function resolve(trip: Trip, sheets: Sheet[], output: unknown, source: string): 
     return question(args.text, [...new Set<string>(args.options)].slice(0, 20));
   }
   if (output.tool !== 'propose_delivery' || !Array.isArray(args.edits) || args.edits.length > 200 || typeof args.readyToComplete !== 'boolean') throw intentError();
-  const sheet = typeof args.sheetNumber === 'number' && Number.isSafeInteger(args.sheetNumber) ? sheets[args.sheetNumber - 1] : undefined;
   const named = sheets.filter(item => mentions(source, item.customer));
+  const sheet = args.sheetNumber === undefined && named.length === 1 ? named[0] :
+    typeof args.sheetNumber === 'number' && Number.isSafeInteger(args.sheetNumber) ? sheets[args.sheetNumber - 1] : undefined;
   if (sheet && (named.includes(sheet) || !named.length) && locked(sheet)) {
     return { text: `「${sheet.customer}」已确认送达，应收已锁定，不能再改。` };
   }
@@ -96,15 +97,17 @@ function resolve(trip: Trip, sheets: Sheet[], output: unknown, source: string): 
     }
     const receivedQuantity = change.receivedQuantity === undefined ? line.receivedQuantity : change.receivedQuantity;
     if (typeof receivedQuantity !== 'number' || !Number.isSafeInteger(receivedQuantity) || receivedQuantity < 0 ||
-        (change.receivedQuantity !== undefined && !quantityFrom(source, line, receivedQuantity))) {
+        (receivedQuantity !== line.receivedQuantity && !quantityFrom(source, line, receivedQuantity))) {
       return question(`请说清楚${line.product}实际收了多少${line.unit}。`, [], sheet.customer);
     }
     let unitPriceCents = line.unitPriceCents;
-    if (change.price !== undefined) {
+    if (change.price !== undefined && !(change.price === null && line.unitPriceCents === null)) {
       const raw = typeof change.price === 'number' ? String(change.price) : change.price;
       try {
-        if (typeof raw !== 'string' || !hasSpokenNumber(source.replace(/第\s*[\d一二两三四五六七八九十]+\s*行/g, ''), raw)) throw intentError();
+        if (typeof raw !== 'string') throw intentError();
         unitPriceCents = unitPrice(raw);
+        if (unitPriceCents === null || (unitPriceCents !== line.unitPriceCents &&
+            !hasSpokenNumber(source.replace(/第\s*[\d一二两三四五六七八九十]+\s*行/g, ''), raw))) throw intentError();
       } catch {
         return question(`请说清楚${line.product}每${line.unit}的单价。`, [], sheet.customer);
       }

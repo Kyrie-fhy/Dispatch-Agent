@@ -412,9 +412,7 @@ Page({
     return this.run(async () => {
       try {
         await this.request('/trips/confirm', { previewId });
-        this.confirmedPreviewId = previewId;
-        this.setData({ confirmed: true });
-        this.render();
+        await this.reload();
       } catch (error) {
         if (error instanceof WorkspaceError && draftConflicts.includes(error.code)) {
           await this.reload();

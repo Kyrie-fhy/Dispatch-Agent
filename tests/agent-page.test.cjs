@@ -213,7 +213,7 @@ test('A1 chat restores original input on failed submission, then polls progress 
 
 test('A1 restores failed messages, renders revision-safe undo and only confirms through the existing trip API', async t => {
   const base = order();
-  const { page, requests, navigation, card, event, handle, setDraft, setConfirmed, setTurns } = setup(t, base);
+  const { page, requests, navigation, card, event, handle, setDraft, setConfirmed, setDelivery, setTurns } = setup(t, base);
   const change = event('change', { lines: ['老王 水饺 数量：1箱 → 2箱'] });
   const saved = event('end', { text: '已整理', status: 'completed', revision: 1 });
   const failure = event('end', { text: '处理失败。草稿没有变化。', status: 'failed', revision: 1 });
@@ -249,6 +249,9 @@ test('A1 restores failed messages, renders revision-safe undo and only confirms 
       } else {
         assert.equal(request.data.previewId, secondPreview.previewId);
         setConfirmed(true, secondPreview.previewId);
+        setDelivery({ tripId: base.id, version: 1, statusRevision: 0, shops: [
+          { sheetId: base.customers[0].id, customer: '老王', locked: false, totalCents: 16400, pendingPrices: 0 },
+        ] });
         request.ok({ picking: [{ id: 'row', product: '水饺', quantity: 2, unit: '箱' }] });
       }
       return true;
@@ -283,8 +286,18 @@ test('A1 restores failed messages, renders revision-safe undo and only confirms 
   assert.equal(retried, true);
   assert.deepEqual(requests.find(r => r.path === '/agent/turns').data.direct, { intent: 'preview' });
   assert.equal(page.data.turns.at(-1).elapsed, '用时 4 秒');
+  page.setData({ text: '未发送的草稿', attachments: [{ id: 'image-1', name: '图片 1' }], voiceRetry: true });
+  page.voiceFile = { draft: nextDraft, path: 'draft.pcm' };
   await page.confirm(tap({ id: secondPreview.previewId }));
   assert.equal(page.data.confirmed, true);
+  assert.equal(page.data.issuedCard, true);
+  assert.equal(page.data.draftStrip, null);
+  assert.equal(page.data.deliveryStrip.label, '本趟送货 · 0/1 家已送达');
+  assert.deepEqual(navigation, []);
+  assert.equal(page.data.text, '');
+  assert.deepEqual(page.data.attachments, []);
+  assert.equal(page.data.voiceRetry, false);
+  assert.equal(page.voiceFile, null);
   page.showPickingList();
   assert.equal(navigation.at(-1), '/pages/trip-picking/index');
   assert.equal(page.data.turns.at(-1).checklist[0].state, 'done');

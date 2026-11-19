@@ -1,5 +1,7 @@
 import { agentSession } from '../../services/agent-session';
-import { emptyItem, ItemInput, money, nullablePrice } from '../../core/orders';
+import { deliveryCandidates, deliveryMessageLimit, parseDeliveryMessage } from '../../core/delivery-conversation';
+import { deliverySummary } from '../../core/delivery-execution';
+import { emptyItem, ItemInput, lineAmount, money, nullablePrice, unitPrice } from '../../core/orders';
 import { Material, materialImagePattern, MaterialSource } from '../../core/materials';
 import { localDay, OpeningPreview, ReceiptPreview, Sheet } from '../../core/settlement';
 import { textOrderLimit, textOrderQuestions } from '../../core/text-order';
@@ -9,7 +11,7 @@ import { chooseMaterial, forgetStaged, materialInfo, sameMaterial, stagedMateria
 import { readVoiceFile, startVoiceRecording, transcribeVoice, VoiceFileError, VoicePermissionError } from '../../services/voice';
 import { FormalTrip, revokeSession, TripPreview, wechatCode, Workspace, WorkspaceError, workspaceRequest } from '../../services/workspace';
 import { deliveryMvp } from '../../services/workspace-config';
-import { deliveryLabel, editLines, errorMessage, formLines, lineView, productLabel, tripView } from '../order-view';
+import { amountLabel, deliveryLabel, editLines, errorMessage, formLines, lineView, productLabel, tripView } from '../order-view';
 import { AmendmentPreview, balanceChange, DeliveryMark, DeliveryPreview, ServerLedger, ServerSheet, settlementPreview,
   SheetAction, sheetPath, sheetView } from './sheet-view';
 
@@ -20,6 +22,13 @@ type VoiceFile = { id: string; revision: number; path: string };
 type VoicePhase = '' | 'starting' | 'recording' | 'stopping' | 'transcribing';
 const draftConflictCodes = ['draft_changed', 'draft_confirmed', 'draft_not_found'];
 type PreviewView = ReturnType<typeof tripView> & { previewId: string; identities: string[] };
+type DeliveryProposal = { lineId: string; receivedQuantity: string; price: string | null;
+  label: string; changes: string[]; total: string };
+
+function deliveryConversation(text = '', reply = '') {
+  return { text, reply, choices: [] as { id: string; label: string }[], proposal: null as DeliveryProposal | null };
+}
+
 function sheetEditor() {
   return {
     sheetAction: '' as SheetAction | '',
@@ -34,6 +43,7 @@ function sheetEditor() {
     paymentPreview: null as ReturnType<typeof settlementPreview> | null,
     payment: { amount: '', day: '', source: '' },
     fieldEdit: null as { id: string; receivedQuantity: string; price: string } | null,
+    deliveryChat: null as ReturnType<typeof deliveryConversation> | null,
     amendment: [] as ItemInput[],
     amendmentForm: [] as ReturnType<typeof formLines>,
     replacements: {} as Record<string, DeliveryMark>,
@@ -53,7 +63,7 @@ function amendmentChanges(result: AmendmentPreview) {
 function initialData() {
   return {
     signedIn: false, busy: false, error: '', revokeFailed: false, section: 'draft' as Section,
-    deliveryMvp, textOrderLimit, orderText: '', organizingText: false, textSaved: false, textNotice: '',
+    deliveryMvp, deliveryMessageLimit, textOrderLimit, orderText: '', organizingText: false, textSaved: false, textNotice: '',
     textQuestions: [] as ReturnType<typeof textOrderQuestions>,
     voicePhase: '' as VoicePhase, voiceRetry: false, voicePermission: false, selectedImage: '',
     draft: null as TripDraft | null, draftConfirmed: false, active: null as CustomerDraft | null,
@@ -658,8 +668,14 @@ Page({
         ? workspaceRequest<FormalTrip>('GET', `/trips/${target.tripId}`, token) : null,
     ]);
     if (generation !== this.generation) return;
+    const { sheet, deliveryChat } = this.data;
+    const refreshed = details.sheet;
+    const chatUpdate = deliveryChat && (refreshed.reviewed || refreshed.version !== sheet?.version ||
+        refreshed.statusRevision !== sheet?.statusRevision)
+      ? { deliveryChat: refreshed.reviewed ? null : deliveryConversation(deliveryChat.text, '客户单已更新，请重新发送并核对。') }
+      : {};
     this.setData({ sheet: sheetView(details.sheet, account?.ledger), sheetNeedsRefresh: false,
-      ...(formal ? { formal: formalTripView(formal) } : {}) });
+      ...chatUpdate, ...(formal ? { formal: formalTripView(formal) } : {}) });
   },
 
   sheetBalanceChange(before: DeliveryPreview['before'], after: DeliveryPreview['after']) {
@@ -683,11 +699,14 @@ Page({
     catch (error) {
       if (generation === this.generation && error instanceof WorkspaceError &&
           ['delivery_changed', 'amendment_changed', 'ledger_changed', 'delivery_preview_required',
-            'sheet_not_reviewed', 'line_not_found', 'preview_not_found', 'unrecorded_delivery'].includes(error.code)) {
+            'delivery_completed', 'delivery_reviewed', 'sheet_not_reviewed', 'line_not_found',
+            'preview_not_found', 'unrecorded_delivery'].includes(error.code)) {
         const staleAmendment = this.data.sheetAction === 'amendment';
+        const chat = this.data.deliveryChat;
         this.pending = null;
         this.setData({
           ...(staleAmendment ? sheetEditor() : { changePreview: null, paymentPreview: null, fieldEdit: null }),
+          ...(chat ? { deliveryChat: deliveryConversation(chat.text, '请按最新客户单重新发送并核对。') } : {}),
           sheetNeedsRefresh: true,
         });
       }
@@ -700,6 +719,7 @@ Page({
     if (!target || !this.token) return;
     return this.run(async generation => {
       const token = this.token;
+      const chatSave = route === '/delivery/line' && !!this.data.deliveryChat?.proposal;
       try { await this.sheetCommand(route, input, token, target); }
       catch (error) {
         if (generation === this.generation && !(error instanceof WorkspaceError && error.status >= 400 && error.status < 500)) {
@@ -717,7 +737,12 @@ Page({
       this.pending = null;
       this.unresolvedSheetWrite = null;
       this.setData({ ...sheetEditor(), sheetRetry: false, sheetNeedsRefresh: true });
-      try { await this.readSheet(generation, token, target, true); }
+      try {
+        await this.readSheet(generation, token, target, true);
+        if (chatSave && generation === this.generation && this.data.sheet && !this.data.sheet.reviewed) {
+          this.setData({ deliveryChat: deliveryConversation('', '修改已保存。') });
+        }
+      }
       catch (error) {
         if (error instanceof WorkspaceError && error.status === 401) throw error;
         throw new Error('本次操作已保存，请重新读取单据');
@@ -730,9 +755,78 @@ Page({
     if (retry) return this.writeSheet(retry.route, retry.input);
   },
 
+  beginDeliveryConversation() {
+    const { sheet, fieldEdit } = this.data;
+    if (!this.data.deliveryMvp || !sheet || !this.sheetReady() || sheet.reviewed || fieldEdit) return;
+    this.setData({ error: '', deliveryChat: deliveryConversation() });
+  },
+
+  editDeliveryMessage(event: WechatMiniprogram.Input) {
+    if (!this.data.deliveryChat || !this.sheetReady()) return;
+    this.setData({ error: '', deliveryChat: deliveryConversation(event.detail.value) });
+  },
+
+  sendDeliveryMessage() { this.prepareDeliveryMessage(); },
+
+  chooseDeliveryLine(event: WechatMiniprogram.TouchEvent) {
+    const id = event.currentTarget.dataset.id;
+    if (this.data.deliveryChat?.choices.some(choice => choice.id === id)) this.prepareDeliveryMessage(id);
+  },
+
+  prepareDeliveryMessage(selectedId?: string) {
+    const { sheet, deliveryChat } = this.data;
+    if (!sheet || !deliveryChat || !this.sheetReady() || sheet.reviewed) return;
+    const { text } = deliveryChat;
+    const next = deliveryConversation(text);
+    try {
+      const command = parseDeliveryMessage(text);
+      if (command.kind === 'complete') return this.goToDeliveryConfirmation();
+      const { edit } = command;
+      const candidates = deliveryCandidates(sheet.lines, edit);
+      const line = selectedId ? candidates.find(item => item.id === selectedId)
+        : candidates.length === 1 ? candidates[0] : undefined;
+      if (!line) {
+        next.reply = '要改哪条配送明细？';
+        next.choices = candidates.map(item => ({ id: item.id,
+          label: `第 ${sheet.lines.indexOf(item) + 1} 行 · ${item.productLabel} · ${item.unit}` }));
+      } else {
+        const received = edit.receivedQuantity ?? line.receivedQuantity;
+        const cents = edit.price === undefined ? line.unitPriceCents : unitPrice(edit.price);
+        const price = cents === null ? null : money(cents);
+        const changes = [];
+        if (received !== line.receivedQuantity) changes.push(`实收 ${line.receivedQuantity} → ${received} ${line.unit}`);
+        if (cents !== line.unitPriceCents) changes.push(`单价 ${line.priceLabel} → ¥${price}`);
+        if (changes.length) {
+          const amountCents = lineAmount(received, cents);
+          const { totalCents, pendingPrices } = deliverySummary(sheet.lines.map(item =>
+            item.id === line.id ? { ...item, amountCents } : item));
+          next.proposal = { lineId: line.id, receivedQuantity: String(received), price, changes,
+            label: `${line.productLabel} · ${line.unit}`, total: amountLabel(totalCents, pendingPrices, '预计应收') };
+        } else next.reply = '这条明细已是该数量或单价。';
+      }
+    } catch (error) {
+      next.reply = errorMessage(error);
+    }
+    this.setData({ deliveryChat: next });
+  },
+
+  saveDeliveryProposal() {
+    const { sheet, deliveryChat } = this.data;
+    const proposal = deliveryChat?.proposal;
+    if (!sheet || !proposal || !this.sheetReady() || sheet.reviewed) return;
+    const { lineId, receivedQuantity, price } = proposal;
+    return this.writeSheet('/delivery/line', { version: sheet.version, statusRevision: sheet.statusRevision, lineId, receivedQuantity, price });
+  },
+
+  goToDeliveryConfirmation() {
+    const { sheet, deliveryChat } = this.data;
+    if (!sheet || !deliveryChat || !this.sheetReady() || sheet.reviewed || deliveryChat.proposal || deliveryChat.choices.length) return;
+    this.setData({ deliveryChat: null, error: '' }, () => wx.pageScrollTo({ selector: '#confirm-delivery', duration: 250 }));
+  },
+
   beginFieldEdit(event: WechatMiniprogram.TouchEvent) {
     const sheet = this.data.sheet;
-    if (!this.data.deliveryMvp || !sheet || !this.sheetReady() || sheet.reviewed) return;
+    if (!this.data.deliveryMvp || !sheet || !this.sheetReady() || sheet.reviewed || this.data.deliveryChat) return;
     const line = sheet.lines.find(line => line.id === event.currentTarget.dataset.id);
     if (!line) return;
     this.setData({ error: '', fieldEdit: { id: line.id, receivedQuantity: String(line.receivedQuantity), price: line.price ?? '' } });
@@ -752,8 +846,8 @@ Page({
   },
 
   completeDelivery() {
-    const { sheet, fieldEdit } = this.data;
-    if (!this.data.deliveryMvp || !sheet || fieldEdit || !this.sheetReady() || sheet.reviewed) return;
+    const { sheet, fieldEdit, deliveryChat } = this.data;
+    if (!this.data.deliveryMvp || !sheet || fieldEdit || deliveryChat || !this.sheetReady() || sheet.reviewed) return;
     return this.writeSheet('/delivery/complete', { version: sheet.version, statusRevision: sheet.statusRevision });
   },
 

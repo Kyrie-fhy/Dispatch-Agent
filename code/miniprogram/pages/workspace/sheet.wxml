@@ -114,6 +114,29 @@
   </view>
 
   <block wx:else>
+    <view wx:if="{{deliveryMvp && !sheet.reviewed && !fieldEdit}}" class="card">
+      <button wx:if="{{!deliveryChat}}" bindtap="beginDeliveryConversation" disabled="{{busy}}">对话改单</button>
+      <block wx:else>
+        <view class="section-title">对话改单</view>
+        <textarea class="order-text delivery-message" value="{{deliveryChat.text}}" maxlength="{{deliveryMessageLimit}}"
+          placeholder="如：水饺实收三箱，单价 12.35 元" bindinput="editDeliveryMessage" disabled="{{busy}}" />
+        <button bindtap="sendDeliveryMessage" disabled="{{busy || !deliveryChat.text}}">发送</button>
+        <view wx:if="{{deliveryChat.reply}}" class="hint" role="status">{{deliveryChat.reply}}</view>
+        <button wx:for="{{deliveryChat.choices}}" wx:key="id" data-id="{{item.id}}"
+          bindtap="chooseDeliveryLine" disabled="{{busy}}">{{item.label}}</button>
+        <view wx:if="{{deliveryChat.proposal}}" class="line">
+          <view class="product">{{deliveryChat.proposal.label}}</view>
+          <view wx:for="{{deliveryChat.proposal.changes}}" wx:key="*this">{{item}}</view>
+          <view class="hint">{{deliveryChat.proposal.total}}</view>
+          <button class="primary" bindtap="saveDeliveryProposal" disabled="{{busy}}" loading="{{busy}}">确认保存修改</button>
+        </view>
+        <view class="workspace-actions">
+          <button size="mini" bindtap="cancelSheetAction" disabled="{{busy}}">退出对话</button>
+          <button wx:if="{{!deliveryChat.proposal && !deliveryChat.choices.length}}" size="mini"
+            bindtap="goToDeliveryConfirmation" disabled="{{busy}}">去确认送达</button>
+        </view>
+      </block>
+    </view>
     <view class="card">
       <view class="section-title">配送明细</view>
       <view class="line" wx:for="{{sheet.lines}}" wx:key="id">
@@ -137,7 +160,7 @@
             <button size="mini" bindtap="cancelSheetAction" disabled="{{busy}}">取消</button>
           </view>
           <button wx:elif="{{!sheet.reviewed && !fieldEdit}}" size="mini" data-id="{{item.id}}"
-            bindtap="beginFieldEdit" disabled="{{busy}}">改实收与单价</button>
+            bindtap="beginFieldEdit" disabled="{{busy || !!deliveryChat}}">改实收与单价</button>
         </block>
         <block wx:else>
           <template is="order-line" data="{{line: item}}" />
@@ -148,8 +171,8 @@
           <button wx:if="{{item.status !== 'pending'}}" size="mini" data-id="{{item.id}}" data-status="pending" bindtap="markDelivery" disabled="{{busy}}">标记未配送</button>
         </view>
       </view>
-      <button wx:if="{{deliveryMvp && !sheet.reviewed}}" class="primary" bindtap="completeDelivery"
-        disabled="{{busy || !!fieldEdit}}" loading="{{busy}}">按实收数量确认送达</button>
+      <button wx:if="{{deliveryMvp && !sheet.reviewed}}" id="confirm-delivery" class="primary" bindtap="completeDelivery"
+        disabled="{{busy || !!fieldEdit || !!deliveryChat}}" loading="{{busy}}">按实收数量确认送达</button>
       <button wx:if="{{!deliveryMvp && sheet.pending.length}}" bindtap="markDelivery" data-status="delivered" disabled="{{busy}}">本客户整单送达</button>
       <button wx:if="{{!deliveryMvp && !sheet.reviewed}}" class="primary" data-action="review" bindtap="beginSheetAction" disabled="{{busy}}">{{deliveryMvp ? '核对配送' : '开始对账'}}</button>
       <button wx:if="{{!deliveryMvp}}" data-action="amendment" bindtap="beginSheetAction" disabled="{{busy}}">更正单据</button>

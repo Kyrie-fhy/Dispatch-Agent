@@ -20,9 +20,17 @@ type RecognizedImage = Awaited<ReturnType<TextOrders['recognizeImage']>>;
 type Run = { key: TurnKey; input: Input; revision: number; signal: AbortSignal; previous?: PreviousQuestions;
   checkSession: () => Promise<unknown>; readRevision?: number; used: number; lines: string[]; questions: Question[] };
 
-const emptyIntent: Intent = { draft: false, query: false, preview: false };
+const emptyIntent: Intent = { draft: false, query: false, preview: false, answering: false };
 const draftTools = ['edit_draft', 'ask_user'] as const;
-const previewClause = /^(?:然后|接着|接下来|之后|再|顺便|并)?\s*(?:帮我|给我)?\s*(?:预览|(?:出|开|打|生成|打印|看)(?:一下|一?[张份个])?(?:这趟|本趟|本次)?(?:配送|送货)?(?:单子?|预览))$/;
+
+function customerOption(number: number, name: string) {
+  return `客户 ${number}（${name}）`;
+}
+
+function matchesConfirmation(question: Question, confirmation: NonNullable<PreviousQuestions['confirmation']>) {
+  return question.options.length === 2 && question.options.includes(confirmation.accept) &&
+    question.options.includes(confirmation.accept === '改' ? '不改' : '保留');
+}
 
 function plan(intent: Intent, imageCount: number, answering: boolean, received: string): PlanStep[] {
   const steps = [{ id: 'intent', text: received }];
@@ -134,13 +142,16 @@ export class AgentRuntime {
     try {
       await run.checkSession();
       const context = await this.store.context(key, run.revision);
-      run.previous = context.previous;
-      const selected = input.direct?.intent === 'draft' ? input.direct.answer : input.text;
-      const confirmation = run.previous?.confirmation;
-      const selectedConfirmation = confirmation && run.previous?.payload.questions.some(q => q.options.includes(selected));
+      const previous = context.previous;
+      const directAnswer = input.direct?.intent === 'draft' ? input.direct.answer : undefined;
+      const confirmation = previous?.confirmation;
+      const selectedConfirmation = directAnswer && confirmation && previous.payload.questions.some(
+        question => matchesConfirmation(question, confirmation) && question.options.includes(directAnswer));
       const intent = input.direct ? { ...emptyIntent, [input.direct.intent]: true }
         : !input.text ? emptyIntent : await this.identify(run, context);
-      steps = plan(intent, input.materialIds.length, Boolean(run.previous), title);
+      const answering = Boolean(directAnswer || (intent.answering && intent.draft && previous?.payload.questions.length));
+      if (answering) run.previous = previous;
+      steps = plan(intent, input.materialIds.length, answering, title);
       await this.store.append(key, 'plan', { steps });
       planned = true;
       await step('intent', 'running');
@@ -195,26 +206,34 @@ export class AgentRuntime {
       if (intent.draft) {
         await begin('edit');
         const beforeEdit = run.revision;
-        if (selectedConfirmation && confirmation) {
-          if (selected === confirmation.accept) {
-            await this.applyEdit(run, confirmation.operations, run.previous!.text, true);
+        if (selectedConfirmation && confirmation && previous) {
+          if (directAnswer === confirmation.accept) {
+            await this.applyEdit(run, confirmation.operations, previous.text, true);
           }
         } else {
           const draft = await this.readDraft(run);
-          const derived = this.deriveEdit(run, draft, intent);
-          if (derived && derived.questions) run.questions.push(...derived.questions);
-          else if (derived) await this.applyEdit(run, [derived]);
-          else await this.organize(run, draft);
-
+          if (!directAnswer || !await this.selectCustomer(run, draft, directAnswer)) {
+            await this.organize(run, draft);
+          }
         }
         const needsInput = run.questions.length > 0 && beforeEdit === run.revision;
         await step('edit', needsInput ? 'needs_input' : 'done',
           needsInput ? `${run.questions.length} 处需要你确认` : run.lines.length ? run.lines.join('；') : '草稿没有变化');
       }
 
+      let questionSource: string | undefined;
       if (intent.draft || input.materialIds.length) {
         await begin('check');
-        if (!run.questions.length && run.revision !== input.revision) run.questions.push(...await this.requiredQuestions(run));
+        if (run.revision !== input.revision) run.questions.push(...await this.requiredQuestions(run));
+        if (!answering && previous) {
+          const carried = previous.payload.questions.filter(question => !confirmation || !matchesConfirmation(question, confirmation));
+          if (carried.length) {
+            const original = previous.payload.sourceText ?? previous.text;
+            questionSource = run.questions.length && input.text ? `${original}\n${input.text}` : original;
+            run.questions.push(...carried);
+          }
+        }
+        run.questions = [...new Map(run.questions.map(question => [JSON.stringify(question), question])).values()];
         const draft = await this.readDraft(run);
         await step('check', run.questions.length ? 'needs_input' : 'done',
           [run.questions.length ? `${run.questions.length} 处待确认` : '', `${draft.pendingPrices} 处待补价`].filter(Boolean).join(' · '));
@@ -262,7 +281,7 @@ export class AgentRuntime {
           }
         }
       }
-      if (run.questions.length) await this.store.append(key, 'questions', { questions: run.questions });
+      if (run.questions.length) await this.store.append(key, 'questions', { questions: run.questions, sourceText: questionSource });
       const summary = run.lines.length ? '草稿已更新。' : '草稿没有变化。';
       await this.store.finish(key, 'completed', [replyText, summary].filter(Boolean).join('\n'));
     } catch (error) {
@@ -276,54 +295,13 @@ export class AgentRuntime {
     }
   }
 
-  private deriveEdit(run: Run, draft: Awaited<ReturnType<AgentRuntime['readDraft']>>, intent: Intent) {
-    const text = normalized(run.input.text);
-    const rows = draft.customers.flatMap(customer => customer.items.map(item => ({ customer: customer.customer, ...item })));
-    const quantityChange = (source: string, canPreview: boolean) => {
-      const [clause, ...tail] = source.split(/[，,。；;]+/).map(part => part.trim()).filter(Boolean);
-      const match = clause?.match(/^(.*?)(再要|再来|再加|加上|追加|加|这次|这趟|本趟|本次|要)\s*(.+)$/);
-      if (!match || tail.some(part => !canPreview || !previewClause.test(part))) return;
-      const [, prefix, verb, suffix] = match;
-      const [amount] = spokenNumbers(suffix);
-      if (!amount || amount.start !== 0 || !amount.value || !Number.isInteger(amount.value)) return;
-      const unit = suffix.slice(amount.end).trim().replace(/(?:了)?[哈啊呀呢哦]?$/, '');
-      const matches = rows.filter(row => unit === row.unit && (prefix === row.customer || prefix === row.product ||
-        prefix === row.customer + row.product || prefix === row.customer + '的' + row.product || prefix === row.product + row.customer));
-      if (matches.length !== 1) return;
-      return { row: matches[0], amount: amount.value, ambiguous: verb === '再要' || verb === '再来', increment: /加/.test(verb) };
-    };
-    if (run.previous) {
-      const [question] = run.previous.payload.questions;
-      const party = text.match(/^(?:选择已有)?客户\s*(\d+)(?:[（(].*[）)])?$/)?.[1];
-      const matching = draft.customers.filter(customer => customer.customerChoice === 'unresolved' &&
-        customer.customer === question?.customer && (party === undefined ||
-          customer.customerOptions.some(option => option.partyNumber === Number(party))));
-      if (matching.length === 1 && (party || text === '新建客户')) {
-        return { action: 'set_customer', customerNumber: matching[0].customerNumber, partyId: party ? undefined : null };
-      }
-      const prior = quantityChange(normalized(run.previous.text), false);
-      const option = question?.options.find(answer => normalized(answer) === text ||
-        (text === '追加' && answer.startsWith('追加')) || (text === '改成' && answer.startsWith('改成')));
-      if (prior?.ambiguous && option) {
-        const quantity = (option.startsWith('追加') ? Number(prior.row.quantity) : 0) + prior.amount;
-        return { action: 'update', target: prior.row.target, quantity: String(quantity) };
-      }
-      return;
-    }
-    const quantity = quantityChange(text, intent.preview);
-    if (quantity?.ambiguous) {
-      const { row, amount } = quantity;
-      return { questions: [{ customer: row.customer, text: `${row.product} 是改成 ${amount} ${row.unit}，还是再加 ${amount} ${row.unit}？`,
-        options: [`改成 ${amount} ${row.unit}`, `追加 ${amount} ${row.unit}`] }] };
-    }
-    if (quantity) return { action: 'update', target: quantity.row.target,
-      quantity: String((quantity.increment ? Number(quantity.row.quantity) : 0) + quantity.amount) };
-    const amounts = spokenNumbers(text);
-    const missing = rows.filter(item => !item.price);
-    if (amounts.length === 1 && amounts[0].start === 0 && amounts[0].end === text.length &&
-        amounts[0].value !== null && amounts[0].value > 0 && missing.length === 1) {
-      return { action: 'fill', target: missing[0].target, price: String(amounts[0].value) };
-    }
+  private async selectCustomer(run: Run, draft: Awaited<ReturnType<AgentRuntime['readDraft']>>, answer: string) {
+    const matches = draft.customers.filter(customer => customer.customerChoice === 'unresolved' &&
+      run.previous?.payload.questions.some(question => question.customer === customer.customer && question.options.includes(answer)) &&
+      (answer === '新建客户' || customer.customerOptions.some(option => answer === customerOption(option.partyNumber, option.name))));
+    if (matches.length !== 1) return false;
+    await this.applyEdit(run, [{ action: 'set_customer', customerNumber: matches[0].customerNumber }], answer);
+    return true;
   }
 
   private async organize(run: Run, draft: Awaited<ReturnType<AgentRuntime['readDraft']>>) {
@@ -332,7 +310,7 @@ export class AgentRuntime {
     const text = input.text.normalize('NFKC');
     const numbers = spokenNumbers(text).map(({ start, end, value }) => ({ original: text.slice(start, end), value, after: text.slice(end, end + 4) }));
     const reply = await this.complete(run, agentPrompt, { text: input.text, numbers, customers,
-      previous: run.previous ? { text: run.previous.text, questions: run.previous.payload.questions } : null }, draftTools);
+      previous: run.previous ? { text: run.previous.payload.sourceText ?? run.previous.text, questions: run.previous.payload.questions } : null }, draftTools);
     for (const call of reply.tool_calls ?? []) {
       const name = call?.function?.name;
       if (!draftTools.some(tool => tool === name) || typeof call.id !== 'string') invalidTool();
@@ -366,6 +344,7 @@ export class AgentRuntime {
       intents = await withDeadline(this.intentModel(run.input.text, {
         customers, questions: context.previous?.payload.questions ?? [], lastSummary: context.lastSummary,
       }, run.signal, value => { trace = value; }), run.signal);
+      intents = { ...intents, answering: Boolean(intents.draft && intents.answering && context.previous?.payload.questions.length) };
       return intents;
     } finally {
       await this.recordModel(run, started, trace, { phase: 'intent', intents });
@@ -416,7 +395,7 @@ export class AgentRuntime {
       return textOrderQuestions(draft).map(({ id, name, issues }) => {
         const customer = draft.customers.find(entry => entry.id === id);
         const options = customer?.customer.trim() && customer.partyId === undefined
-          ? [...parties.flatMap((party, i) => normalized(party.name) === normalized(name) ? [`客户 ${i + 1}（${party.name}）`] : []), '新建客户']
+          ? [...parties.flatMap((party, i) => normalized(party.name) === normalized(name) ? [customerOption(i + 1, party.name)] : []), '新建客户']
           : [];
         return { customer: name, text: issues.join('；'), options };
       });

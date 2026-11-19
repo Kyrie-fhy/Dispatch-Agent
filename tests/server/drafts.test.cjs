@@ -78,7 +78,7 @@ function runPostgresClient(tool, database, args, input) {
 }
 
 async function start(db, wechat, textModel, imageModel, speechModel, agentModel,
-  intentModel = agentModel && (async () => ({ draft: true, preview: false, query: false }))) {
+  intentModel = agentModel && (async () => ({ draft: true, preview: false, query: false, answering: false }))) {
   const pool = db.pool();
   let server;
   try {
@@ -1861,8 +1861,8 @@ const localCasesPath = resolve(__dirname, '../fixtures/a1-heldout.local.json');
 const localCases = existsSync(localCasesPath) ? require(localCasesPath) : [];
 const intentLabel = ({ draft, query, preview }) =>
   [draft && 'draft', query && 'query', preview && 'preview'].filter(Boolean).join('+') || 'other';
-const originalLabels = new Map(originalSamples().map(sample => [sample.id, intentLabel(sample.expected)]));
-const heldoutLabels = new Map(heldoutSamples(localCases).map(sample => [sample.id, intentLabel(sample.expected)]));
+const originalIntents = new Map(originalSamples().map(sample => [sample.id, sample.expected]));
+const heldoutIntents = new Map(heldoutSamples(localCases).map(sample => [sample.id, sample.expected]));
 
 const localAdd = (customer, product, quantity, unit, price) =>
   a1.edit(a1.add(customer, product, quantity, { unit, ...(price ? { price } : {}) }));
@@ -1879,6 +1879,18 @@ const localActions = {
   'two-stores': [a1.edit(a1.add('小冯', '手抓饼', '2', { unit: '提' }), a1.add('黄叔', '糯米鸡', '26', { unit: '盒' }))],
 };
 
+const a1LineFields = ['brand', 'product', 'specification', 'unit', 'quantity', 'price'];
+function assertAgentLines(customers, expected) {
+  const rows = customers.flatMap(customer => customer.items.map(item => ({ customer: customer.customer, ...item })));
+  assert.equal(rows.length, expected.length);
+  for (const [index, row] of rows.entries()) {
+    const [customer, product, brand, specification, unit, quantity, price] = expected[index];
+    const fields = { brand, product, specification, unit, quantity, price };
+    assert.equal(row.customer, customer, `line ${index + 1} customer`);
+    for (const field of a1LineFields) assert.equal(row[field], fields[field], `line ${index + 1} ${field}`);
+  }
+}
+
 function checklist(result, intent, { image, answering, direct, needs, unresolvedEdit } = {}) {
   const plan = result.events.filter(event => event.kind === 'plan');
   assert.equal(plan.length, 1);
@@ -1892,6 +1904,13 @@ function checklist(result, intent, { image, answering, direct, needs, unresolved
   assert.deepEqual(plan[0].payload.steps.map(step => step.id), ids);
   assert.ok(result.events.filter(event => event.kind === 'step').every(event => event.seq > plan[0].seq));
   assert.equal(plan[0].payload.steps[0].text, direct ? '已收到你的选择' : '看懂你的意思');
+  if (intent.includes('draft')) {
+    const labels = Object.fromEntries(plan[0].payload.steps.map(step => [step.id, step.text]));
+    assert.equal(labels.read, answering ? undefined : '读当前草稿');
+    assert.equal(labels.edit, answering ? '按你的回答改草稿' : '整理进草稿');
+    assert.equal(labels.check, answering ? '核对剩下的问题' : '核对缺项');
+    assert.equal(labels.summary, '汇报');
+  }
   const expected = Object.fromEntries(ids.map(id => [id, 'done']));
   if (needs && intent === 'other' && !image) Object.assign(expected, { intent: 'needs_input', other: 'needs_input' });
   if (needs && intent.includes('draft')) {
@@ -1926,6 +1945,7 @@ for (const scenario of [...a1.cases, ...newCases]) {
         const db = await isolatedDatabase(sampleTest);
         let action;
         let expectedIntent;
+        let expectedAnswering;
         const imageModel = a1Live ? configuredImageModel(process.env) : async (_image, hooks) => {
           hooks?.trace({ tool: 'extract_image', model: 'fixture', outcome: 'stop', promptVersion: 'fixture', elapsedMs: 0 });
           return { operations: [a1.add('老王', '水饺'), a1.add('小李', '水饺', '3')] };
@@ -1945,6 +1965,7 @@ for (const scenario of [...a1.cases, ...newCases]) {
         };
         const classify = liveIntent ?? (async () => ({
           draft: expectedIntent.includes('draft'), preview: expectedIntent.includes('preview'), query: expectedIntent.includes('query'),
+          answering: expectedAnswering,
         }));
         const api = await start(db, undefined, undefined, imageModel, undefined, agentModel, classify);
         const token = await login(api, 'a');
@@ -1966,17 +1987,15 @@ for (const scenario of [...a1.cases, ...newCases]) {
         const capture = action => { try { action(); } catch (error) { errors.push(error); } };
         for (const [step, commands] of scenario.steps.entries()) {
           const [text, ...tools] = commands;
-          expectedIntent = scenario.expected?.[step] ?? originalLabels.get(`${scenario.id}/${step + 1}`) ??
-            heldoutLabels.get(`${scenario.heldout?.id}/${step + 1}`) ?? 'other';
+          const annotated = originalIntents.get(`${scenario.id}/${step + 1}`) ??
+            heldoutIntents.get(`${scenario.heldout?.id}/${step + 1}`);
+          expectedIntent = scenario.expected?.[step] ?? (annotated ? intentLabel(annotated) : 'other');
+          expectedAnswering = annotated?.answering ?? false;
           const lastResult = results.at(-1);
           const draft = await read(api, token);
           action = tools.find(tool => Array.isArray(tool) && ['edit_draft', 'ask_user'].includes(tool[0]));
           if (tools.includes('pick')) {
             action = a1.edit({ action: 'set_customer', customerNumber: 1, partyNumber: 1 });
-          }
-          if (scenario.id === 'same-name' && step === 0 && action) {
-            const ask = tools.find(tool => tool[0] === 'ask_user');
-            action = [action[0], { ...action[1], ...ask[1] }];
           }
           const direct = tools.includes('direct') ? { intent: 'draft', turnId: lastResult.turnId, answer: text } : undefined;
           const submitted = await agentPost(api, token, 'turns', { ...agentInput(draft, text, text ? [] : [attachment]), direct });
@@ -1990,22 +2009,48 @@ for (const scenario of [...a1.cases, ...newCases]) {
           const toolTrace = traces.filter(trace => trace.kind === 'tool').map(trace => trace.payload.name);
           const intent = models.find(model => model.phase === 'intent')?.intents;
           sampleTest.diagnostic(JSON.stringify({ case: scenario.id, sample, step: step + 1, mode: a1Live ? 'live' : 'fixture',
-            status: result.status, wallMs: result.wallMs, modelCalls: models.length,
+            text, status: result.status, wallMs: result.wallMs, modelCalls: models.length, expectedAnswering,
             actualIntent: intent ? intentLabel(intent) : null, expectedIntent, models, tools: toolTrace,
             summary: result.events.filter(event => ['change', 'questions', 'end'].includes(event.kind)).map(event => event.payload) }));
           capture(() => {
-            if (text && !direct) assert.equal(intent && intentLabel(intent), expectedIntent);
-            else assert.equal(intent, undefined);
+            if (text && !direct) {
+              assert.equal(intent && intentLabel(intent), expectedIntent);
+              assert.equal(intent.answering, expectedAnswering);
+              if (intent.draft) assert.equal(models.filter(model => model.phase === 'edit').length, 1);
+            } else {
+              assert.equal(intent, undefined);
+              if (direct) assert.equal(models.length, 0);
+            }
             assert.ok(toolTrace.every(name => ['edit_draft', 'ask_user', 'import_image', 'preview_trip'].includes(name)));
             assert.equal(result.status, scenario.id === 'provider-failure' ? 'failed' : 'completed');
             const needs = scenario.heldout?.turns[step]?.ask ?? (
               (scenario.id === 'append' && step === 1) || (scenario.id === 'same-name' && step === 0) ||
-              (scenario.id === 'oral-standard' && step === 3) || (scenario.id === 'oral-naked-price' && step === 0) ||
+              (scenario.id === 'oral-standard' && step === 4) || (scenario.id === 'words-in-order' && step === 3) ||
+              scenario.id === 'new-order-with-pending-question' || (scenario.id === 'oral-naked-price' && step === 0) ||
               ['blocked-preview', 'vague'].includes(scenario.id));
             assert.equal(result.events.some(event => event.kind === 'questions'), needs && expectedIntent !== 'other');
-            checklist(result, expectedIntent, { needs, unresolvedEdit: needs && scenario.id !== 'same-name', image: !text,
-              answering: !!lastResult?.events.some(event => event.kind === 'questions'), direct });
+            checklist(result, expectedIntent, { needs, unresolvedEdit: needs && scenario.id !== 'same-name' && !(scenario.id === 'new-order-with-pending-question' && step === 1), image: !text,
+              answering: Boolean(direct) || expectedAnswering, direct });
           });
+          if (scenario.id === 'words-in-order' && step === 3) {
+            const current = await read(api, token);
+            capture(() => {
+              assert.deepEqual(current, draft);
+              assert.deepEqual(result.events.find(event => event.kind === 'questions')?.payload.questions, [{
+                customer: '', text: '确认林记 馄饨 3箱改成 2箱？', options: ['改', '不改'],
+              }]);
+            });
+          }
+          if (scenario.id === 'new-order-with-pending-question' && step === 1) {
+            capture(() => {
+              const questions = turn => turn.events.find(event => event.kind === 'questions')?.payload.questions;
+              assert.equal(questions(lastResult)?.length, 1);
+              assert.deepEqual(questions(result), questions(lastResult));
+              const check = result.events.find(event => event.kind === 'step' && event.payload.id === 'check' &&
+                event.payload.state === 'needs_input');
+              assert.match(check?.payload.result, /1 处待确认/);
+            });
+          }
           if (scenario.heldout) {
             const current = await read(api, token);
             for (const { customer, ...fields } of scenario.heldout.turns[step].draft) {
@@ -2020,7 +2065,18 @@ for (const scenario of [...a1.cases, ...newCases]) {
         const items = after.customers.flatMap(customer => customer.items);
         assert.equal((await db.admin.query('SELECT count(*)::int AS n FROM dispatch.trips')).rows[0].n, beforeCount);
         capture(() => {
-          if (scenario.id === 'standard') assert.equal(candidate?.totalCents, 16_400);
+          if (scenario.id === 'standard' || scenario.id === 's6-text-cases' || scenario.id === 'oral-standard') {
+            const expected = scenario.id === 's6-text-cases' ? s6.expected : scenario.id === 'standard' ? [s6.expected[0]]
+              : [['老王', '水饺', '安井', '500g', '箱', '5', '80']];
+            const issuedPreview = scenario.id === 'oral-standard' ? results[3].events.find(event => event.kind === 'preview')?.payload.preview : candidate;
+            assertAgentLines(after.customers, expected);
+            assert.ok(issuedPreview);
+            assertAgentLines(issuedPreview.customers, expected);
+            assert.equal(issuedPreview.totalCents, scenario.id === 's6-text-cases' ? s6.orderCents : scenario.id === 'standard' ? 16_400 : 40_000);
+          }
+          if (scenario.id === 'new-order-with-pending-question') {
+            assertAgentLines(after.customers, [['友邻食堂', '糍粑', '', '', '盒', '6', null]]);
+          }
           if (scenario.id === 'multiple') assert.deepEqual(after.customers.map(({ customer, items }) => [
             customer, items.map(item => item.quantity)]), [['周记', ['1']], ['林记', ['4']]]);
           if (scenario.id === 'append') {
@@ -2042,17 +2098,21 @@ for (const scenario of [...a1.cases, ...newCases]) {
           if (scenario.id === 'mixed-injection') assert.equal(after.customers[1]?.items[0].product, '鱼丸');
           if (['injection', 'provider-failure', 'vague', 'blocked-preview'].includes(scenario.id)) assert.deepEqual(after, before);
           if (scenario.id === 'mixed-intent') assert.equal(candidate?.totalCents, 32_800);
-          if (scenario.id === 'oral-standard') {
-            assert.equal(items[0].quantity, '5');
-            assert.equal(items[0].price, '80');
-          }
           if (['oral-naked-price', 'oral-price-reply'].includes(scenario.id)) assert.equal(items[0].price, scenario.id === 'oral-naked-price' ? '80' : '82');
           if (scenario.id === 'words-in-order') assert.deepEqual(items.map(item => item.quantity), ['2', '4', '2']);
         });
-        if (scenario.id === 'standard' && candidate) {
+        if (['standard', 's6-text-cases'].includes(scenario.id) && candidate) {
           const formal = await confirm(api, token, candidate.previewId, randomUUID());
-          assert.equal(formal.status, 200);
-          assert.deepEqual(formal.data.picking.map(row => [row.quantity, row.unit]), [[2, '箱']]);
+          capture(() => {
+            assert.equal(formal.status, 200);
+            const picking = scenario.id === 'standard' ? [['安井', '箱', 2]] : s6.picking;
+            assert.deepEqual(formal.data.picking.map(row => [row.brand, row.product, row.specification, row.unit, row.quantity]),
+              picking.map(([brand, unit, quantity]) => [brand, '水饺', '500g', unit, quantity]));
+            if (scenario.id === 's6-text-cases') {
+              assertAgentLines(formal.data.trip.versions[0].customers, s6.expected);
+              assert.equal(formal.data.trip.versions[0].totalCents, s6.orderCents);
+            }
+          });
         }
         if (errors.length) throw new AggregateError(errors, errors.map(error => error.message).join('; '));
       });

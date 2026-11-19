@@ -2,10 +2,10 @@ const assert = require('node:assert/strict');
 const { readFileSync } = require('node:fs');
 const { resolve } = require('node:path');
 const { configuredIntentModel, intentPrompt, combinedIntentPrompt } = require('../code/server-dist/server/agent/intent.js');
-const { originalSamples, heldoutSamples } = require('../tests/fixtures/a1-intents.cjs');
+const { originalSamples, heldoutSamples, questionSamples } = require('../tests/fixtures/a1-intents.cjs');
 
-const label = ({ draft, preview, query }) =>
-  [draft && 'draft', query && 'query', preview && 'preview'].filter(Boolean).join('+') || 'other';
+const label = ({ draft, preview, query, answering }) =>
+  [draft && 'draft', query && 'query', preview && 'preview', answering && 'answering'].filter(Boolean).join('+') || 'other';
 
 function summarize(traces, threshold) {
   const times = traces.map(call => call.elapsedMs).sort((left, right) => left - right);
@@ -32,7 +32,7 @@ async function main() {
   const heldout = heldoutSamples(JSON.parse(readFileSync(file, 'utf8')));
   assert.equal(original.length, 16);
   assert.ok(heldout.length >= 15);
-  const samples = [...original, ...heldout];
+  const samples = [...original, ...heldout, ...questionSamples()];
   for (const { text, id } of samples) {
     assert.ok(!intentPrompt.includes(text) && !combinedIntentPrompt.includes(text), `提示词包含用例原文：${id}`);
   }

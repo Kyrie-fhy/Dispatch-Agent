@@ -1,5 +1,5 @@
 const assert = require('node:assert/strict');
-const { cases, add } = require('./a1-dialogues.cjs');
+const { cases, revisionCases, add } = require('./a1-dialogues.cjs');
 
 const expectedByCase = {
   standard: ['draft', 'draft', 'preview'],
@@ -12,8 +12,8 @@ const expectedByCase = {
   mixed: [null, 'draft', 'preview'],
 };
 
-function flags(classes) {
-  return { draft: classes.includes('draft'), preview: classes.includes('preview'), query: classes.includes('query') };
+function flags(classes, answering = false) {
+  return { draft: classes.includes('draft'), preview: classes.includes('preview'), query: classes.includes('query'), answering };
 }
 
 function context(rows, questions, lastSummary) {
@@ -34,7 +34,7 @@ function originalSamples() {
     return steps.flatMap(([text, ...commands], index) => {
       const label = expectedByCase[id][index];
       assert.equal(Boolean(text), Boolean(label), id);
-      const sample = { id: `${id}/${index + 1}`, group: 'original', text, expected: label ? flags([label]) : null,
+      const sample = { id: `${id}/${index + 1}`, group: 'original', text, expected: label ? flags([label], questions.length > 0 && label === 'draft') : null,
         context: context(rows, questions, lastSummary) };
       questions = [];
       for (const command of commands) {
@@ -58,7 +58,7 @@ function heldoutSamples(scenarios) {
     const rows = new Map();
     let lastSummary = '';
     return turns.map(({ text, intents, context: pending, draft = [], ask }, index) => {
-      const expected = flags(intents.map(kind => ['add', 'edit', 'answer'].includes(kind) ? 'draft' : kind));
+      const expected = flags(intents.map(kind => ['add', 'edit', 'answer'].includes(kind) ? 'draft' : kind), Boolean(pending && intents.includes('answer')));
       const sample = { id: `${id}/${index + 1}`, group: 'heldout', text, expected,
         context: context([...rows.values()], pending ? [{ customer: '', text: pending, options: [] }] : [], lastSummary) };
       for (const line of draft) {
@@ -70,4 +70,11 @@ function heldoutSamples(scenarios) {
     });
   });
 }
-module.exports = { originalSamples, heldoutSamples };
+function questionSamples() {
+  const { id, steps } = revisionCases.find(scenario => scenario.id === 'new-order-with-pending-question');
+  return [{
+    id: `${id}/2`, group: 'regression', text: steps[1][0], expected: flags(['draft']),
+    context: context([], steps[0][1][1].questions, '有草稿问题待确认。'),
+  }];
+}
+module.exports = { originalSamples, heldoutSamples, questionSamples };

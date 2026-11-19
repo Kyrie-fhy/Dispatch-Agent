@@ -16,7 +16,7 @@ export type EditConfirmation = { operations: unknown[]; accept: string };
 export type PreviousQuestions = {
   turnId: string;
   text: string;
-  payload: { questions: Question[] };
+  payload: { questions: Question[]; sourceText?: string };
   confirmation?: EditConfirmation | null;
 };
 
@@ -44,6 +44,7 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
   let deleting = false;
   const names = new Set(parties.map(party => normalized(party.name)));
   const response = normalized(source);
+  const priorText = previous?.payload.sourceText ?? previous?.text;
   const options = previous?.payload.questions.flatMap(question => question.options) ?? [];
   const matches = options.filter(option => {
     const candidate = normalized(option);
@@ -57,7 +58,7 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
       !includesValue(response, op.price.trim()))) return issues('请明确说明要填写的单价。');
     if (edits.some(op => isObject(op) && typeof op.quantity === 'string' && op.quantity.trim() &&
       !includesValue(response, op.quantity.trim()))) return issues('请说明要填写的确切数量。');
-    const contextSource = previous?.text ? `${source} ${previous.text}` : source;
+    const contextSource = priorText ? `${source} ${priorText}` : source;
     const merged = mergeOrder(next, { operations: edits }, names, contextSource);
     if (!merged.draft) return { issues: merged.issues };
     next.customers = merged.draft.customers;
@@ -95,7 +96,7 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
     if (!row || isPlaceholder(row.item)) return issues('请指明要修改的货品明细。');
     const label = `${row.customer.customer} ${row.item.product}`.trim();
     const actualRows = initial.filter(entry => !isPlaceholder(entry.item));
-    const targetSource = selected && previous ? response + normalized(previous.text) : response;
+    const targetSource = selected && priorText ? response + normalized(priorText) : response;
     const matchScore = ({ item, customer }: typeof row) =>
       Number(Boolean(item.product && targetSource.includes(normalized(item.product)))) +
       Number(Boolean(customer.customer && targetSource.includes(normalized(customer.customer))));
@@ -114,13 +115,16 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
       lines.push(`删除 ${label} ${row.item.quantity} ${row.item.unit}`);
       continue;
     }
+    const namesProduct = Boolean(row.item.product && targetSource.includes(normalized(row.item.product)));
+    const uniqueRow = actualRows.length === 1 && !draft.customers.some(customer =>
+      customer !== old.customer && customer.customer.trim() && targetSource.includes(normalized(customer.customer)));
+    const explicit = /改成|改为|改到|改一下|更正|换成|调整|重填|单价改|价格改/.test(response + selected);
     const fields = safeFields(op, invalidTool);
     for (const field of textFields) {
       const value = fields[field];
       if (typeof value !== 'string' || value === row.item[field]) continue;
-      const explicit = /改成|改为|改到|改一下|更正|换成|调整|重填|覆盖|单价改|价格改/.test(response + selected);
       const increment = field === 'quantity'
-        ? (selected && previous && statedQuantity(normalized(previous.text), row.item.unit)) ||
+        ? (selected && priorText && statedQuantity(normalized(priorText), row.item.unit)) ||
           statedQuantity(selected || response, row.item.unit)
         : undefined;
       const append = typeof increment === 'number' && increment > 0 && /追加|加/.test(selected || response)
@@ -129,7 +133,7 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
       if (!includesValue(response, value) && !includesValue(selected, value) && !append) {
         return issues('请说明本轮要改成的值。');
       }
-      if (!confirmed && !append && !(eligible && explicit)) {
+      if (!confirmed && !((namesProduct || uniqueRow) && (append || (eligible && explicit)))) {
         const unit = field === 'price' ? '元' : field === 'quantity' ? row.item.unit : '';
         confirmations.push(`${label} ${row.item[field] || '空'}${unit}改成 ${value}${unit}`);
       }

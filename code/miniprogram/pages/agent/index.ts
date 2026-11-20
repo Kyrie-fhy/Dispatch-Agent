@@ -69,16 +69,25 @@ function view(turn: AgentTurn, revision: number, confirmed: boolean, last: boole
       : turn.status === 'completed' && !skipped ? 'pending' : 'skipped');
     return { ...item, state, icon: stepIcon[state], result: stored?.result ?? '' };
   });
+  const deliveryActive = Boolean(proposal && !stale && !deliveryState && turn.status === 'completed');
+  const canAnswer = Boolean(last && (!confirmed || plan.some(step => step.id === 'delivery-check')) && !undone &&
+    turn.status === 'completed' && end?.revision === revision);
+  const hasPendingQuestions = Boolean(canAnswer && questions.length);
+  const showDraftSummary = Boolean(last && !confirmed && turn.status === 'completed' && !preview && !proposal);
+  const showDraftActions = showDraftSummary;
+  const canUndo = Boolean(!confirmed && !undone && !!changes.length && end?.revision === revision && turn.status !== 'running');
+  const showStandaloneUndo = Boolean(canUndo && !showDraftActions);
+  const showPostDeliveryLink = Boolean(last && confirmed && turn.status === 'completed' && !issued && !deliveryActive);
   return { id: turn.id, text: turn.text, pictures: turn.materialIds.length, checklist, questions, changes, undone, issued,
     status: turn.status, reply: changes.length && end?.text === '草稿已更新。' ? '' : end?.text ?? '',
     elapsed: end?.elapsedMs === undefined ? '' : `用时 ${Math.max(1, Math.round(end.elapsedMs / 1000))} 秒`,
-    canAnswer: last && (!confirmed || plan.some(step => step.id === 'delivery-check')) && !undone && turn.status === 'completed' && end?.revision === revision,
+    canAnswer, hasPendingQuestions, showDraftSummary, showDraftActions, showStandaloneUndo, showPostDeliveryLink,
     canRetry: last && (turn.status === 'failed' || turn.status === 'interrupted'),
-    canUndo: !confirmed && !undone && !!changes.length && end?.revision === revision && turn.status !== 'running',
+    canUndo,
     preview: preview ? { ...tripView(preview), id: preview.previewId,
       active: !skipped && latestPreview && !confirmed && turn.status === 'completed' } : null,
     delivery: proposal ? { ...proposal, totalLabel: `¥${money(proposal.totalCents)}`, pendingLabel: proposal.pendingPriceNames.join('、'),
-      active: !stale && !deliveryState && turn.status === 'completed', stale, notice: deliveryState === 'saved' ? '已保存修改' :
+      active: deliveryActive, stale, notice: deliveryState === 'saved' ? '已保存修改' :
         deliveryState === 'completed' ? '已确认送达，应收已锁定' : deliveryState === 'cancelled' ? '已取消' : '' } : null,
   };
 }
@@ -94,12 +103,16 @@ function draftSummary(draft: TripDraft, pending: number) {
     id: customer.id, name: customer.customer || '未命名客户',
     lines: customer.items.filter(line => line.product || line.quantity || line.price || line.brand || line.specification)
       .map(line => ({ id: line.id, product: productLabel(line) || '未命名货品', quantity: line.quantity, unit: line.unit,
-        price: line.price ? '¥' + line.price : '待补价' })),
+        price: line.price ? '¥' + line.price : '待补价', pending: !line.price })),
   })).filter(customer => customer.lines.length);
   const lines = customers.reduce((sum, customer) => sum + customer.lines.length, 0);
   const issues = pending || (lines ? textOrderQuestions(draft).reduce((sum, customer) => sum + customer.issues.length, 0) : 0);
   return { customers, hasLines: lines > 0,
     label: `本趟草稿 · ${customers.length} 家 ${lines} 行${issues ? `，${issues} 处待确认` : ''}` };
+}
+
+function applyNavTitle(title: string) {
+  if (typeof wx.setNavigationBarTitle === 'function') wx.setNavigationBarTitle({ title });
 }
 
 Page({
@@ -108,8 +121,8 @@ Page({
     turns: [] as ReturnType<typeof view>[], attachments: [] as Attachment[], pendingMaterial: '', uploadLabel: '',
     draftsAvailable: false, scrollTo: '', voicePhase: '', voiceRetry: false, inputMode: 'text' as 'text' | 'voice',
     readyImages: [] as Attachment[], uploadRows: [] as (MaterialSource & { id?: string; local: boolean })[],
-    draftStrip: null as ReturnType<typeof draftSummary> | null, draftExpanded: false, issuedCard: false, revokeFailed: false,
-    deliveryStrip: null as ReturnType<typeof deliverySummaryView> | null, focusInput: false, imageLimit,
+    draftSummary: null as ReturnType<typeof draftSummary> | null, draftExpanded: false, issuedCard: false, revokeFailed: false,
+    deliverySummary: null as ReturnType<typeof deliverySummaryView> | null, navTitle: '录单助手', focusInput: false, imageLimit,
   },
   draft: null as TripDraft | null,
   turns: [] as AgentTurn[],
@@ -164,8 +177,9 @@ Page({
     this.delivery = null;
     this.setData({ signedIn: false, busy: false, polling: false, confirmed: false, draftsAvailable: false,
       error: '', text: '', turns: [], attachments: [], readyImages: [], uploadRows: [], pendingMaterial: '',
-      scrollTo: '', draftStrip: null, deliveryStrip: null, focusInput: false, draftExpanded: false, issuedCard: false,
-      voiceRetry: false, inputMode: 'text', revokeFailed: !!this.retiredToken });
+      scrollTo: '', draftSummary: null, deliverySummary: null, navTitle: '录单助手', focusInput: false, draftExpanded: false,
+      issuedCard: false, voiceRetry: false, inputMode: 'text', revokeFailed: !!this.retiredToken });
+    applyNavTitle('录单助手');
   },
 
   async run(action: () => Promise<void>) {
@@ -242,10 +256,17 @@ Page({
     const turns = this.turns.map((turn, index) => view(turn, revision, this.data.confirmed,
       index === this.turns.length - 1, preview?.id === turn.id, this.confirmedPreviewId, this.delivery));
     const recent = turns[turns.length - 1];
+    const deliverySummary = this.delivery ? deliverySummaryView(this.delivery) : null;
+    const draftInfo = !this.data.confirmed && this.draft
+      ? draftSummary(this.draft, recent?.canAnswer ? recent.questions.length : 0) : null;
+    const navTitle = !this.data.signedIn || !this.data.confirmed ? '录单助手'
+      : (this.delivery && this.delivery.shops.length
+        ? `送货助手（${this.delivery.shops.filter(shop => shop.locked).length}/${this.delivery.shops.length} 已送达）`
+        : '送货助手');
     this.setData({ turns, scrollTo: '', issuedCard: turns.some(turn => turn.issued),
-      deliveryStrip: this.delivery && deliverySummaryView(this.delivery),
-      draftStrip: !this.data.confirmed && this.draft ? draftSummary(this.draft, recent?.canAnswer ? recent.questions.length : 0) : null });
+      deliverySummary, draftSummary: draftInfo, navTitle });
     this.setData({ scrollTo: 'latest' });
+    applyNavTitle(navTitle);
   },
 
   stopPolling() {

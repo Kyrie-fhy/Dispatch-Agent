@@ -55,9 +55,9 @@ function setup(t, initialDraft) {
       requests.push(entry);
       if (path === '/session/wechat') return entry.ok({ token }, 201);
       assert.equal(request.header.Authorization, `Bearer ${token}`);
+      if (onRequest?.(entry)) return;
       if (path === '/session') return entry.ok(null, 204);
       if (path === '/agent/card-actions') return entry.ok({ recorded: true });
-      if (onRequest?.(entry)) return;
       if (path === '/agent/conversation') return entry.ok({ draft: structuredClone(draft), draftConfirmed: confirmed, confirmedPreviewId, turns: structuredClone(turns), delivery: structuredClone(delivery) });
       if (path === '/materials') return entry.ok({ materials: [] });
       if (path === '/workspace') return entry.ok({ draft: structuredClone(draft), parties: [], draftConfirmed: confirmed, currentTrip: null });
@@ -523,4 +523,62 @@ test('A1 tabs share login, refresh the current trip and page through read-only h
   await picking.onShow();
   assert.equal(picking.data.formal, null);
   assert.equal(requests.filter(r => r.path === '/session/wechat').length, 1);
+});
+
+test('Delivery MVP ships five native tabs and the profile tab shares the workspace session safely', async t => {
+  const draft = order();
+  const { page, pageFor, navigation, handle } = setup(t, draft);
+  const app = require('../code/dist/app.json');
+  assert.equal(app.tabBar.custom, undefined);
+  assert.deepEqual(app.tabBar.list.map(item => item.text), ['助手', '取货', '送货', '历史', '我的']);
+
+  const profile = pageFor('profile');
+  await profile.onShow();
+  assert.equal(profile.data.signedIn, false);
+  assert.equal(profile.data.revokeFailed, false);
+
+  const parties = [{ id: 'party-1', name: '老王' }, { id: 'party-2', name: '老李' }];
+  let revokeAttempts = 0;
+  handle(request => {
+    if (request.path === '/workspace') {
+      request.ok({ draft: structuredClone(draft), parties: structuredClone(parties), draftConfirmed: false, currentTrip: null });
+      return true;
+    }
+    if (request.path === '/session' && request.method === 'DELETE') {
+      revokeAttempts += 1;
+      if (revokeAttempts === 1) request.fail();
+      else request.ok(null, 204);
+      return true;
+    }
+    return false;
+  });
+
+  await profile.login();
+  assert.equal(profile.data.signedIn, true);
+  assert.equal(profile.data.tripMode, '晚间录单中');
+  assert.match(profile.data.tripDetail, /1 家 1 行/);
+  assert.equal(profile.data.partyCount, 2);
+  assert.equal(profile.data.canEditForm, true);
+
+  const picking = pageFor('trip-picking');
+  await picking.onShow();
+  assert.equal(picking.data.signedIn, true);
+
+  profile.openWorkspace();
+  assert.equal(navigation.at(-1), '/pages/workspace/index?from=agent');
+
+  await page.onShow();
+  assert.equal(page.data.signedIn, true);
+  await profile.logout();
+  assert.equal(agentSession.token, '');
+  assert.equal(profile.data.signedIn, false);
+  assert.equal(profile.data.revokeFailed, true);
+  assert.notEqual(profile.data.error, '');
+
+  await profile.logout();
+  assert.equal(revokeAttempts, 2);
+  assert.equal(profile.data.revokeFailed, false);
+
+  await page.onShow();
+  assert.equal(page.data.signedIn, false);
 });

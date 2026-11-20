@@ -1,22 +1,149 @@
-page { background: #f5f7f6; color: #18362b; font-family: -apple-system, sans-serif; font-size: 30rpx; }
-.container { padding: 32rpx 28rpx 60rpx; }
-.title { font-size: 42rpx; font-weight: 650; margin-bottom: 16rpx; }
-.hint { color: #63716b; font-size: 26rpx; line-height: 1.7; margin: 12rpx 0 24rpx; }
-.card { background: #fff; border: 1rpx solid #dfe8e3; border-radius: 20rpx; padding: 28rpx; margin: 24rpx 0; }
+page {
+  /* ---- 画布与表面 ---- */
+  --canvas: #F4F6F5;
+  --canvas-sub: #EDF2EF;
+  --surface: #FFFFFF;
+  --surface-sunken: #F7F9F8;
+
+  /* ---- 文字层级 ---- */
+  --ink: #182B24;
+  --ink-2: #394D45;
+  --ink-3: #596C64;
+  --ink-disabled: #9BA9A3;
+
+  /* ---- 边框与分割线 ---- */
+  --hairline: #DFE7E3;
+  --hairline-strong: #C9D6D0;
+
+  /* ---- 品牌主交互色（冷杉墨绿） ---- */
+  --primary: #12664D;
+  --primary-pressed: #0D4F3B;
+  --primary-weak: #E4F2EC;
+  --on-primary: #FFFFFF;
+
+  /* ---- 语义状态色 ---- */
+  --success: #12664D;
+  --success-weak: #E6F4EE;
+  --warning: #A84B00;
+  --warning-weak: #FFF5E5;
+  --danger: #B8261E;
+  --danger-weak: #FDECEB;
+
+  /* ---- 间距标尺 ---- */
+  --space-1: 8rpx;
+  --space-2: 16rpx;
+  --space-3: 24rpx;
+  --space-4: 32rpx;
+  --space-5: 48rpx;
+  --page-x: 28rpx;
+
+  /* ---- 圆角标尺 ---- */
+  --radius-sm: 12rpx;
+  --radius-md: 18rpx;
+  --radius-lg: 24rpx;
+
+  /* ---- 触控尺寸底线 ---- */
+  --tap-card-btn: 80rpx;
+  --tap-min: 88rpx;
+  --action-h: 96rpx;
+  --row-min: 104rpx;
+
+  /* ---- 极简阴影 ---- */
+  --shadow-card: 0 2rpx 10rpx rgba(24, 43, 36, 0.04);
+
+  background: var(--canvas);
+  color: var(--ink);
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif;
+  font-size: 30rpx;
+}
+
+/* ---- 等宽数字：数量、单价、小计与金额统一挂载 ---- */
+.num { font-variant-numeric: tabular-nums; font-feature-settings: "tnum"; }
+
+/* ---- 大触控按钮工具类 ---- */
+.btn-primary, .btn-secondary, .btn-ghost, .btn-danger-ghost {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: 100%;
+  margin: 0;
+  padding: 0 24rpx;
+  font-size: 30rpx;
+  line-height: 1.45;
+  border-radius: var(--radius-md);
+  transition: opacity 0.12s ease, background 0.12s ease;
+}
+.btn-primary::after, .btn-secondary::after, .btn-ghost::after, .btn-danger-ghost::after { border: 0; }
+.btn-primary { height: var(--action-h); background: var(--primary); color: var(--on-primary); font-weight: 600; }
+.btn-primary:active { background: var(--primary-pressed); }
+.btn-secondary { height: var(--tap-min); background: var(--canvas-sub); color: var(--ink); font-weight: 500; }
+.btn-secondary:active { background: var(--hairline); }
+.btn-ghost {
+  height: var(--tap-card-btn);
+  background: transparent;
+  border: 1rpx solid var(--hairline-strong);
+  color: var(--ink-2);
+  font-weight: 500;
+}
+.btn-ghost:active { background: var(--surface-sunken); }
+.btn-danger-ghost {
+  height: var(--tap-min);
+  background: var(--surface);
+  border: 1rpx solid var(--hairline-strong);
+  color: var(--danger);
+  font-weight: 500;
+}
+.btn-danger-ghost:active { background: var(--danger-weak); }
+.btn-primary[disabled], .btn-secondary[disabled], .btn-ghost[disabled], .btn-danger-ghost[disabled] {
+  color: var(--ink-disabled);
+  background: var(--canvas-sub);
+  border-color: var(--hairline);
+  opacity: 1;
+}
+
+/* ---- 既有全局类名：色值平滑映射到设计令牌，保持页面零破版 ---- */
+.container { padding: 32rpx var(--page-x) 60rpx; }
+.title { font-size: 42rpx; font-weight: 700; line-height: 1.2; margin-bottom: 16rpx; }
+.hint { color: var(--ink-3); font-size: 26rpx; line-height: 1.7; margin: 12rpx 0 24rpx; }
+.card {
+  background: var(--surface);
+  border: 1rpx solid var(--hairline);
+  border-radius: var(--radius-lg);
+  padding: 28rpx;
+  margin: 24rpx 0;
+}
 label { display: block; margin: 20rpx 0 10rpx; font-size: 26rpx; }
-input { background: #f4f7f5; padding: 20rpx; border-radius: 10rpx; height: 48rpx; color: #18362b; }
-button { margin-top: 20rpx; font-size: 28rpx; border-radius: 12rpx; }
-.primary { background: #12664d; color: white; }
-.error { color: #a13221; line-height: 1.6; position: sticky; top: 0; z-index: 2; background: #fff3ed; border-radius: 12rpx; padding: 16rpx; margin-bottom: 16rpx; }
+input {
+  background: var(--surface-sunken);
+  padding: 20rpx;
+  border-radius: var(--radius-sm);
+  height: 48rpx;
+  color: var(--ink);
+}
+button { margin-top: 20rpx; font-size: 30rpx; border-radius: var(--radius-md); }
+.primary { background: var(--primary); color: var(--on-primary); }
+.primary[disabled] { color: var(--ink-disabled); background: var(--canvas-sub); }
+.error {
+  color: var(--danger);
+  line-height: 1.6;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--danger-weak);
+  border-radius: var(--radius-sm);
+  padding: 16rpx;
+  margin-bottom: 16rpx;
+}
 .amount { font-size: 40rpx; font-weight: 650; padding-top: 20rpx; }
-.line { padding: 16rpx 0; border-bottom: 1rpx solid #e9eeeb; line-height: 1.7; }
+.line { padding: 16rpx 0; border-bottom: 1rpx solid var(--hairline); line-height: 1.7; }
 .section-title { font-size: 32rpx; font-weight: 650; overflow-wrap: anywhere; }
 .subtotal { font-weight: 650; margin-top: 18rpx; overflow-wrap: anywhere; }
 .product { font-weight: 600; overflow-wrap: anywhere; }
-.muted { color: #63716b; font-size: 26rpx; }
-.link { color: #12664d; font-weight: 600; margin-top: 20rpx; }
-.edit-line { border-top: 1rpx solid #e9eeeb; margin-top: 28rpx; padding-top: 20rpx; }
+.muted { color: var(--ink-3); font-size: 26rpx; }
+.link { color: var(--primary); font-weight: 600; margin-top: 20rpx; }
+.edit-line { border-top: 1rpx solid var(--hairline); margin-top: 28rpx; padding-top: 20rpx; }
 .field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 20rpx; }
 .customer-options { display: flex; flex-wrap: wrap; gap: 12rpx; margin: 16rpx 0; }
 .customer-options .option { margin: 0; max-width: 100%; overflow-wrap: anywhere; }
-.option-active { background: #def2e8; color: #12664d; }
+.option-active { background: var(--primary-weak); color: var(--primary); }

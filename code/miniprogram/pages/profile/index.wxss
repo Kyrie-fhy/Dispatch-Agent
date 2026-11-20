@@ -1,0 +1,79 @@
+.profile {
+  min-height: 100vh;
+  box-sizing: border-box;
+  padding: 24rpx var(--page-x) calc(40rpx + env(safe-area-inset-bottom));
+}
+
+.identity-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20rpx;
+}
+
+.card-title {
+  font-size: 34rpx;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.status-tag {
+  flex: none;
+  height: 44rpx;
+  padding: 0 16rpx;
+  border-radius: var(--radius-sm);
+  background: var(--success-weak);
+  color: var(--success);
+  font-size: 24rpx;
+  font-weight: 500;
+  line-height: 44rpx;
+}
+
+.overview-card { padding: 0 28rpx; }
+
+.overview-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24rpx;
+  min-height: var(--row-min);
+  padding: 18rpx 0;
+}
+
+.overview-row + .overview-row { border-top: 1rpx solid var(--hairline); }
+
+.row-label {
+  flex: none;
+  color: var(--ink-2);
+  font-size: 30rpx;
+}
+
+.row-value {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6rpx;
+  min-width: 0;
+  text-align: right;
+}
+
+.row-main {
+  color: var(--ink);
+  font-size: 30rpx;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.row-detail {
+  color: var(--ink-3);
+  font-size: 26rpx;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.action-group {
+  display: flex;
+  flex-direction: column;
+  gap: 20rpx;
+  margin-top: 32rpx;
+}

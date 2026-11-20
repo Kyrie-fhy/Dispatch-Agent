@@ -38,6 +38,7 @@ if (s5) {
       { pagePath: 'pages/trip-picking/index', text: '取货' },
       { pagePath: 'pages/trip-delivery/index', text: '送货' },
       { pagePath: 'pages/history/index', text: '历史' },
+      { pagePath: 'pages/profile/index', text: '我的' },
     ];
     app.pages = [...tabs.map(tab => tab.pagePath), 'pages/workspace/index'];
     app.tabBar.list = tabs;

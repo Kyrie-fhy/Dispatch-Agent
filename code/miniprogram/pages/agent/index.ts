@@ -484,10 +484,11 @@ Page({
       wx.showModal({
         title: '开始下一趟',
         content: `还有 ${unfinished.length} 家没确认送达：${unfinished.join('、')}。原单仍可在「历史」查看，确定开始下一趟吗？`,
-        confirmText: '开始下一趟',
+        confirmText: '开始新趟',
         success: ({ confirm }) => {
           if (confirm && token === agentSession.token && this.draft?.id === draftId) void this.startNextTrip(draftId);
         },
+        fail: () => this.setData({ error: '确认框打开失败，请重试。' }),
       });
       return;
     }

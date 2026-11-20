@@ -683,6 +683,7 @@ test('Agent starts the next trip from delivery cards with a guard for unfinished
   await page.nextTrip();
   assert.match(modal.content, /还有 1 家没确认送达：老王/);
   assert.match(modal.content, /历史/);
+  assert.ok(modal.confirmText.length <= 4, 'wx.showModal 的确认按钮最多 4 个字符');
   modal.success({ confirm: false });
   assert.equal(requests.some(request => request.path === '/trips/next-draft'), false);
   assert.equal(page.data.confirmed, true);

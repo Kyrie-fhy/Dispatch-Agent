@@ -253,6 +253,11 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
     sendJson(response, 200, await trips.history(account, before, Number(limit)));
     return;
   }
+  const tripTurnsRoute = /^\/v1\/trips\/([^/]+)\/turns$/.exec(path);
+  if (method === 'GET' && tripTurnsRoute && uuidPattern.test(tripTurnsRoute[1])) {
+    sendJson(response, 200, await agent.store.tripTurns(account, tripTurnsRoute[1]));
+    return;
+  }
   if (method === 'GET' && tripId) {
     sendJson(response, 200, await trips.trip(account, tripId));
     return;

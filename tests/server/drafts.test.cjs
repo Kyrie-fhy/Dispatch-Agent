@@ -2512,6 +2512,34 @@ test('A1 trip history pages by issue time with account isolation, missing prices
   assert.deepEqual((await api.request(`/v1/trips?before=${their.id}`, { token })).data.trips, []);
 });
 
+test('A1 trip turns replay only the issued trip and keep draft and account boundaries', { timeout: 30_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const model = async () => ({ role: 'assistant', content: '收到，本趟已记录。' });
+  const api = await start(db, undefined, undefined, undefined, undefined, model);
+  const token = await login(api, 'a');
+  const other = await login(api, 'b');
+  const draft = await startingOrder(api, token);
+  const first = await agentPost(api, token, 'turns', agentInput(draft, '老王两箱水饺'));
+  assert.equal(first.status, 202);
+  assert.equal((await waitForAgent(api, token, first.data.turnId)).status, 'completed');
+  const candidate = await preview(api, token, await read(api, token), randomUUID());
+  assert.equal(candidate.status, 200);
+  assert.equal((await confirm(api, token, candidate.data.preview.previewId, randomUUID())).status, 200);
+  const next = await api.request('/v1/trips/next-draft', { method: 'POST', token,
+    body: { draftId: draft.id, requestId: randomUUID() } });
+  assert.equal(next.status, 200);
+  const second = await agentPost(api, token, 'turns', agentInput(next.data.draft, '下一趟的新消息'));
+  assert.equal(second.status, 202);
+  assert.equal((await waitForAgent(api, token, second.data.turnId)).status, 'completed');
+  const replay = await api.request(`/v1/trips/${draft.id}/turns`, { token });
+  assert.equal(replay.status, 200);
+  assert.equal(replay.data.tripId, draft.id);
+  assert.deepEqual(replay.data.turns.map(turn => turn.text), ['老王两箱水饺']);
+  assert.ok(replay.data.turns[0].events.some(event => event.kind === 'end'));
+  assert.equal((await api.request(`/v1/trips/${next.data.draft.id}/turns`, { token })).status, 404);
+  assert.equal((await api.request(`/v1/trips/${draft.id}/turns`, { token: other })).status, 404);
+});
+
 test('A1 validates direct buttons, persists the checklist, and leaves formal confirmation to the existing API', { timeout: 30_000 }, async t => {
   const db = await isolatedDatabase(t);
   const api = await start(db);

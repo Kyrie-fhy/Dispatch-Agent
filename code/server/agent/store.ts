@@ -106,6 +106,17 @@ async function visibleEvents(client: PoolClient, account: string, id: string, af
   return rows;
 }
 
+async function turnsForDraft(client: PoolClient, account: string, draftId: string, limit = 60) {
+  const { rows } = await client.query<Omit<AgentTurn, 'events'>>(`
+    SELECT t.id, t.status, t.start_revision AS revision, m.content AS text, m.material_ids AS "materialIds"
+    FROM dispatch.agent_turns t JOIN dispatch.agent_messages m ON m.account_id = t.account_id AND m.turn_id = t.id
+    WHERE t.account_id = $1 AND t.draft_id = $2 AND m.role = 'user'
+    ORDER BY t.created_at DESC, t.id DESC LIMIT $3`, [account, draftId, limit]);
+  const turns: AgentTurn[] = [];
+  for (const row of rows.reverse()) turns.push({ ...row, events: await visibleEvents(client, account, row.id, 0) });
+  return turns;
+}
+
 async function endTurn(client: PoolClient, key: TurnKey, status: Exclude<AgentStatus, 'running'>, text: string, errorCode?: string) {
   const turn = await getTurn(client, key.account, key.id, true);
   if (turn.status !== 'running') return;
@@ -187,13 +198,7 @@ export class AgentStore {
   conversation(account: string) {
     return readAccount(this.pool, account, async client => {
       const workspace = await readWorkspace(client, account);
-      const { rows } = await client.query<Omit<AgentTurn, 'events'>>(`
-        SELECT t.id, t.status, t.start_revision AS revision, m.content AS text, m.material_ids AS "materialIds"
-        FROM dispatch.agent_turns t JOIN dispatch.agent_messages m ON m.account_id = t.account_id AND m.turn_id = t.id
-        WHERE t.account_id = $1 AND t.draft_id = $2 AND m.role = 'user'
-        ORDER BY t.created_at DESC, t.id DESC LIMIT 60`, [account, workspace.id]);
-      const turns: AgentTurn[] = [];
-      for (const row of rows.reverse()) turns.push({ ...row, events: await visibleEvents(client, account, row.id, 0) });
+      const turns = await turnsForDraft(client, account, workspace.id, 60);
       const draftConfirmed = workspace.currentTripId === workspace.id;
       const issued = draftConfirmed ? await client.query<{ id: string }>(
         'SELECT source_preview_id AS id FROM dispatch.trips WHERE account_id = $1 AND id = $2', [account, workspace.id]) : null;
@@ -207,6 +212,14 @@ export class AgentStore {
         }) } : null;
       return { draftId: workspace.id, revision: workspace.revision, turns, draft: workspaceDraft(workspace),
         draftConfirmed, confirmedPreviewId: issued?.rows[0]?.id ?? null, delivery };
+    });
+  }
+
+  tripTurns(account: string, tripId: string) {
+    return readAccount(this.pool, account, async client => {
+      const { rowCount } = await client.query('SELECT 1 FROM dispatch.trips WHERE account_id = $1 AND id = $2', [account, tripId]);
+      if (!rowCount) throw new HttpError(404, 'trip_not_found', '未找到正式送货单');
+      return { tripId, turns: await turnsForDraft(client, account, tripId, 100) };
     });
   }
 

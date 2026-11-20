@@ -196,7 +196,7 @@ export class TripStore {
     return row;
   }
 
-  private async readTrip(client: PoolClient, accountId: string, tripId: string, known?: TripRow): Promise<FormalTrip> {
+  async readTrip(client: PoolClient, accountId: string, tripId: string, known?: TripRow): Promise<FormalTrip> {
     const row = known ?? await this.tripRow(client, accountId, tripId);
     if (!row) throw missingTrip();
     const { rows } = await client.query<VersionRow>(`

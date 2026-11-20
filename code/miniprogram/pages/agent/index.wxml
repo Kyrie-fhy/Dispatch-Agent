@@ -7,6 +7,17 @@
     <text wx:if="{{error}}" class="error">{{error}}</text>
   </view>
   <block wx:else>
+    <view class="draft-strip" wx:if="{{deliveryStrip}}">
+      <view class="draft-header">
+        <button size="mini" class="draft-toggle" bindtap="toggleDraft">{{deliveryStrip.label}} {{draftExpanded ? '▴' : '▾'}}</button>
+        <button size="mini" bindtap="openDelivery" disabled="{{busy}}">去送货单</button>
+      </view>
+      <scroll-view wx:if="{{draftExpanded}}" scroll-y class="draft-detail">
+        <view wx:for="{{deliveryStrip.shops}}" wx:key="sheetId" class="preview-line detail">
+          <text>{{item.customer}} · {{item.locked ? '已送达' : '未送达'}}</text><text>{{item.description}}</text>
+        </view>
+      </scroll-view>
+    </view>
     <view class="draft-strip" wx:if="{{draftStrip}}">
       <view class="draft-header">
         <button size="mini" class="draft-toggle" bindtap="toggleDraft">{{draftStrip.label}} {{draftExpanded ? '▴' : '▾'}}</button>
@@ -38,7 +49,7 @@
         <view class="assistant-row" wx:if="{{turn.checklist.length || turn.reply || turn.changes.length || turn.questions.length || turn.preview || turn.canRetry}}">
           <view class="avatar helper">✦</view>
           <view class="assistant-content">
-            <text class="assistant-name">录单助手</text>
+            <text class="assistant-name">{{confirmed ? '送货助手' : '录单助手'}}</text>
             <view class="card">
               <view wx:for="{{turn.checklist}}" wx:for-item="step" wx:key="id" class="step step-{{step.state}}">
                 <view class="step-icon">{{step.icon}}</view>
@@ -72,6 +83,26 @@
                   </view>
                 </view>
               </view>
+              <view wx:if="{{turn.delivery}}" class="detail">
+                <text class="card-title">门店送货核对卡 · {{turn.delivery.customer}}</text>
+                <view wx:for="{{turn.delivery.edits}}" wx:key="lineId" class="detail">
+                  <text class="line">{{item.name}} · 原订 {{item.originalQuantity}}</text>
+                  <text class="line">实收 {{item.beforeQuantity}} → {{item.receivedQuantity}}；单价 {{item.beforePrice || '待补价'}} → {{item.price || '待补价'}}</text>
+                </view>
+                <text class="line">整单预计应收 <text class="amount">{{turn.delivery.totalLabel}}</text></text>
+                <text wx:if="{{turn.delivery.pendingLabel}}" class="line">还有待补价：{{turn.delivery.pendingLabel}}。{{turn.delivery.edits.length ? '可先保存修改，' : ''}}补齐后才能确认送达。</text>
+                <text wx:if="{{turn.delivery.stale}}" class="muted">单据已更新，请以最新送货单为准</text>
+                <text wx:if="{{turn.delivery.notice}}" class="line">{{turn.delivery.notice}}</text>
+                <view wx:if="{{turn.delivery.active}}" class="actions">
+                  <button wx:if="{{turn.delivery.canComplete}}" size="mini" class="primary" disabled="{{busy || polling}}"
+                    data-turn="{{turn.id}}" data-mode="complete" bindtap="applyDelivery">{{turn.delivery.edits.length ? '保存并确认送达' : '按实收确认送达'}}</button>
+                  <button wx:if="{{turn.delivery.edits.length}}" size="mini" class="{{turn.delivery.canComplete ? '' : 'primary'}}" disabled="{{busy || polling}}"
+                    data-turn="{{turn.id}}" data-mode="save" bindtap="applyDelivery">只保存修改</button>
+                  <button size="mini" disabled="{{busy}}" data-turn="{{turn.id}}" bindtap="openDelivery">{{turn.delivery.canComplete ? '去送货单细看' : '去送货单补价'}}</button>
+                  <button wx:if="{{turn.delivery.canComplete || turn.delivery.edits.length}}" size="mini" disabled="{{busy || polling}}"
+                    data-turn="{{turn.id}}" data-mode="cancel" bindtap="applyDelivery">取消</button>
+                </view>
+              </view>
               <view wx:if="{{turn.preview.active || turn.issued || turn.canRetry}}" class="actions">
                 <block wx:if="{{turn.preview.active}}">
                   <button class="primary" size="mini" disabled="{{busy || polling}}" data-id="{{turn.preview.id}}" bindtap="confirm">确认出单</button>
@@ -84,10 +115,6 @@
             </view>
           </view>
         </view>
-      </view>
-      <view wx:if="{{confirmed && !issuedCard}}" class="card success">
-        <text class="card-title">本趟已出单</text>
-        <view class="actions"><button size="mini" class="primary" bindtap="showPickingList">去取货</button></view>
       </view>
       <view id="latest" />
     </scroll-view>
@@ -105,19 +132,20 @@
           <button wx:if="{{item.local}}" size="mini" disabled="{{busy || polling}}" data-key="{{item.requestId}}" bindtap="resumeImage">继续上传</button>
           <button wx:else size="mini" disabled="{{busy || polling}}" data-key="{{item.requestId}}" data-album="yes" bindtap="chooseImage">重选原图</button>
         </view>
-        <text wx:if="{{uploadLabel || voicePhase}}" class="muted">{{pendingMaterial}} {{uploadLabel || voicePhase}}</text>
+        <text wx:if="{{uploadLabel}}" class="muted">{{pendingMaterial}} {{uploadLabel}}</text>
       </view>
-      <textarea class="input" value="{{text}}" maxlength="{{textOrderLimit}}" auto-height show-confirm-bar="{{false}}"
-        placeholder="发订单，或告诉我怎么改" disabled="{{busy}}" bindinput="editText" />
+      <text wx:if="{{voicePhase}}" class="muted">{{voicePhase}}</text>
+      <textarea class="input" value="{{text}}" maxlength="{{textOrderLimit}}" auto-height show-confirm-bar="{{false}}" focus="{{focusInput && !busy}}"
+        placeholder="{{confirmed ? '说哪家少收、补单价，或问还剩哪几家' : '发订单，或告诉我怎么改'}}" disabled="{{busy}}" bindinput="editText" />
       <view class="actions">
         <block wx:if="{{!confirmed}}">
           <button size="mini" disabled="{{busy || polling || !draftsAvailable}}" data-album="yes" bindtap="chooseImage">相册</button>
           <button size="mini" disabled="{{busy || polling || !draftsAvailable}}" bindtap="chooseImage">聊天图片</button>
           <button size="mini" disabled="{{busy || polling || !draftsAvailable}}" bindtap="images">上传记录</button>
-          <button wx:if="{{voicePhase === '录音中'}}" size="mini" bindtap="stopRecording">结束录音</button>
-          <button wx:else size="mini" disabled="{{busy || polling || !draftsAvailable}}" bindtap="record">录音</button>
-          <button wx:if="{{voiceRetry}}" size="mini" disabled="{{busy || polling}}" bindtap="retryVoice">重试转写</button>
         </block>
+        <button wx:if="{{voicePhase === '录音中'}}" size="mini" bindtap="stopRecording">结束录音</button>
+        <button wx:else size="mini" disabled="{{busy || polling || !draftsAvailable}}" bindtap="record">录音</button>
+        <button wx:if="{{voiceRetry}}" size="mini" disabled="{{busy || polling}}" bindtap="retryVoice">重试转写</button>
         <button wx:if="{{!confirmed}}" size="mini" bindtap="previewShortcut" disabled="{{busy || polling || !draftsAvailable}}">生成送货单</button>
         <button size="mini" class="primary send" disabled="{{busy || polling || !draftsAvailable || (!text && !attachments.length)}}" bindtap="send">发送</button>
       </view>

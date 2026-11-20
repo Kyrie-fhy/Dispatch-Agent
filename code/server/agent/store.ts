@@ -1,15 +1,17 @@
 import { randomUUID } from 'node:crypto';
 import { Pool, PoolClient } from 'pg';
-import type { AgentEvent, AgentStatus, AgentTurn, DirectIntent, Question } from '../../miniprogram/core/agent';
+import { deliveryLines, deliverySummary } from '../../miniprogram/core/delivery-execution';
+import type { AgentEvent, AgentStatus, AgentTurn, DeliveryCardState, DeliveryProposal, DirectIntent } from '../../miniprogram/core/agent';
 import { isObject } from '../../miniprogram/core/orders';
 import { textOrderLimit } from '../../miniprogram/core/text-order';
-import type { TripDraft } from '../../miniprogram/core/trips';
+import { latest, type TripDraft } from '../../miniprogram/core/trips';
 import { missingDraft, readAccount, readWorkspace, Workspace, workspaceDraft, writeAccount } from '../account-workspace';
 import { setAccount, transaction } from '../database';
 import { HttpError } from '../http-error';
 import { readId, readPreviewInput, validRevision } from '../request-input';
 import { readable } from '../text-orders';
 import type { PreviousQuestions } from './edit';
+import { TripStore } from '../trips';
 
 export function readTurnInput(value: unknown) {
   const basis = readPreviewInput(value);
@@ -36,7 +38,7 @@ function invalidIntent() {
   return new HttpError(400, 'invalid_agent_intent', '这个选项无效，请从最新问题重新选择。');
 }
 
-export const cardActions = new Set(['answer', 'undo', 'confirm', 'edit', 'picking', 'next', 'workspace', 'retry']);
+export const cardActions = new Set(['answer', 'undo', 'confirm', 'edit', 'picking', 'next', 'workspace', 'retry', 'delivery-cancel']);
 export type Input = ReturnType<typeof readTurnInput>;
 export type TurnKey = { account: string; id: string; draftId: string };
 type StoredTurn = {
@@ -65,6 +67,27 @@ async function getTurn(client: PoolClient, account: string, id: string, lock = f
   return turn;
 }
 
+export async function pendingDeliveryCard(client: PoolClient, key: TurnKey, sheetId?: string) {
+  const turn = await getTurn(client, key.account, key.id, true);
+  if (turn.draftId !== key.draftId || turn.status !== 'completed') throw invalidIntent();
+  const { rows } = await client.query<{ kind: string; payload: DeliveryProposal }>(`
+    SELECT kind, payload FROM dispatch.agent_events WHERE account_id = $1 AND turn_id = $2
+    AND kind IN ('delivery_proposal', 'delivery_applied') ORDER BY seq DESC`, [key.account, key.id]);
+  const card = rows[0]?.payload;
+  if (rows[0]?.kind !== 'delivery_proposal' || card.tripId !== key.draftId || (sheetId && card.sheetId !== sheetId)) {
+    throw new HttpError(409, 'delivery_changed', '核对卡已处理或不再有效，请重新核对。');
+  }
+  return card;
+}
+
+export async function finishDeliveryCard(client: PoolClient, key: TurnKey, status: DeliveryCardState) {
+  const cancelled = status === 'cancelled';
+  await event(client, key, 'delivery_applied', { status });
+  await event(client, key, 'step', { id: 'delivery-confirm', state: cancelled ? 'skipped' : 'done' });
+  await event(client, key, 'step', { id: 'delivery-updated', state: cancelled ? 'skipped' : 'done',
+    result: cancelled ? '已取消' : status === 'completed' ? '已确认送达' : '已保存修改' });
+}
+
 export async function saveChange(client: PoolClient, key: TurnKey, revision: number, lines: string[], signal: AbortSignal, digest?: string) {
   signal.throwIfAborted();
   const changed = await client.query(`UPDATE dispatch.agent_turns SET end_revision = $3
@@ -79,7 +102,7 @@ async function visibleEvents(client: PoolClient, account: string, id: string, af
   const { rows } = await client.query<AgentEvent>(`
     SELECT seq::float8, kind, payload FROM dispatch.agent_events
     WHERE account_id = $1 AND turn_id = $2 AND seq > $3
-      AND kind IN ('progress', 'plan', 'step', 'questions', 'preview', 'change', 'undo', 'end') ORDER BY seq`, [account, id, after]);
+      AND kind IN ('progress', 'plan', 'step', 'questions', 'preview', 'change', 'undo', 'end', 'delivery_proposal', 'delivery_applied') ORDER BY seq`, [account, id, after]);
   return rows;
 }
 
@@ -98,8 +121,8 @@ async function endTurn(client: PoolClient, key: TurnKey, status: Exclude<AgentSt
   await event(client, key, 'end', { status, text: message, revision: turn.endRevision, errorCode, elapsedMs: timing.elapsedMs });
 }
 
-async function previousQuestions(client: PoolClient, account: string, draftId: string, revision: number, exclude?: string) {
-  const { rows: [previous] } = await client.query<PreviousQuestions>(`
+async function previousQuestions(client: PoolClient, account: string, draftId: string, revision: number, exclude?: string, delivery = false) {
+  const { rows: [previous] } = await client.query<PreviousQuestions & { payload: PreviousQuestions['payload'] & { context?: string } }>(`
     SELECT t.id AS "turnId", m.content AS text, e.payload, confirmation.payload AS confirmation
     FROM dispatch.agent_turns t JOIN dispatch.agent_messages m
       ON m.account_id = t.account_id AND m.turn_id = t.id AND m.role = 'user'
@@ -107,10 +130,11 @@ async function previousQuestions(client: PoolClient, account: string, draftId: s
     LEFT JOIN dispatch.agent_events confirmation
       ON confirmation.account_id = t.account_id AND confirmation.turn_id = t.id AND confirmation.kind = 'edit_confirmation'
     WHERE t.account_id = $1 AND t.end_revision = $4 AND NOT t.undone AND t.status = 'completed'
+      AND coalesce(e.payload->>'mode', '') = $5
       AND t.id = (SELECT id FROM dispatch.agent_turns WHERE account_id = $1 AND draft_id = $2
         AND ($3::uuid IS NULL OR id <> $3) ORDER BY created_at DESC, id DESC LIMIT 1)
-    ORDER BY e.seq DESC LIMIT 1`, [account, draftId, exclude ?? null, revision]);
-  return previous;
+    ORDER BY e.seq DESC LIMIT 1`, [account, draftId, exclude ?? null, revision, delivery ? 'delivery' : '']);
+  return previous && { ...previous, text: previous.payload.context ?? previous.text };
 }
 
 export class AgentStore {
@@ -127,7 +151,7 @@ export class AgentStore {
         }
       } else checkDraft(workspace, draftId, revision);
       if (input.direct?.intent === 'draft') {
-        const prior = await previousQuestions(client, account, draftId, revision);
+        const prior = await previousQuestions(client, account, draftId, revision, undefined, workspace.currentTripId === draftId);
         const { turnId, answer } = input.direct;
         if (prior?.turnId !== turnId || !prior.payload.questions.some(question => question.options.includes(answer))) {
           throw invalidIntent();
@@ -173,8 +197,16 @@ export class AgentStore {
       const draftConfirmed = workspace.currentTripId === workspace.id;
       const issued = draftConfirmed ? await client.query<{ id: string }>(
         'SELECT source_preview_id AS id FROM dispatch.trips WHERE account_id = $1 AND id = $2', [account, workspace.id]) : null;
+      const formal = draftConfirmed ? await new TripStore(this.pool).readTrip(client, account, workspace.id) : null;
+      const version = formal && latest(formal.trip);
+      const delivery = formal && version ? { tripId: workspace.id, version: version.version, statusRevision: formal.trip.statusRevision,
+        shops: version.customers.flatMap(customer => {
+          const sheet = formal.sheets.find(sheet => sheet.sheetId === customer.id);
+          return sheet ? [{ sheetId: sheet.sheetId, customer: customer.customer, locked: sheet.reviewed || sheet.deliveryCompleted,
+            ...deliverySummary(deliveryLines(customer, formal.deliveryEdits)) }] : [];
+        }) } : null;
       return { draftId: workspace.id, revision: workspace.revision, turns, draft: workspaceDraft(workspace),
-        draftConfirmed, confirmedPreviewId: issued?.rows[0]?.id ?? null };
+        draftConfirmed, confirmedPreviewId: issued?.rows[0]?.id ?? null, delivery };
     });
   }
 
@@ -190,10 +222,10 @@ export class AgentStore {
           SELECT id FROM dispatch.agent_turns WHERE account_id = $1 AND draft_id = $2 AND id <> $3
           ORDER BY created_at DESC, id DESC LIMIT 1
         )`, [key.account, key.draftId, key.id]);
-      const previous = await previousQuestions(client, key.account, key.draftId, revision, key.id);
+      const previous = await previousQuestions(client, key.account, key.draftId, revision, key.id, workspace.currentTripId === workspace.id);
       const lastSummary = previous && last.asked ? '有草稿问题待确认。' : last.previewed ? '已生成送货单预览。'
         : last.changed ? '本趟草稿已整理。' : last.seen ? '草稿没有变化。' : '';
-      return { draft: workspaceDraft(workspace), previous, lastSummary };
+      return { draft: workspaceDraft(workspace), previous, lastSummary, delivery: workspace.currentTripId === workspace.id };
     });
   }
 
@@ -257,8 +289,16 @@ export class AgentStore {
       throw new HttpError(400, 'invalid_card_action', '卡片操作无效');
     }
     const action = value.action;
-    const turnId = action === 'edit' && value.turnId !== undefined ? readId(value.turnId, '预览回合编号') : undefined;
+    const turnId = action === 'delivery-cancel' || (action === 'edit' && value.turnId !== undefined)
+      ? readId(value.turnId, '回合编号') : undefined;
     return writeAccount(this.pool, account, basis.requestId, { ...basis, action: 'agent-card', card: action, turnId }, async (client, workspace) => {
+      if (action === 'delivery-cancel' && turnId) {
+        if (workspace.id !== basis.draftId || workspace.currentTripId !== basis.draftId) throw missingDraft();
+        const key = { account, id: turnId, draftId: basis.draftId };
+        await pendingDeliveryCard(client, key);
+        await finishDeliveryCard(client, key, 'cancelled');
+        return { recorded: true };
+      }
       if (workspace.id !== basis.draftId) {
         const previous = await client.query('SELECT 1 FROM dispatch.trips WHERE account_id = $1 AND id = $2',
           [account, basis.draftId]);

@@ -1,6 +1,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { emptyTrip, previewTrip, pickingList, statusesFor } = require('../code/dist/core/trips');
+const { deliveryLines, deliverySummary } = require('../code/dist/core/delivery-execution');
+const { deliveredBalance } = require('../code/dist/core/settlement');
 const { agentSession } = require('../code/dist/services/agent-session');
 
 const token = 'a'.repeat(43);
@@ -21,6 +23,7 @@ function setup(t, initialDraft) {
   let draft = initialDraft;
   let confirmed = false;
   let confirmedPreviewId = null;
+  let delivery = null;
   let turns = [];
   let onRequest;
   let sequence = 0;
@@ -39,12 +42,14 @@ function setup(t, initialDraft) {
   };
   agentSession.token = '';
   agentSession.unsaved = null;
+  agentSession.deliveryCustomer = null;
+  agentSession.deliveryTarget = null;
   global.wx = {
     login: ({ success }) => success({ code: 'example-login' }),
     request: request => {
       const url = new URL(request.url);
       const path = url.pathname.slice(3);
-      const entry = { path, query: url.searchParams, data: request.data, method: request.method,
+      const entry = { path, query: url.searchParams, data: request.data, method: request.method, headers: request.header,
         ok: (data, statusCode = 200) => request.success({ statusCode, data }),
         fail: () => request.fail({ errMsg: 'offline' }) };
       requests.push(entry);
@@ -53,7 +58,7 @@ function setup(t, initialDraft) {
       if (path === '/session') return entry.ok(null, 204);
       if (path === '/agent/card-actions') return entry.ok({ recorded: true });
       if (onRequest?.(entry)) return;
-      if (path === '/agent/conversation') return entry.ok({ draft: structuredClone(draft), draftConfirmed: confirmed, confirmedPreviewId, turns: structuredClone(turns) });
+      if (path === '/agent/conversation') return entry.ok({ draft: structuredClone(draft), draftConfirmed: confirmed, confirmedPreviewId, turns: structuredClone(turns), delivery: structuredClone(delivery) });
       if (path === '/workspace') return entry.ok({ draft: structuredClone(draft), parties: [], draftConfirmed: confirmed, currentTrip: null });
       assert.fail(`Unhandled request ${entry.method} ${path}`);
     },
@@ -64,9 +69,87 @@ function setup(t, initialDraft) {
   t.after(() => { page.onHide(); agentSession.token = ''; agentSession.unsaved = null; });
   return { page, pageFor, requests, navigation, event, card,
     setDraft(value) { draft = value; }, setConfirmed(value, id = null) { confirmed = value; confirmedPreviewId = id; },
-    setTurns(value) { turns = value; }, handle(fn) { onRequest = fn; },
+    setTurns(value) { turns = value; }, setDelivery(value) { delivery = value; }, handle(fn) { onRequest = fn; },
   };
 }
+
+test('A2 follows a card to the delivery sheet, returns with customer context, and resubmits only on tap', async t => {
+  const draft = order();
+  const { page, pageFor, navigation, requests, event, handle, setConfirmed, setDelivery, setTurns } = setup(t, draft);
+  const summary = previewTrip(draft, true);
+  const customer = summary.customers[0];
+  const sheetPath = `/trips/${draft.id}/sheets/${customer.id}`;
+  const lines = deliveryLines(customer, {}).map(line => ({ ...line, status: 'pending' }));
+  const statuses = statusesFor(summary.customers, 'pending');
+  const progress = { tripId: draft.id, version: 1, statusRevision: 0, shops: [
+    { sheetId: customer.id, customer: customer.customer, locked: false, totalCents: 16400, pendingPrices: 0 },
+  ] };
+  const lineId = lines[0].id;
+  const proposal = { tripId: draft.id, sheetId: customer.id, customer: customer.customer, version: 1, statusRevision: 0,
+    totalCents: 8200, canComplete: true, pendingPriceNames: [], edits: [{ lineId, name: '水饺', originalQuantity: '2',
+      beforeQuantity: 2, beforePrice: '82.00', receivedQuantity: 1, price: '82.00' }] };
+  const turn = { id: 'delivery-turn', text: '老王水饺只收一箱', materialIds: [], revision: draft.revision, status: 'completed',
+    events: [event('delivery_proposal', proposal), event('end', { status: 'completed', revision: draft.revision, text: '请核对' })] };
+  setConfirmed(true);
+  setDelivery(progress);
+  setTurns([turn]);
+  const callbacks = {};
+  Object.assign(global.wx, {
+    authorize({ success }) { success(); },
+    getRecorderManager: () => ({
+      onStart(callback) { callbacks.start = callback; }, onStop(callback) { callbacks.stop = callback; },
+      onError() {}, onInterruptionBegin() {}, start() { callbacks.start(); },
+      stop() { callbacks.stop({ tempFilePath: 'onsite.pcm', duration: 1000 }); },
+    }),
+    getFileSystemManager: () => ({ readFile: ({ success }) => success({ data: new ArrayBuffer(32000) }) }),
+    arrayBufferToBase64: bytes => Buffer.from(bytes).toString('base64'),
+  });
+  handle(request => {
+    if (request.path === '/workspace') request.ok({ draft, parties: [], draftConfirmed: true, currentTrip: { id: draft.id } });
+    else if (request.path === `/trips/${draft.id}`) request.ok({ trip: { id: draft.id, statuses, versions: [{ ...summary, version: 1 }] },
+      deliveryEdits: {}, picking: pickingList(summary.customers) });
+    else if (request.path === sheetPath) request.ok({ sheet: { tripId: draft.id, sheetId: customer.id, customer: customer.customer,
+      reviewed: false, orderCents: 16400, lines, execution: deliverySummary(lines), amounts: deliveredBalance(customer, statuses, 0) } });
+    else if (request.path === '/agent/transcription') {
+      assert.equal(request.headers['X-Draft-Id'], draft.id);
+      assert.equal(Buffer.from(request.data.wave, 'base64').toString('ascii', 0, 4), 'RIFF');
+      request.ok({ draftId: draft.id, revision: draft.revision, text: '水饺只收一箱' });
+    } else if (request.path === `${sheetPath}/delivery/apply`) {
+      assert.equal(request.data.turnId, turn.id);
+      assert.equal(request.data.complete, true);
+      assert.deepEqual(request.data.edits, [{ lineId, receivedQuantity: 1, price: '82.00' }]);
+      setDelivery({ ...progress, statusRevision: 1, shops: progress.shops.map(shop => ({ ...shop, locked: true })) });
+      setTurns([{ ...turn, events: [...turn.events, event('delivery_applied', { status: 'completed' })] }]);
+      request.ok({});
+    } else return false;
+    return true;
+  });
+  await page.onShow();
+  await page.login();
+  assert.match(page.data.deliveryStrip.label, /0\/1/);
+  assert.equal(page.data.turns[0].delivery.active, true);
+  page.openDelivery(tap({ turn: turn.id }));
+  assert.equal(navigation.at(-1), '/pages/trip-delivery/index');
+  page.onHide();
+  const deliveryPage = pageFor('trip-delivery');
+  await deliveryPage.onShow();
+  assert.equal(deliveryPage.data.sheet.customer, '老王');
+  deliveryPage.goAssistantDelivery();
+  assert.equal(navigation.at(-1), '/pages/agent/index');
+  await page.onShow();
+  assert.equal(page.data.text, '老王：');
+  const recording = page.record();
+  assert.equal(page.data.voicePhase, '录音中');
+  page.stopRecording();
+  await recording;
+  assert.match(page.data.text, /老王：\n水饺只收一箱/);
+  assert.equal(requests.some(request => request.path.endsWith('/delivery/apply') || request.path === '/agent/turns'), false);
+  await page.applyDelivery(tap({ turn: turn.id, mode: 'complete' }));
+  assert.match(page.data.deliveryStrip.label, /1\/1/);
+  assert.equal(page.data.turns[0].delivery.notice, '已确认送达，应收已锁定');
+  await page.applyDelivery(tap({ turn: turn.id, mode: 'complete' }));
+  assert.equal(requests.filter(request => request.path.endsWith('/delivery/apply')).length, 1);
+});
 
 test('A1 chat restores original input on failed submission, then polls progress and submits a quick answer', async t => {
   const draft = order();
@@ -130,7 +213,7 @@ test('A1 chat restores original input on failed submission, then polls progress 
 
 test('A1 restores failed messages, renders revision-safe undo and only confirms through the existing trip API', async t => {
   const base = order();
-  const { page, requests, navigation, card, event, handle, setDraft, setConfirmed, setTurns } = setup(t, base);
+  const { page, requests, navigation, card, event, handle, setDraft, setConfirmed, setDelivery, setTurns } = setup(t, base);
   const change = event('change', { lines: ['老王 水饺 数量：1箱 → 2箱'] });
   const saved = event('end', { text: '已整理', status: 'completed', revision: 1 });
   const failure = event('end', { text: '处理失败。草稿没有变化。', status: 'failed', revision: 1 });
@@ -166,6 +249,9 @@ test('A1 restores failed messages, renders revision-safe undo and only confirms 
       } else {
         assert.equal(request.data.previewId, secondPreview.previewId);
         setConfirmed(true, secondPreview.previewId);
+        setDelivery({ tripId: base.id, version: 1, statusRevision: 0, shops: [
+          { sheetId: base.customers[0].id, customer: '老王', locked: false, totalCents: 16400, pendingPrices: 0 },
+        ] });
         request.ok({ picking: [{ id: 'row', product: '水饺', quantity: 2, unit: '箱' }] });
       }
       return true;
@@ -200,8 +286,18 @@ test('A1 restores failed messages, renders revision-safe undo and only confirms 
   assert.equal(retried, true);
   assert.deepEqual(requests.find(r => r.path === '/agent/turns').data.direct, { intent: 'preview' });
   assert.equal(page.data.turns.at(-1).elapsed, '用时 4 秒');
+  page.setData({ text: '未发送的草稿', attachments: [{ id: 'image-1', name: '图片 1' }], voiceRetry: true });
+  page.voiceFile = { draft: nextDraft, path: 'draft.pcm' };
   await page.confirm(tap({ id: secondPreview.previewId }));
   assert.equal(page.data.confirmed, true);
+  assert.equal(page.data.issuedCard, true);
+  assert.equal(page.data.draftStrip, null);
+  assert.equal(page.data.deliveryStrip.label, '本趟送货 · 0/1 家已送达');
+  assert.deepEqual(navigation, []);
+  assert.equal(page.data.text, '');
+  assert.deepEqual(page.data.attachments, []);
+  assert.equal(page.data.voiceRetry, false);
+  assert.equal(page.voiceFile, null);
   page.showPickingList();
   assert.equal(navigation.at(-1), '/pages/trip-picking/index');
   assert.equal(page.data.turns.at(-1).checklist[0].state, 'done');

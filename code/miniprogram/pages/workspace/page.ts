@@ -117,13 +117,23 @@ Page({
     return this.run(async generation => {
       await this.restore(generation, token);
       if (generation !== this.generation || this.data.sheetRetry) return;
-      const target = this.data.sheetTarget;
+      const linked = tab === 'delivery' ? agentSession.deliveryTarget : null;
+      if (tab === 'delivery') agentSession.deliveryTarget = null;
+      const target = linked ?? this.data.sheetTarget;
+      if (linked) this.setData({ ...sheetEditor(), sheetTarget: linked, sheet: null, sheetNeedsRefresh: false });
       if (target?.tripId === this.data.formal?.id && target) await this.readSheet(generation, token, target, false);
       else if (target) this.setData({ ...sheetEditor(), sheetTarget: null, sheet: null });
     });
   },
 
   goAssistant(): void { wx.switchTab({ url: '/pages/agent/index' }); },
+
+  goAssistantDelivery(): void {
+    const { sheet, formal, deliveryMvp, busy, fieldEdit, sheetRetry } = this.data;
+    if (!deliveryMvp || !sheet || sheet.reviewed || busy || fieldEdit || sheetRetry || formal?.id !== sheet.tripId || !agentSession.token) return;
+    agentSession.deliveryCustomer = { tripId: sheet.tripId, name: sheet.customer };
+    this.goAssistant();
+  },
 
   async run(action: (generation: number) => Promise<void>) {
     if (this.data.busy) return;

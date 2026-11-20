@@ -15,6 +15,8 @@ import { invalidTool, prepareEdits, PreviousQuestions } from './edit';
 import { AgentMessage, AgentModel, AgentModelTrace, agentPrompt, agentPromptVersion, otherPrompt } from './model';
 import { AgentStore, checkDraft, Input, saveChange, TurnKey } from './store';
 import type { Intent, IntentModel } from './intent';
+import { runDelivery } from './delivery';
+import type { DeliveryModel } from './delivery-model';
 
 type RecognizedImage = Awaited<ReturnType<TextOrders['recognizeImage']>>;
 type Run = { key: TurnKey; input: Input; revision: number; signal: AbortSignal; previous?: PreviousQuestions;
@@ -84,7 +86,7 @@ export class AgentRuntime {
   private readonly running = new Set<string>();
 
   constructor(private readonly pool: Pool, private readonly trips: TripStore, private readonly orders: TextOrders,
-    private readonly model?: AgentModel, private readonly intentModel?: IntentModel) {
+    private readonly model?: AgentModel, private readonly intentModel?: IntentModel, private readonly deliveryModel?: DeliveryModel) {
     this.store = new AgentStore(pool);
   }
 
@@ -142,6 +144,10 @@ export class AgentRuntime {
     try {
       await run.checkSession();
       const context = await this.store.context(key, run.revision);
+      if (context.delivery) {
+        await runDelivery(this.store, this.trips, this.deliveryModel, key, input, context.previous, signal, run.checkSession);
+        return;
+      }
       const previous = context.previous;
       const directAnswer = input.direct?.intent === 'draft' ? input.direct.answer : undefined;
       const confirmation = previous?.confirmation;

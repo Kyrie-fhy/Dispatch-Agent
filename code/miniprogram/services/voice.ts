@@ -127,12 +127,12 @@ export function readVoiceFile(path: string) {
   });
 }
 
-export function transcribeVoice(draft: { id: string; revision: number }, bytes: ArrayBuffer, token: string) {
+export function transcribeVoice(draft: { id: string; revision: number }, bytes: ArrayBuffer, token: string, agent = false) {
   const wave = wx.arrayBufferToBase64(bytes);
   if (wave.length !== 4 * Math.ceil(bytes.byteLength / 3)) {
     throw new VoiceFileError('录音编码不完整，请重新录音。');
   }
   return workspaceRequest<{ draftId: string; revision: number; text: string }>(
-    'POST', `/drafts/${draft.id}/transcription`, token, { wave },
-    { 'X-Draft-Revision': String(draft.revision) }, 40_000);
+    'POST', agent ? '/agent/transcription' : `/drafts/${draft.id}/transcription`, token, { wave },
+    { 'X-Draft-Revision': String(draft.revision), ...(agent ? { 'X-Draft-Id': draft.id } : {}) }, 40_000);
 }

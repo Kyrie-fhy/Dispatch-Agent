@@ -340,7 +340,7 @@ export class AgentRuntime {
                 ? `${spoken} → ${mention.canonicalName}（记住的叫法）`
                 : `${mention.canonicalName}：认出熟客`);
             }
-            links.push({ draftCustomerId: customer.id, spoken, customerId: mention.customerId,
+            links.push({ draftCustomerId: sibling ? sibling.id : customer.id, spoken, customerId: mention.customerId,
               canonicalName: mention.canonicalName, matchedBy: mention.matchedBy, merged: Boolean(sibling) });
           } else if (customer.partyId === null) {
             delete customer.partyId;

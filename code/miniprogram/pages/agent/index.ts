@@ -1,4 +1,5 @@
 import type { AgentEvent, AgentStatus, AgentTurn, DeliveryCardState, DeliveryProgress, DeliveryProposal, DirectIntent, PlanStep, StepState } from '../../core/agent';
+import type { CustomerMention, DraftPriceSuggestion } from '../../core/memory';
 import { money } from '../../core/orders';
 import { materialImagePattern, Material, MaterialSource } from '../../core/materials';
 import { textOrderLimit, textOrderQuestions } from '../../core/text-order';
@@ -15,14 +16,30 @@ type Conversation = { draft: TripDraft; draftConfirmed: boolean; confirmedPrevie
 type PollResult = { status: AgentStatus; events: AgentEvent[] };
 type Attachment = { id: string; name: string };
 type VoiceFile = { draft: TripDraft; path: string };
+type AgentMemory = { draftId: string; revision: number; confirmed: boolean; customers: { id: string; name: string }[];
+  mentions: { draftCustomerId: string; resolution: CustomerMention }[]; prices: DraftPriceSuggestion[] };
+type ChoiceView = { draftCustomerId: string; spoken: string; remember: boolean;
+  candidates: { id: string; name: string }[]; hint: string };
+type ChoicePayload = { draftCustomerId: string; choice: 'existing'; customerId: string; remember: boolean }
+  | { draftCustomerId: string; choice: 'new' }
+  | { draftCustomerId: string; choice: 'unlink'; spoken: string };
 const draftConflicts = ['draft_changed', 'draft_confirmed', 'draft_not_found', 'preview_not_found', 'material_draft_changed'];
+const choiceConflicts = ['draft_changed', 'draft_confirmed', 'draft_not_found', 'agent_busy', 'customer_already_linked',
+  'customer_not_linked', 'draft_customer_not_found'];
 const imageLimit = 4;
+
+// 只用于展示判断，规则与 core/memory 的 normalizeMemoryText 保持一致。
+function sameName(left: string, right: string): boolean {
+  const clean = (value: string) => value.replace(/[！-～]/g, character => String.fromCharCode(character.charCodeAt(0) - 0xfee0))
+    .trim().replace(/\s+/g, ' ').toLowerCase();
+  return clean(left) === clean(right);
+}
 
 const stepIcon: Record<StepState, string> = { pending: '○', running: '', done: '✓', needs_input: '！', failed: '✗', skipped: '–' };
 type StepView = PlanStep & { state: StepState; result?: string };
 
 function view(turn: AgentTurn, revision: number, confirmed: boolean, last: boolean, latestPreview: boolean, confirmedPreviewId: string,
-  delivery: DeliveryProgress | null) {
+  delivery: DeliveryProgress | null, draft: TripDraft | null) {
   let plan: PlanStep[] = [];
   const progress = new Map<string, StepView>();
   const changes: string[] = [];
@@ -32,6 +49,7 @@ function view(turn: AgentTurn, revision: number, confirmed: boolean, last: boole
   let questions: Extract<AgentEvent, { kind: 'questions' }>['payload']['questions'] = [];
   let proposal: DeliveryProposal | undefined;
   let deliveryState: DeliveryCardState | undefined;
+  let links: { draftCustomerId: string; spoken: string; label: string }[] = [];
   for (const event of turn.events) {
     if (event.kind === 'plan') plan = event.payload.steps;
     if (event.kind === 'step') {
@@ -49,7 +67,19 @@ function view(turn: AgentTurn, revision: number, confirmed: boolean, last: boole
     if (event.kind === 'questions') questions = event.payload.questions;
     if (event.kind === 'delivery_proposal') proposal = event.payload;
     if (event.kind === 'delivery_applied') deliveryState = event.payload.status;
+    if (event.kind === 'customer_links') for (const link of event.payload.links) {
+      if (link.merged) continue;
+      const customer = draft?.customers.find(entry => entry.id === link.draftCustomerId);
+      if (!customer || customer.partyId !== link.customerId) continue;
+      links.push({ draftCustomerId: link.draftCustomerId, spoken: link.spoken,
+        label: sameName(link.spoken, link.canonicalName) ? `${link.canonicalName}：认出熟客`
+          : `${link.spoken} → ${link.canonicalName}` });
+    }
   }
+  if (!(last && !confirmed && !undone && turn.status === 'completed')) links = [];
+  questions = questions.filter(question => !draft || !question.text.includes('是哪家熟客？')
+    || draft.customers.some(customer => customer.partyId === undefined && customer.customer.trim() === (question.customer || '').trim()));
+  const showChoices = Boolean(last && !confirmed && turn.status === 'completed');
   const issued = Boolean(latestPreview && confirmed && preview && preview.previewId === confirmedPreviewId);
   const skipped = Boolean(preview && !issued &&
     (progress.get('confirm')?.state === 'skipped' || preview.revision !== revision || confirmed));
@@ -79,7 +109,7 @@ function view(turn: AgentTurn, revision: number, confirmed: boolean, last: boole
   const showStandaloneUndo = Boolean(canUndo && !showDraftActions);
   const allDelivered = Boolean(delivery && delivery.shops.length > 0 && delivery.shops.every(shop => shop.locked));
   const showDeliveryFooter = Boolean(last && confirmed && turn.status === 'completed' && !deliveryActive);
-  return { id: turn.id, text: turn.text, pictures: turn.materialIds.length, checklist, questions, changes, undone, issued,
+  return { id: turn.id, text: turn.text, pictures: turn.materialIds.length, checklist, questions, changes, undone, issued, links, showChoices,
     status: turn.status, reply: changes.length && end?.text === '草稿已更新。' ? '' : end?.text ?? '',
     elapsed: end?.elapsedMs === undefined ? '' : `用时 ${Math.max(1, Math.round(end.elapsedMs / 1000))} 秒`,
     canAnswer, hasPendingQuestions, showDraftSummary, showDraftActions, showStandaloneUndo, showDeliveryFooter, allDelivered,
@@ -127,6 +157,8 @@ Page({
     readyImages: [] as Attachment[], uploadRows: [] as (MaterialSource & { id?: string; local: boolean })[],
     draftSummary: null as ReturnType<typeof draftSummary> | null, draftExpanded: false, issuedCard: false, revokeFailed: false,
     deliverySummary: null as ReturnType<typeof deliverySummaryView> | null, navTitle: '录单助手', focusInput: false, imageLimit,
+    choices: [] as ChoiceView[], memoryNames: [] as string[], rememberOff: {} as Record<string, boolean>,
+    memoryFailed: false, notice: '',
   },
   draft: null as TripDraft | null,
   turns: [] as AgentTurn[],
@@ -135,6 +167,7 @@ Page({
   timer: null as ReturnType<typeof setTimeout> | null,
   confirmedPreviewId: '',
   delivery: null as DeliveryProgress | null,
+  memory: null as AgentMemory | null,
   pending: new Map<string, string>(),
   voiceCapture: null as ReturnType<typeof startVoiceRecording> | null,
   voiceFile: null as VoiceFile | null,
@@ -179,10 +212,12 @@ Page({
     this.voiceFile = null;
     this.confirmedPreviewId = '';
     this.delivery = null;
+    this.memory = null;
     this.setData({ signedIn: false, busy: false, polling: false, confirmed: false, draftsAvailable: false,
       error: '', text: '', turns: [], attachments: [], readyImages: [], uploadRows: [], pendingMaterial: '',
       scrollTo: '', draftSummary: null, deliverySummary: null, navTitle: '录单助手', focusInput: false, draftExpanded: false,
-      issuedCard: false, voiceRetry: false, inputMode: 'text', revokeFailed: !!this.retiredToken });
+      issuedCard: false, voiceRetry: false, inputMode: 'text', revokeFailed: !!this.retiredToken,
+      choices: [], memoryNames: [], rememberOff: {}, memoryFailed: false, notice: '' });
     applyNavTitle('录单助手');
   },
 
@@ -248,17 +283,54 @@ Page({
       ...(changedMode || !sameTrip ? { text: '', attachments: [], readyImages: [], uploadRows: [], draftExpanded: false,
         pendingMaterial: '', voiceRetry: false, inputMode: 'text' } : {}),
       ...(prefill ? { text: `${target.name}：`, focusInput: !active, inputMode: 'text' } : { focusInput: false }) });
+    await this.loadMemory(draft, draftConfirmed, generation, token);
+    if (generation !== this.generation || token !== agentSession.token) return;
     this.render();
     if (active) this.schedule();
     if (!draftConfirmed) void this.syncMaterials(draft, generation);
+  },
+
+  async loadMemory(draft: TripDraft, confirmed: boolean, generation: number, token: string) {
+    if (confirmed) {
+      this.memory = null;
+      this.setData({ memoryFailed: false });
+      return;
+    }
+    try {
+      const memory = await workspaceRequest<AgentMemory>('GET', `/agent/memory?draftId=${draft.id}`, token);
+      if (generation !== this.generation || token !== agentSession.token || this.draft?.id !== draft.id) return;
+      this.memory = memory;
+      this.setData({ memoryFailed: false });
+    } catch {
+      if (generation !== this.generation || token !== agentSession.token) return;
+      this.setData({ memoryFailed: true });
+    }
   },
 
   render() {
     const revision = this.draft?.revision ?? -1;
     const preview = [...this.turns].reverse().find(turn => turn.events.some(event => event.kind === 'preview') &&
       !turn.events.some(event => event.kind === 'step' && event.payload.id === 'confirm' && event.payload.state === 'skipped'));
+    const choices: ChoiceView[] = [];
+    const memory = this.draft && this.memory && this.memory.draftId === this.draft.id &&
+      this.memory.revision === this.draft.revision && !this.data.confirmed ? this.memory : null;
+    if (memory && this.draft) for (const item of memory.mentions) {
+      const customer = this.draft.customers.find(entry => entry.id === item.draftCustomerId);
+      if (!customer || customer.partyId !== undefined || !customer.customer.trim()) continue;
+      const resolution = item.resolution;
+      choices.push({ draftCustomerId: item.draftCustomerId, spoken: customer.customer,
+        remember: !this.data.rememberOff[item.draftCustomerId],
+        candidates: resolution.status === 'resolved'
+          ? [{ id: resolution.customerId, name: resolution.canonicalName }]
+          : resolution.status === 'ambiguous' || resolution.status === 'candidate_only'
+            ? resolution.candidates.map(candidate => ({ id: candidate.customerId, name: candidate.canonicalName })) : [],
+        hint: resolution.status === 'resolved' ? '是不是这家？'
+          : resolution.status === 'ambiguous' ? '有几家同名，请选一家'
+            : resolution.status === 'candidate_only' ? '像下面这几家' : '熟客里没有这个叫法' });
+    }
+    const memoryNames = memory ? memory.customers.map(customer => customer.name) : [];
     const turns = this.turns.map((turn, index) => view(turn, revision, this.data.confirmed,
-      index === this.turns.length - 1, preview?.id === turn.id, this.confirmedPreviewId, this.delivery));
+      index === this.turns.length - 1, preview?.id === turn.id, this.confirmedPreviewId, this.delivery, this.draft));
     const recent = turns[turns.length - 1];
     const deliverySummary = this.delivery ? deliverySummaryView(this.delivery) : null;
     const draftInfo = !this.data.confirmed && this.draft
@@ -268,7 +340,7 @@ Page({
         ? `送货助手（${this.delivery.shops.filter(shop => shop.locked).length}/${this.delivery.shops.length} 已送达）`
         : '送货助手');
     this.setData({ turns, scrollTo: '', issuedCard: turns.some(turn => turn.issued),
-      deliverySummary, draftSummary: draftInfo, navTitle });
+      deliverySummary, draftSummary: draftInfo, navTitle, choices, memoryNames });
     this.setData({ scrollTo: 'latest' });
     applyNavTitle(navTitle);
   },
@@ -415,6 +487,68 @@ Page({
     if (!parent || typeof option !== 'string' || !parent.questions.some(question => question.options.includes(option))) return;
     this.card('answer');
     return this.submit(option, [], { intent: 'draft', turnId: parent.id, answer: option });
+  },
+
+  chooseCustomer(event: WechatMiniprogram.TouchEvent): Promise<void> | undefined {
+    const draftCustomerId = String(event.currentTarget.dataset.customer ?? '');
+    const customerId = String(event.currentTarget.dataset.party ?? '');
+    const choice = this.data.choices.find(item => item.draftCustomerId === draftCustomerId);
+    if (!choice || !customerId) return;
+    return this.choose({ draftCustomerId, choice: 'existing', customerId, remember: choice.remember });
+  },
+
+  pickCustomer(event: WechatMiniprogram.PickerChange): Promise<void> | undefined {
+    const draftCustomerId = String(event.currentTarget.dataset.customer ?? '');
+    const choice = this.data.choices.find(item => item.draftCustomerId === draftCustomerId);
+    const customer = this.memory?.customers[Number(event.detail.value)];
+    if (!choice || !customer) return;
+    return this.choose({ draftCustomerId, choice: 'existing', customerId: customer.id, remember: choice.remember });
+  },
+
+  newCustomer(event: WechatMiniprogram.TouchEvent): Promise<void> | undefined {
+    const draftCustomerId = String(event.currentTarget.dataset.customer ?? '');
+    if (!this.data.choices.some(item => item.draftCustomerId === draftCustomerId)) return;
+    return this.choose({ draftCustomerId, choice: 'new' });
+  },
+
+  notHim(event: WechatMiniprogram.TouchEvent): Promise<void> | undefined {
+    const { turn: turnId, customer } = event.currentTarget.dataset;
+    const link = this.data.turns.find(turn => turn.id === turnId)?.links.find(item => item.draftCustomerId === customer);
+    if (!link) return;
+    return this.choose({ draftCustomerId: link.draftCustomerId, choice: 'unlink', spoken: link.spoken });
+  },
+
+  toggleRemember(event: WechatMiniprogram.TouchEvent) {
+    const draftCustomerId = String(event.currentTarget.dataset.customer ?? '');
+    if (!draftCustomerId) return;
+    this.setData({ rememberOff: { ...this.data.rememberOff, [draftCustomerId]: !this.data.rememberOff[draftCustomerId] } });
+    this.render();
+  },
+
+  reloadMemory(): Promise<void> | undefined {
+    return this.run(() => this.reload());
+  },
+
+  choose(payload: ChoicePayload): Promise<void> | undefined {
+    const draft = this.draft;
+    if (!draft || this.data.busy || this.data.polling) return;
+    const spoken = this.data.choices.find(item => item.draftCustomerId === payload.draftCustomerId)?.spoken ?? '';
+    this.setData({ notice: '' });
+    return this.run(async () => {
+      try {
+        const result = await this.request<{ revision: number; remembered: boolean | null; rememberIssue?: string }>(
+          '/agent/customer-choice', { draftId: draft.id, revision: draft.revision, ...payload });
+        await this.reload();
+        if (result.remembered === true) {
+          if (typeof wx.showToast === 'function') wx.showToast({ title: '已记住叫法', icon: 'success' });
+        } else if (result.remembered === false && result.rememberIssue === 'name_conflict') {
+          this.setData({ notice: `已选好店。${spoken ? `「${spoken}」` : '这个叫法'}和另一家的正式店名一样，没有记住这个叫法。` });
+        }
+      } catch (error) {
+        if (error instanceof WorkspaceError && choiceConflicts.includes(error.code)) await this.reload();
+        throw error;
+      }
+    });
   },
 
   retry(event: WechatMiniprogram.TouchEvent) {

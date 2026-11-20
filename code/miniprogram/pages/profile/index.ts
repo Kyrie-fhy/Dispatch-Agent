@@ -1,7 +1,10 @@
 import type { TripDraft } from '../../core/trips';
 import { agentSession } from '../../services/agent-session';
+import { newId } from '../../services/ids';
 import { revokeSession, wechatCode, Workspace, WorkspaceError, workspaceRequest } from '../../services/workspace';
 import { errorMessage } from '../order-view';
+
+type AliasView = { alias: string; canonicalName: string };
 
 function draftCounts(draft: TripDraft) {
   let customers = 0;
@@ -28,6 +31,9 @@ Page({
     tripDetail: '',
     partyCount: 0,
     canEditForm: false,
+    aliases: [] as AliasView[],
+    aliasesLoaded: false,
+    aliasError: '',
   },
   generation: 0,
   retiredToken: '',
@@ -44,7 +50,8 @@ Page({
   clear(error = '') {
     this.generation += 1;
     this.setData({ signedIn: false, busy: false, error, revokeFailed: !!this.retiredToken,
-      loaded: false, tripMode: '', tripDetail: '', partyCount: 0, canEditForm: false });
+      loaded: false, tripMode: '', tripDetail: '', partyCount: 0, canEditForm: false,
+      aliases: [], aliasesLoaded: false, aliasError: '' });
   },
 
   async run(action: () => Promise<void>) {
@@ -84,6 +91,15 @@ Page({
       partyCount: result.parties.length,
       canEditForm: !result.draftConfirmed,
     });
+    try {
+      const { aliases } = await workspaceRequest<{ aliases: AliasView[] }>('GET', '/customer-aliases', token);
+      if (generation !== this.generation || token !== agentSession.token) return;
+      this.setData({ aliases: aliases.map(({ alias, canonicalName }) => ({ alias, canonicalName })),
+        aliasesLoaded: true, aliasError: '' });
+    } catch {
+      if (generation !== this.generation || token !== agentSession.token) return;
+      this.setData({ aliasError: '叫法列表没加载出来，重进本页可重试。' });
+    }
   },
 
   login(): Promise<void> | undefined {
@@ -109,7 +125,8 @@ Page({
     agentSession.deliveryTarget = null;
     this.generation += 1;
     this.setData({ signedIn: false, busy: false, error: '', revokeFailed: !!this.retiredToken,
-      loaded: false, tripMode: '', tripDetail: '', partyCount: 0, canEditForm: false });
+      loaded: false, tripMode: '', tripDetail: '', partyCount: 0, canEditForm: false,
+      aliases: [], aliasesLoaded: false, aliasError: '' });
     return this.run(async () => {
       const generation = this.generation;
       try { await revokeSession(this.retiredToken); }
@@ -117,6 +134,28 @@ Page({
       if (generation !== this.generation) return;
       this.retiredToken = '';
       this.setData({ revokeFailed: false });
+    });
+  },
+
+  unbindAlias(event: WechatMiniprogram.TouchEvent) {
+    const alias = String(event.currentTarget.dataset.alias ?? '');
+    const name = String(event.currentTarget.dataset.name ?? '');
+    if (!alias || this.data.busy) return;
+    if (typeof wx.showModal !== 'function') return this.unbind(alias);
+    wx.showModal({
+      title: '解绑叫法',
+      content: name ? `解绑后再说「${alias}」不会自动认成${name}。` : `解绑后再说「${alias}」不会自动认成这家熟客。`,
+      confirmText: '解绑',
+      success: ({ confirm }) => { if (confirm) void this.unbind(alias); },
+      fail: () => this.setData({ error: '确认框打开失败，请重试。' }),
+    });
+  },
+
+  unbind(alias: string): Promise<void> | undefined {
+    if (this.data.busy || !agentSession.token) return;
+    return this.run(async () => {
+      await workspaceRequest('POST', '/customer-aliases/unbind', agentSession.token, { requestId: newId(), alias });
+      await this.reload();
     });
   },
 

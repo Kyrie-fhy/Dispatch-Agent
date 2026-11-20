@@ -2862,6 +2862,8 @@ test('A3 keeps an unknown spoken name pending until the courier chooses and reme
   assert.equal(merged.length, 1);
   assert.equal(merged[0].matchedBy, 'alias');
   assert.equal(merged[0].merged, true);
+  // 并入同一家时指向被并入的原客户单，页面「不是他」才能落到草稿里仍存在的那家。
+  assert.equal(merged[0].draftCustomerId, pending.customers[0].id);
   assert.match(secondTurn.events.filter(event => event.kind === 'change').flatMap(event => event.payload.lines).join(' '), /并入同一家/);
 });
 

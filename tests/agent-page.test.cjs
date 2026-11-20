@@ -664,6 +664,71 @@ test('Agent drops the top strip and keeps the next action only on the latest lin
   assert.ok(requests.some(request => request.path === '/trips/confirm'));
 });
 
+test('Delivery MVP lists shops before opening a sheet and picking stays a flat read-only view', async t => {
+  const deliveryWxml = fs.readFileSync(require.resolve('../code/dist/pages/trip-delivery/index.wxml'), 'utf8');
+  assert.equal(deliveryWxml.includes('order-line'), false);
+  assert.equal(deliveryWxml.includes('原订'), false);
+  assert.equal(deliveryWxml.includes('size="mini"'), false);
+  const pickingWxml = fs.readFileSync(require.resolve('../code/dist/pages/trip-picking/index.wxml'), 'utf8');
+  const pickingFragment = fs.readFileSync(require.resolve('../code/dist/pages/workspace/picking.wxml'), 'utf8');
+  for (const wxml of [pickingWxml, pickingFragment]) {
+    assert.equal(wxml.includes('<checkbox'), false);
+    assert.equal(wxml.includes('openSheet'), false);
+  }
+
+  const draft = order();
+  draft.customers.push({
+    id: 'c-2', customer: '老李', partyId: null,
+    items: [{ id: 'i-2', product: '汤圆', brand: '', specification: '', unit: '箱', quantity: '1', price: '' }],
+  });
+  const { page, pageFor, handle } = setup(t, draft);
+  await page.onShow();
+  await page.login();
+  const summary = previewTrip(draft, true);
+  const statuses = statusesFor(summary.customers, 'pending');
+  const formal = { trip: { id: draft.id, origin: 's2', versions: [{ ...summary, version: 1, savedAt: '2026-11-20T00:00:00Z' }],
+    statuses, statusRevision: 0 }, picking: pickingList(summary.customers), deliveryEdits: {}, sheets: [] };
+  const sheetId = draft.customers[0].id;
+  handle(request => {
+    if (request.path === '/workspace') {
+      request.ok({ draft, parties: [], draftConfirmed: true, currentTrip: { id: draft.id } });
+      return true;
+    }
+    if (request.path === `/trips/${draft.id}`) { request.ok(formal); return true; }
+    if (request.path === `/trips/${draft.id}/sheets/${sheetId}`) {
+      const customer = summary.customers[0];
+      const lines = deliveryLines(customer, {}).map(line => ({ ...line, status: 'pending' }));
+      request.ok({ sheet: { tripId: draft.id, sheetId, customer: customer.customer, version: 1, statusRevision: 0,
+        reviewed: false, deliveryCompleted: false, orderCents: customer.totalCents, execution: deliverySummary(lines),
+        amounts: deliveredBalance(customer, statuses, 0), lines } });
+      return true;
+    }
+    return false;
+  });
+
+  const delivery = pageFor('trip-delivery');
+  await delivery.onShow();
+  assert.equal(delivery.data.sheetTarget, null);
+  assert.equal(delivery.data.formal.deliveredCount, 0);
+  const [first, second] = delivery.data.formal.deliveryRows;
+  assert.equal(first.customer, '老王');
+  assert.equal(first.dueLabel, '¥164.00');
+  assert.equal(first.amountTitle, '预计应收');
+  assert.equal(first.lineCount, 1);
+  assert.equal(second.pendingPrices, 1);
+  assert.equal(second.pendingPriceOnly, true);
+  assert.equal(second.dueLabel, '待补价');
+  assert.notEqual(second.dueLabel, '¥0.00');
+
+  await delivery.openSheet(tap({ tripId: draft.id, sheetId }));
+  assert.ok(delivery.data.sheetTarget);
+  assert.equal(delivery.data.sheet.customer, '老王');
+  assert.equal(delivery.data.sheet.lines.length, 1);
+  assert.equal(delivery.data.sheet.lines[0].originalQuantity, '2');
+  delivery.closeSheet();
+  assert.equal(delivery.data.sheetTarget, null);
+});
+
 test('Agent starts the next trip from delivery cards with a guard for unfinished shops', async t => {
   const draft = order();
   const { page, requests, event, handle, setDraft, setConfirmed, setDelivery, setTurns } = setup(t, draft);

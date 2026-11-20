@@ -1,7 +1,10 @@
 <view class="container">
   <view class="title">取货清单</view>
   <view wx:if="{{error}}" class="error">{{error}}</view>
-  <button wx:if="{{!signedIn}}" class="primary" bindtap="goAssistant">去助手登录</button>
+  <view wx:if="{{!signedIn}}" class="card">
+    <view class="hint">微信登录后查看本趟冷库汇总拿货单。</view>
+    <button class="btn-primary" bindtap="goAssistant">去助手登录</button>
+  </view>
   <view wx:elif="{{busy && !draft}}" class="hint">正在读取取货清单…</view>
   <block wx:else><include src="../workspace/picking.wxml" /></block>
 </view>

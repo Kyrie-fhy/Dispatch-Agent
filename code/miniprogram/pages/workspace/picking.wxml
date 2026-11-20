@@ -1,5 +1,8 @@
         <view wx:if="{{!formal}}" class="card">
-          <button wx:if="{{onTripTab}}" bindtap="goAssistant">这趟还没出单，去助手录单</button>
+          <block wx:if="{{onTripTab}}">
+            <view class="hint">这趟还没确认出单，出单后自动汇总整车应取货品。</view>
+            <button class="btn-primary" bindtap="goAssistant">去助手录单</button>
+          </block>
           <text wx:else>还没有正式送货单。</text>
         </view>
         <block wx:else>
@@ -8,14 +11,20 @@
             <view wx:if="{{!formal.changes.length}}" class="hint">本次取货数量无变化</view>
             <view wx:for="{{formal.changes}}" wx:key="id" class="line">
               <view>{{item.brand ? item.brand + ' ' : ''}}{{item.product}}{{item.specification ? ' · ' + item.specification : ''}}</view>
-              <view>{{item.before}} → {{item.after}} {{item.unit}}</view>
+              <view class="num">{{item.before}} → {{item.after}} {{item.unit}}</view>
             </view>
           </view>
-          <view class="card">
-            <view class="section-title">本趟应取 · 第 {{formal.version}} 版</view>
+          <view class="card picking-card">
+            <view class="picking-header">
+              <text class="section-title">{{onTripTab ? '本趟应取汇总' : '本趟应取 · 第 ' + formal.version + ' 版'}}</text>
+              <text class="picking-count num">共 {{formal.picking.length}} 种货品</text>
+            </view>
             <view wx:for="{{formal.picking}}" wx:key="id" class="line picking-row">
-              <view class="product">{{item.brand ? item.brand + ' ' : ''}}{{item.product}}{{item.specification ? ' · ' + item.specification : ''}}</view>
-              <view class="picking-quantity">{{item.quantity}} {{item.unit}}</view>
+              <view class="picking-info">
+                <view class="product picking-name">{{item.brand ? item.brand + ' ' : ''}}{{item.product}}</view>
+                <view wx:if="{{item.specification}}" class="picking-spec">{{item.specification}}</view>
+              </view>
+              <view class="picking-quantity num">{{item.quantity}} {{item.unit}}</view>
             </view>
           </view>
         </block>

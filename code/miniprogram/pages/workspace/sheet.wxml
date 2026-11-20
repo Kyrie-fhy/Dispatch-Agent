@@ -1,31 +1,38 @@
 <import src="../order-templates.wxml" />
 <view class="workspace-actions">
-  <button size="mini" bindtap="closeSheet" disabled="{{busy || sheetRetry}}">返回本趟送货单</button>
+  <button wx:if="{{deliveryMvp}}" class="btn-ghost sheet-back-btn" bindtap="closeSheet" disabled="{{busy || sheetRetry}}">‹ 返回门店列表</button>
+  <button wx:else size="mini" bindtap="closeSheet" disabled="{{busy || sheetRetry}}">返回本趟送货单</button>
 </view>
 
 <view wx:if="{{sheetRetry}}" class="card">
-  <button class="primary" bindtap="retrySheetWrite" disabled="{{busy}}" loading="{{busy}}">重试本次提交</button>
+  <button class="{{deliveryMvp ? 'btn-primary' : 'primary'}}" bindtap="retrySheetWrite" disabled="{{busy}}" loading="{{busy}}">重试本次提交</button>
 </view>
 <view wx:elif="{{sheetNeedsRefresh || !sheet}}" class="card">
   <view wx:if="{{busy}}">正在读取客户单…</view>
-  <button wx:else class="primary" bindtap="refreshSheet">重新读取客户单</button>
+  <button wx:else class="{{deliveryMvp ? 'btn-primary' : 'primary'}}" bindtap="refreshSheet">重新读取客户单</button>
 </view>
 <block wx:else>
   <view class="card">
-    <view class="section-title">{{sheet.customer}} · 第 {{sheet.version}} 版</view>
     <block wx:if="{{deliveryMvp}}">
-      <view class="amount">{{sheet.reviewed ? '本次应收 ¥' + sheet.balance.due : sheet.executionLabel}}</view>
+      <view class="sheet-head">
+        <text class="sheet-title">{{sheet.customer}}</text>
+        <text class="status-tag {{sheet.deliveryCompleted ? 'status-done' : 'status-pending'}}">{{sheet.deliveryCompleted ? '已确认送达' : '待送达'}}</text>
+      </view>
+      <view class="amount num">{{sheet.reviewed ? '本次应收 ¥' + sheet.balance.due : sheet.executionLabel}}</view>
       <view wx:if="{{sheet.reviewed}}" class="hint">{{sheet.deliveryCompleted ? '已确认送达 · 应收已锁定' : '配送已核对'}}</view>
     </block>
-    <view wx:else class="sheet-metrics">
-      <view>{{sheet.executionLabel}}</view>
-      <view class="hint">{{sheet.reviewed ? '配送已核对' : '配送待核对，应收为预估'}}</view>
-      <view>本单应收 ¥{{sheet.balance.due}}</view>
-      <view>本单实收 ¥{{sheet.balance.paid}}</view>
-      <view>本单欠款 ¥{{sheet.balance.remaining}}</view>
-      <view wx:if="{{sheet.balance.hasExcess}}">本单多收 ¥{{sheet.balance.excess}}</view>
-      <view>其他单据欠款 ¥{{sheet.otherRemaining}}</view>
-    </view>
+    <block wx:else>
+      <view class="section-title">{{sheet.customer}} · 第 {{sheet.version}} 版</view>
+      <view class="sheet-metrics">
+        <view>{{sheet.executionLabel}}</view>
+        <view class="hint">{{sheet.reviewed ? '配送已核对' : '配送待核对，应收为预估'}}</view>
+        <view>本单应收 ¥{{sheet.balance.due}}</view>
+        <view>本单实收 ¥{{sheet.balance.paid}}</view>
+        <view>本单欠款 ¥{{sheet.balance.remaining}}</view>
+        <view wx:if="{{sheet.balance.hasExcess}}">本单多收 ¥{{sheet.balance.excess}}</view>
+        <view>其他单据欠款 ¥{{sheet.otherRemaining}}</view>
+      </view>
+    </block>
   </view>
 
   <view wx:if="{{changePreview}}" class="card">
@@ -119,8 +126,8 @@
       <view class="line" wx:for="{{sheet.lines}}" wx:key="id">
         <block wx:if="{{deliveryMvp}}">
           <view class="product">{{item.productLabel}}</view>
-          <view>原订 {{item.originalQuantity}} {{item.unit}} · 实收 {{item.receivedQuantity}} {{item.unit}}</view>
-          <view>单价 {{item.priceLabel}} · 小计 {{item.amountLabel}}</view>
+          <view class="num">原订 {{item.originalQuantity}} {{item.unit}} · 实收 {{item.receivedQuantity}} {{item.unit}}</view>
+          <view class="num">单价 <text class="{{item.priceLabel === '待补价' ? 'pending-price' : ''}}">{{item.priceLabel}}</text> · 小计 <text class="{{item.amountLabel === '待补价' ? 'pending-price' : ''}}">{{item.amountLabel}}</text></view>
           <view wx:if="{{sheet.reviewed}}" class="muted">{{item.statusLabel}}</view>
           <view wx:if="{{fieldEdit.id === item.id}}" class="field-grid">
             <view>
@@ -133,10 +140,12 @@
               <input id="price-{{item.id}}" type="digit" maxlength="18" value="{{fieldEdit.price}}"
                 data-field="price" bindinput="editDeliveryField" disabled="{{busy}}" placeholder="待补价" />
             </view>
-            <button size="mini" class="primary" bindtap="saveFieldEdit" disabled="{{busy}}">保存</button>
-            <button size="mini" bindtap="cancelSheetAction" disabled="{{busy}}">取消</button>
+            <view class="field-actions">
+              <button class="btn-primary field-btn" bindtap="saveFieldEdit" disabled="{{busy}}">保存</button>
+              <button class="btn-secondary field-btn" bindtap="cancelSheetAction" disabled="{{busy}}">取消</button>
+            </view>
           </view>
-          <button wx:elif="{{!sheet.reviewed && !fieldEdit}}" size="mini" data-id="{{item.id}}"
+          <button wx:elif="{{!sheet.reviewed && !fieldEdit}}" class="btn-secondary line-edit-btn" data-id="{{item.id}}"
             bindtap="beginFieldEdit" disabled="{{busy}}">改实收与单价</button>
         </block>
         <block wx:else>
@@ -148,9 +157,9 @@
           <button wx:if="{{item.status !== 'pending'}}" size="mini" data-id="{{item.id}}" data-status="pending" bindtap="markDelivery" disabled="{{busy}}">标记未配送</button>
         </view>
       </view>
-      <button wx:if="{{deliveryMvp && !sheet.reviewed}}" class="primary" bindtap="completeDelivery"
+      <button wx:if="{{deliveryMvp && !sheet.reviewed}}" class="btn-primary sheet-submit-btn" bindtap="completeDelivery"
         disabled="{{busy || !!fieldEdit}}" loading="{{busy}}">按实收数量确认送达</button>
-      <button wx:if="{{deliveryMvp && !sheet.reviewed && formal.id === sheet.tripId}}" size="mini" bindtap="goAssistantDelivery"
+      <button wx:if="{{deliveryMvp && !sheet.reviewed && formal.id === sheet.tripId}}" class="btn-secondary sheet-submit-btn" bindtap="goAssistantDelivery"
         disabled="{{busy || !!fieldEdit || !!sheetRetry}}">去助手语音改单</button>
       <button wx:if="{{!deliveryMvp && sheet.pending.length}}" bindtap="markDelivery" data-status="delivered" disabled="{{busy}}">本客户整单送达</button>
       <button wx:if="{{!deliveryMvp && !sheet.reviewed}}" class="primary" data-action="review" bindtap="beginSheetAction" disabled="{{busy}}">{{deliveryMvp ? '核对配送' : '开始对账'}}</button>

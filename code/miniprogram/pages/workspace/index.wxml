@@ -12,7 +12,7 @@
   <block wx:else>
     <view class="session-actions">
       <button wx:if="{{draft && !dirty && !sheetTarget}}" size="mini" bindtap="reload" disabled="{{busy}}">刷新工作区</button>
-      <button size="mini" bindtap="logout">退出登录</button>
+      <button wx:if="{{!deliveryMvp}}" size="mini" bindtap="logout">退出登录</button>
     </view>
     <view wx:if="{{!draft}}" class="card">
       <view wx:if="{{busy}}">正在恢复工作区…</view>

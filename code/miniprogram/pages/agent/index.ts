@@ -69,22 +69,35 @@ function view(turn: AgentTurn, revision: number, confirmed: boolean, last: boole
       : turn.status === 'completed' && !skipped ? 'pending' : 'skipped');
     return { ...item, state, icon: stepIcon[state], result: stored?.result ?? '' };
   });
+  const deliveryActive = Boolean(proposal && !stale && !deliveryState && turn.status === 'completed');
+  const canAnswer = Boolean(last && (!confirmed || plan.some(step => step.id === 'delivery-check')) && !undone &&
+    turn.status === 'completed' && end?.revision === revision);
+  const hasPendingQuestions = Boolean(canAnswer && questions.length);
+  const showDraftSummary = Boolean(last && !confirmed && turn.status === 'completed' && !preview && !proposal);
+  const showDraftActions = showDraftSummary;
+  const canUndo = Boolean(!confirmed && !undone && !!changes.length && end?.revision === revision && turn.status !== 'running');
+  const showStandaloneUndo = Boolean(canUndo && !showDraftActions);
+  const allDelivered = Boolean(delivery && delivery.shops.length > 0 && delivery.shops.every(shop => shop.locked));
+  const showDeliveryFooter = Boolean(last && confirmed && turn.status === 'completed' && !deliveryActive);
   return { id: turn.id, text: turn.text, pictures: turn.materialIds.length, checklist, questions, changes, undone, issued,
     status: turn.status, reply: changes.length && end?.text === '草稿已更新。' ? '' : end?.text ?? '',
     elapsed: end?.elapsedMs === undefined ? '' : `用时 ${Math.max(1, Math.round(end.elapsedMs / 1000))} 秒`,
-    canAnswer: last && (!confirmed || plan.some(step => step.id === 'delivery-check')) && !undone && turn.status === 'completed' && end?.revision === revision,
+    canAnswer, hasPendingQuestions, showDraftSummary, showDraftActions, showStandaloneUndo, showDeliveryFooter, allDelivered,
     canRetry: last && (turn.status === 'failed' || turn.status === 'interrupted'),
-    canUndo: !confirmed && !undone && !!changes.length && end?.revision === revision && turn.status !== 'running',
+    canUndo,
     preview: preview ? { ...tripView(preview), id: preview.previewId,
       active: !skipped && latestPreview && !confirmed && turn.status === 'completed' } : null,
     delivery: proposal ? { ...proposal, totalLabel: `¥${money(proposal.totalCents)}`, pendingLabel: proposal.pendingPriceNames.join('、'),
-      active: !stale && !deliveryState && turn.status === 'completed', stale, notice: deliveryState === 'saved' ? '已保存修改' :
+      active: deliveryActive, stale, notice: deliveryState === 'saved' ? '已保存修改' :
         deliveryState === 'completed' ? '已确认送达，应收已锁定' : deliveryState === 'cancelled' ? '已取消' : '' } : null,
   };
 }
 
 function deliverySummaryView(progress: DeliveryProgress) {
-  return { label: `本趟送货 · ${progress.shops.filter(shop => shop.locked).length}/${progress.shops.length} 家已送达`,
+  const unfinished = progress.shops.filter(shop => !shop.locked).map(shop => shop.customer);
+  const allDelivered = progress.shops.length > 0 && unfinished.length === 0;
+  return { label: `本趟送货 · ${progress.shops.length - unfinished.length}/${progress.shops.length} 家已送达`,
+    unfinished, allDelivered,
     shops: progress.shops.map(shop => ({ ...shop, description: `${shop.locked ? '已锁定应收' : '预计应收'} ¥${money(shop.totalCents)}` +
       (shop.pendingPrices ? ` · ${shop.pendingPrices} 项待补价` : '') })) };
 }
@@ -94,21 +107,26 @@ function draftSummary(draft: TripDraft, pending: number) {
     id: customer.id, name: customer.customer || '未命名客户',
     lines: customer.items.filter(line => line.product || line.quantity || line.price || line.brand || line.specification)
       .map(line => ({ id: line.id, product: productLabel(line) || '未命名货品', quantity: line.quantity, unit: line.unit,
-        price: line.price ? '¥' + line.price : '待补价' })),
+        price: line.price ? '¥' + line.price : '待补价', pending: !line.price })),
   })).filter(customer => customer.lines.length);
   const lines = customers.reduce((sum, customer) => sum + customer.lines.length, 0);
   const issues = pending || (lines ? textOrderQuestions(draft).reduce((sum, customer) => sum + customer.issues.length, 0) : 0);
-  return { customers, label: `本趟草稿 · ${customers.length} 家 ${lines} 行${issues ? `，${issues} 处待确认` : ''}` };
+  return { customers, hasLines: lines > 0,
+    label: `本趟草稿 · ${customers.length} 家 ${lines} 行${issues ? `，${issues} 处待确认` : ''}` };
+}
+
+function applyNavTitle(title: string) {
+  if (typeof wx.setNavigationBarTitle === 'function') wx.setNavigationBarTitle({ title });
 }
 
 Page({
   data: {
     signedIn: false, busy: false, polling: false, confirmed: false, error: '', text: '', textOrderLimit,
     turns: [] as ReturnType<typeof view>[], attachments: [] as Attachment[], pendingMaterial: '', uploadLabel: '',
-    draftsAvailable: false, scrollTo: '', voicePhase: '', voiceRetry: false,
+    draftsAvailable: false, scrollTo: '', voicePhase: '', voiceRetry: false, inputMode: 'text' as 'text' | 'voice',
     readyImages: [] as Attachment[], uploadRows: [] as (MaterialSource & { id?: string; local: boolean })[],
-    draftStrip: null as ReturnType<typeof draftSummary> | null, draftExpanded: false, issuedCard: false, revokeFailed: false,
-    deliveryStrip: null as ReturnType<typeof deliverySummaryView> | null, focusInput: false,
+    draftSummary: null as ReturnType<typeof draftSummary> | null, draftExpanded: false, issuedCard: false, revokeFailed: false,
+    deliverySummary: null as ReturnType<typeof deliverySummaryView> | null, navTitle: '录单助手', focusInput: false, imageLimit,
   },
   draft: null as TripDraft | null,
   turns: [] as AgentTurn[],
@@ -120,6 +138,7 @@ Page({
   pending: new Map<string, string>(),
   voiceCapture: null as ReturnType<typeof startVoiceRecording> | null,
   voiceFile: null as VoiceFile | null,
+  discardVoice: false,
   pauseUpload: false,
   retiredToken: '',
 
@@ -162,7 +181,9 @@ Page({
     this.delivery = null;
     this.setData({ signedIn: false, busy: false, polling: false, confirmed: false, draftsAvailable: false,
       error: '', text: '', turns: [], attachments: [], readyImages: [], uploadRows: [], pendingMaterial: '',
-      scrollTo: '', draftStrip: null, deliveryStrip: null, focusInput: false, draftExpanded: false, issuedCard: false, voiceRetry: false, revokeFailed: !!this.retiredToken });
+      scrollTo: '', draftSummary: null, deliverySummary: null, navTitle: '录单助手', focusInput: false, draftExpanded: false,
+      issuedCard: false, voiceRetry: false, inputMode: 'text', revokeFailed: !!this.retiredToken });
+    applyNavTitle('录单助手');
   },
 
   async run(action: () => Promise<void>) {
@@ -224,10 +245,12 @@ Page({
     const prefill = draftConfirmed && target?.tripId === draft.id && !this.data.text.trim();
     if (changedMode || !sameTrip) this.voiceFile = null;
     this.setData({ confirmed: draftConfirmed, draftsAvailable: true, polling: !!active,
-      ...(changedMode || !sameTrip ? { text: '', attachments: [], readyImages: [], uploadRows: [], draftExpanded: false, pendingMaterial: '', voiceRetry: false } : {}),
-      ...(prefill ? { text: `${target.name}：`, focusInput: !active } : { focusInput: false }) });
+      ...(changedMode || !sameTrip ? { text: '', attachments: [], readyImages: [], uploadRows: [], draftExpanded: false,
+        pendingMaterial: '', voiceRetry: false, inputMode: 'text' } : {}),
+      ...(prefill ? { text: `${target.name}：`, focusInput: !active, inputMode: 'text' } : { focusInput: false }) });
     this.render();
     if (active) this.schedule();
+    if (!draftConfirmed) void this.syncMaterials(draft, generation);
   },
 
   render() {
@@ -237,10 +260,17 @@ Page({
     const turns = this.turns.map((turn, index) => view(turn, revision, this.data.confirmed,
       index === this.turns.length - 1, preview?.id === turn.id, this.confirmedPreviewId, this.delivery));
     const recent = turns[turns.length - 1];
+    const deliverySummary = this.delivery ? deliverySummaryView(this.delivery) : null;
+    const draftInfo = !this.data.confirmed && this.draft
+      ? draftSummary(this.draft, recent?.canAnswer ? recent.questions.length : 0) : null;
+    const navTitle = !this.data.signedIn || !this.data.confirmed ? '录单助手'
+      : (this.delivery && this.delivery.shops.length
+        ? `送货助手（${this.delivery.shops.filter(shop => shop.locked).length}/${this.delivery.shops.length} 已送达）`
+        : '送货助手');
     this.setData({ turns, scrollTo: '', issuedCard: turns.some(turn => turn.issued),
-      deliveryStrip: this.delivery && deliverySummaryView(this.delivery),
-      draftStrip: !this.data.confirmed && this.draft ? draftSummary(this.draft, recent?.canAnswer ? recent.questions.length : 0) : null });
+      deliverySummary, draftSummary: draftInfo, navTitle });
     this.setData({ scrollTo: 'latest' });
+    applyNavTitle(navTitle);
   },
 
   stopPolling() {
@@ -444,13 +474,68 @@ Page({
     wx.switchTab({ url: '/pages/trip-picking/index' });
   },
 
-  chooseImage(event: WechatMiniprogram.TouchEvent) {
+  nextTrip(): Promise<void> | undefined {
     const draft = this.draft;
+    if (!draft || !this.data.confirmed || !agentSession.token || this.data.busy || this.data.polling) return;
+    const unfinished = this.data.deliverySummary?.unfinished ?? [];
+    if (unfinished.length && typeof wx.showModal === 'function') {
+      const token = agentSession.token;
+      const draftId = draft.id;
+      wx.showModal({
+        title: '开始下一趟',
+        content: `还有 ${unfinished.length} 家没确认送达：${unfinished.join('、')}。原单仍可在「历史」查看，确定开始下一趟吗？`,
+        confirmText: '开始新趟',
+        success: ({ confirm }) => {
+          if (confirm && token === agentSession.token && this.draft?.id === draftId) void this.startNextTrip(draftId);
+        },
+        fail: () => this.setData({ error: '确认框打开失败，请重试。' }),
+      });
+      return;
+    }
+    return this.startNextTrip(draft.id);
+  },
+
+  startNextTrip(draftId: string): Promise<void> | undefined {
+    this.card('next');
+    return this.run(async () => {
+      try {
+        await this.request('/trips/next-draft', { draftId });
+        await this.reload();
+      } catch (error) {
+        if (error instanceof WorkspaceError && ['draft_open', 'draft_changed', 'draft_not_found'].includes(error.code)) {
+          await this.reload();
+        }
+        throw error;
+      }
+    });
+  },
+
+  openImageMenu(): void {
+    const draft = this.draft;
+    if (!draft || this.data.confirmed || this.data.busy || this.data.polling || !this.data.draftsAvailable ||
+      this.data.attachments.length >= imageLimit) return;
+    wx.showActionSheet({
+      itemList: ['从微信聊天选图', '从手机相册选图'],
+      success: ({ tapIndex }) => {
+        if (tapIndex === 0) void this.pickAndUpload(false);
+        else if (tapIndex === 1) void this.pickAndUpload(true);
+      },
+      fail: () => {},
+    });
+  },
+
+  chooseImage(event: WechatMiniprogram.TouchEvent) {
     const { album, key } = event.currentTarget.dataset;
-    if (!draft || this.data.confirmed || this.data.polling || this.data.attachments.length >= imageLimit) return;
+    return this.pickAndUpload(album === 'yes', key);
+  },
+
+  pickAndUpload(album: boolean, key?: string): Promise<void> | undefined {
+    const draft = this.draft;
+    if (!draft || this.data.confirmed || this.data.busy || this.data.polling || !this.data.draftsAvailable ||
+      this.data.attachments.length >= imageLimit) return;
     return this.run(async () => {
       const linked = this.data.uploadRows.find(row => row.requestId === key);
-      const file = await chooseMaterial(album === 'yes');
+      const file = await chooseMaterial(album);
       if (!file) return;
       if (!materialImagePattern.test(file.name)) throw new Error('请选择 JPG、PNG、WebP 或 HEIC 图片。');
       const info = await materialInfo(file.path);
@@ -479,17 +564,29 @@ Page({
   images() {
     const draft = this.draft;
     if (!draft || this.data.polling) return;
-    return this.run(async () => {
-      const { materials } = await workspaceRequest<{ materials: Material[] }>('GET', '/materials', agentSession.token);
-      const local = stagedMaterials().filter(item => item.draftId === draft.id);
-      const current = materials.filter(item => item.draftId === draft.id);
-      const remote = current.filter(item => item.status === 'uploading').map(item =>
-        ({ ...item, local: local.some(source => sameMaterial(source, item)) }));
-      this.setData({ readyImages: current.filter(item => item.status === 'ready' && !item.organized &&
-        !this.data.attachments.some(attached => attached.id === item.id)),
-        uploadRows: [...remote, ...local.filter(item => item.revision === draft.revision &&
-          !current.some(material => material.requestId === item.requestId)).map(item => ({ ...item, local: true }))] });
-    });
+    const generation = this.generation;
+    return this.run(() => this.syncMaterials(draft, generation));
+  },
+
+  async syncMaterials(draft: TripDraft, generation: number) {
+    let local: MaterialSource[] = [];
+    try {
+      if (typeof wx.getStorageSync === 'function') local = stagedMaterials().filter(item => item.draftId === draft.id);
+    } catch { local = []; }
+    let materials: Material[];
+    try {
+      const result = await workspaceRequest<{ materials: Material[] }>('GET', '/materials', agentSession.token);
+      materials = result.materials;
+    } catch { return; }
+    const currentDraft = this.draft;
+    if (generation !== this.generation || !agentSession.token || !currentDraft || currentDraft.id !== draft.id) return;
+    const current = materials.filter(item => item.draftId === currentDraft.id);
+    const remote = current.filter(item => item.status === 'uploading').map(item =>
+      ({ ...item, local: local.some(source => sameMaterial(source, item)) }));
+    this.setData({ readyImages: current.filter(item => item.status === 'ready' && !item.organized &&
+      !this.data.attachments.some(attached => attached.id === item.id)),
+      uploadRows: [...remote, ...local.filter(item => item.revision === currentDraft.revision &&
+        !current.some(material => material.requestId === item.requestId)).map(item => ({ ...item, local: true }))] });
   },
 
   resumeImage(event: WechatMiniprogram.TouchEvent) {
@@ -515,6 +612,20 @@ Page({
     this.setData({ attachments: this.data.attachments.filter(item => item.id !== event.currentTarget.dataset.id) });
   },
 
+  toggleInputMode() {
+    if (this.data.voicePhase === '录音中') {
+      this.discardVoice = true;
+      this.voiceCapture?.cancel();
+    }
+    const inputMode = this.data.inputMode === 'text' ? 'voice' : 'text';
+    this.setData({ inputMode, ...(inputMode === 'text' ? { focusInput: !this.data.busy } : { focusInput: false }) });
+  },
+
+  voiceTap() {
+    if (this.data.voicePhase === '录音中') this.stopRecording();
+    else this.record();
+  },
+
   record() {
     const draft = this.draft;
     if (!draft || this.data.polling) return;
@@ -522,10 +633,14 @@ Page({
       this.setData({ voicePhase: '准备录音', voiceRetry: false });
       try {
         this.voiceCapture = startVoiceRecording(() => this.setData({ voicePhase: '录音中' }));
-        const path = await this.voiceCapture.done;
+        const path = await this.voiceCapture.done.catch(error => {
+          if (!this.discardVoice) throw error;
+          return '';
+        });
+        if (!path) return;
         this.voiceFile = { draft, path };
         await this.transcribe();
-      } finally { this.voiceCapture = null; this.setData({ voicePhase: '' }); }
+      } finally { this.voiceCapture = null; this.discardVoice = false; this.setData({ voicePhase: '' }); }
     });
   },
 
@@ -551,7 +666,7 @@ Page({
       if (!result.text.trim()) throw new Error('语音转写没有返回文字，请重试。');
       if (text.length > textOrderLimit) throw new Error('转写后文字太长，请缩短输入框内容再重试。');
       this.voiceFile = null;
-      this.setData({ text });
+      this.setData({ text, inputMode: 'text' });
     } catch (error) {
       if (error instanceof VoiceFileError || (error instanceof WorkspaceError && error.status < 500)) this.voiceFile = null;
       this.setData({ voiceRetry: !!this.voiceFile });

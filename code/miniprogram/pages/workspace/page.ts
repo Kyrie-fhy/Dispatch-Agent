@@ -616,9 +616,9 @@ Page({
       const names = this.data.formal.unfinished;
       const token = this.token;
       wx.showModal({ title: '开始下一趟', content: `还有 ${names.length} 家没确认送达：${names.join('、')}。仍要开始下一趟吗？`,
-        confirmText: '开始下一趟', success: ({ confirm }) => {
+        confirmText: '开始新趟', success: ({ confirm }) => {
           if (confirm && token === this.token && this.data.draft?.id === draft.id) void this.startNext(draft.id);
-        } });
+        }, fail: () => this.setData({ error: '确认框打开失败，请重试。' }) });
       return;
     }
     return this.startNext(draft.id);

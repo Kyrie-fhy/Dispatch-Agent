@@ -1,0 +1,36 @@
+<view class="profile">
+  <view wx:if="{{error}}" class="error">{{error}}</view>
+
+  <view wx:if="{{!signedIn}}" class="card account-card">
+    <view class="title">我的账号</view>
+    <view class="hint">微信登录后同步本账号的录单草稿、正式送货单与熟客档案。</view>
+    <button wx:if="{{!revokeFailed}}" class="btn-primary" bindtap="login" disabled="{{busy}}">微信登录</button>
+    <button wx:else class="btn-danger-ghost" bindtap="logout" disabled="{{busy}}">重试退出</button>
+  </view>
+
+  <block wx:else>
+    <view class="card identity-card">
+      <view class="card-title">微信账号已登录</view>
+      <view class="status-tag">独立账本已同步</view>
+    </view>
+
+    <view class="card overview-card">
+      <view class="overview-row">
+        <view class="row-label">本趟阶段</view>
+        <view class="row-value">
+          <view class="row-main">{{loaded ? tripMode : '正在同步…'}}</view>
+          <view wx:if="{{tripDetail}}" class="row-detail num">{{tripDetail}}</view>
+        </view>
+      </view>
+      <view class="overview-row">
+        <view class="row-label">熟客档案</view>
+        <view class="row-value"><text class="num">{{partyCount}} 家</text></view>
+      </view>
+    </view>
+
+    <view class="action-group">
+      <button wx:if="{{canEditForm}}" class="btn-secondary" bindtap="openWorkspace" disabled="{{busy}}">打开表单手动改草稿</button>
+      <button class="btn-danger-ghost" bindtap="logout" disabled="{{busy}}">退出登录</button>
+    </view>
+  </block>
+</view>

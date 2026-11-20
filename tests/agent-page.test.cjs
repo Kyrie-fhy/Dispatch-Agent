@@ -502,6 +502,7 @@ test('A1 tabs share login, refresh the current trip and page through read-only h
   wx.showModal = spec => { modal = spec; };
   await delivery.nextTrip();
   assert.match(modal.content, /还有 1 家没确认送达：老王/);
+  assert.ok(modal.confirmText.length <= 4, 'wx.showModal 的确认按钮最多 4 个字符');
   modal.success({ confirm: false });
   assert.ok(!requests.some(r => r.path.endsWith('next-draft')));
   await history.onShow();

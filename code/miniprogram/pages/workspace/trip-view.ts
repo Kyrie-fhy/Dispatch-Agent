@@ -1,4 +1,5 @@
 import { deliveryLines, deliverySummary } from '../../core/delivery-execution';
+import { money } from '../../core/orders';
 import { deliveredBalance } from '../../core/settlement';
 import { latest, PickingChange, PickingLine, pickingChanges } from '../../core/trips';
 import type { FormalTrip } from '../../services/workspace';
@@ -11,9 +12,19 @@ export type FormalView = ReturnType<typeof tripView> & {
   picking: PickingLine[];
   changes: PickingChange[];
   unfinished: string[];
-  deliveryRows: { totalLabel: string; completed: boolean; lines: (ReturnType<typeof lineView> & {
-    originalQuantity: string;
-  })[] }[];
+  deliveredCount: number;
+  deliveryRows: {
+    id: string;
+    customer: string;
+    lineCount: number;
+    pendingPrices: number;
+    pendingPriceOnly: boolean;
+    amountTitle: string;
+    dueLabel: string;
+    totalLabel: string;
+    completed: boolean;
+    lines: (ReturnType<typeof lineView> & { originalQuantity: string })[];
+  }[];
 };
 
 export function formalTripView({ trip, picking, deliveryEdits, sheets = [] }: FormalTrip): FormalView {
@@ -26,11 +37,17 @@ export function formalTripView({ trip, picking, deliveryEdits, sheets = [] }: Fo
     const sheet = sheets.find(sheet => sheet.sheetId === customer.id);
     const reviewed = sheet?.reviewed;
     const due = reviewed ? deliveredBalance({ ...customer, items: lines }, trip.statuses, 0).due : totalCents;
-    return { lines: lines.map(line => ({ ...lineView({ ...line, quantity: String(line.receivedQuantity) }), originalQuantity: line.originalQuantity })),
+    const pendingPriceOnly = pendingPrices > 0 && due === 0;
+    return {
+      id: customer.id, customer: customer.customer, lineCount: lines.length, pendingPrices, pendingPriceOnly,
+      amountTitle: reviewed ? '本次应收' : (pendingPrices > 0 && due > 0 ? '已算金额' : '预计应收'),
+      dueLabel: pendingPriceOnly ? '待补价' : '¥' + money(due),
+      lines: lines.map(line => ({ ...lineView({ ...line, quantity: String(line.receivedQuantity) }), originalQuantity: line.originalQuantity })),
       completed: Boolean(sheet?.deliveryCompleted),
       totalLabel: amountLabel(due, pendingPrices, reviewed ? '本次应收' : '预计应收') };
   });
-  return { ...tripView(version), deliveryRows, id: trip.id, version: version.version, picking, statuses,
+  return { ...tripView(version), deliveryRows, deliveredCount: deliveryRows.filter(row => row.completed).length,
+    id: trip.id, version: version.version, picking, statuses,
     unfinished: version.customers.filter((_, index) => !deliveryRows[index].completed).map(customer => customer.customer),
     changes: previous ? pickingChanges(previous.customers, version.customers) : [] };
 }

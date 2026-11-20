@@ -1,28 +1,127 @@
 <view class="container">
   <view class="title">历史趟次</view>
   <view wx:if="{{error}}" class="error">{{error}}</view>
-  <button wx:if="{{!signedIn}}" class="primary" bindtap="goAssistant">去助手登录</button>
+
+  <view wx:if="{{!signedIn}}" class="card">
+    <view class="section-title">往期档案</view>
+    <view class="hint">微信登录后回看往期趟次的送货单、取货单与对话记录。</view>
+    <button class="btn-primary" bindtap="goAssistant">去助手登录</button>
+  </view>
+
   <block wx:elif="{{formal}}">
-    <button size="mini" bindtap="backToList" disabled="{{busy}}">返回趟次列表</button>
-    <include src="../workspace/picking.wxml" />
-    <view wx:for="{{formal.customers}}" wx:for-item="customer" wx:key="id" class="card">
-      <view class="section-title">{{customer.customer}}</view>
-      <view class="hint">{{formal.deliveryRows[index].completed ? '已确认送达' : '未确认送达'}}</view>
-      <view wx:for="{{formal.deliveryRows[index].lines}}" wx:for-item="line" wx:key="id" class="line">
-        <view class="product">{{line.productLabel}}</view>
-        <view>原订 {{line.originalQuantity}} {{line.unit}} · 实收 {{line.quantity}} {{line.unit}}</view>
-        <view class="hint">{{formal.statuses[line.id] || '未记录'}} · {{line.amountLabel}}</view>
+    <button class="btn-ghost history-back-btn" bindtap="backToList" disabled="{{busy}}">‹ 返回趟次列表</button>
+    <view class="card trip-banner">
+      <view class="trip-banner-time">{{selectedTime}}</view>
+      <view class="trip-banner-meta">
+        <text class="num">{{formal.deliveredCount}}/{{formal.customers.length}} 家已送达</text>
+        <text class="num">{{formal.totalLabel}}</text>
       </view>
-      <view class="subtotal">{{formal.deliveryRows[index].totalLabel}}</view>
     </view>
+
+    <view class="history-tabs">
+      <button class="history-tab {{historyTab === 'delivery' ? 'history-tab-active' : ''}}" data-tab="delivery" bindtap="switchHistoryTab">送货单</button>
+      <button class="history-tab {{historyTab === 'picking' ? 'history-tab-active' : ''}}" data-tab="picking" bindtap="switchHistoryTab">取货单</button>
+      <button class="history-tab {{historyTab === 'turns' ? 'history-tab-active' : ''}}" data-tab="turns" bindtap="switchHistoryTab">对话记录</button>
+    </view>
+
+    <block wx:if="{{historyTab === 'delivery'}}">
+      <block wx:if="{{selectedShop}}">
+        <button class="btn-secondary shop-back-btn" bindtap="closeHistoryShop">‹ 返回本趟门店列表</button>
+        <view class="card">
+          <view class="shop-title-row">
+            <text class="shop-name">{{selectedShop.customer}}</text>
+            <text class="status-tag {{selectedShop.completed ? 'status-done' : 'status-pending'}}">{{selectedShop.completed ? '已确认送达' : '未确认送达'}}</text>
+          </view>
+          <view class="amount num">{{selectedShop.totalLabel}}</view>
+          <view wx:for="{{selectedShop.lines}}" wx:for-item="line" wx:key="id" class="line">
+            <view class="product">{{line.productLabel}}</view>
+            <view class="num">原订 {{line.originalQuantity}} {{line.unit}} · 实收 {{line.quantity}} {{line.unit}}</view>
+            <view class="num {{line.priceLabel === '待补价' || line.amountLabel === '待补价' ? 'pending-price' : ''}}">单价 {{line.priceLabel}} · 小计 {{line.amountLabel}}</view>
+            <view class="hint">配送状态 · {{formal.statuses[line.id] || '未记录'}}</view>
+          </view>
+        </view>
+      </block>
+      <block wx:else>
+        <view wx:if="{{!formal.deliveryRows.length}}" class="card">
+          <view class="hint">这一趟没有门店货品。</view>
+        </view>
+        <view wx:for="{{formal.deliveryRows}}" wx:key="id" class="card shop-row" bindtap="openHistoryShop" data-sheet-id="{{item.id}}">
+          <view class="shop-main">
+            <view class="shop-title-row">
+              <text class="shop-name">{{item.customer}}</text>
+              <text class="status-tag {{item.completed ? 'status-done' : 'status-pending'}}">{{item.completed ? '已送达' : '未送达'}}</text>
+              <text wx:if="{{item.pendingPrices}}" class="status-tag status-unpriced num">{{item.pendingPrices}} 项待补价</text>
+            </view>
+            <view class="shop-meta num">共 {{item.lineCount}} 项货品</view>
+          </view>
+          <view class="shop-right">
+            <view class="shop-amount-label">{{item.amountTitle}}</view>
+            <view class="shop-amount num {{item.pendingPriceOnly ? 'pending-price' : ''}}">{{item.dueLabel}}</view>
+          </view>
+          <view class="shop-arrow">›</view>
+        </view>
+      </block>
+    </block>
+
+    <block wx:elif="{{historyTab === 'picking'}}">
+      <include src="../workspace/picking.wxml" />
+    </block>
+
+    <block wx:else>
+      <view wx:if="{{turnsLoading || (busy && turnsLoadedId !== formal.id)}}" class="hint">正在读取当趟对话记录…</view>
+      <view wx:elif="{{!tripTurns.length}}" class="card">
+        <view class="hint">这一趟没有对话记录（通过手动表单出单）。</view>
+      </view>
+      <view wx:else>
+        <view wx:for="{{tripTurns}}" wx:key="id" class="turn-block">
+          <view class="user-row">
+            <view class="user-bubble">
+              <text wx:if="{{item.text}}" class="user-text">{{item.text}}</text>
+              <text wx:if="{{item.pictures}}" class="user-pictures num">{{item.pictures}} 张图片</text>
+            </view>
+            <view class="avatar mine">我</view>
+          </view>
+          <view class="assistant-row">
+            <view class="avatar helper">助</view>
+            <view class="assistant-card">
+              <view wx:if="{{item.changes.length}}" class="turn-section">
+                <text class="turn-label">{{item.undone ? '这一步已撤销' : '草稿改动'}}</text>
+                <text wx:for="{{item.changes}}" wx:for-item="change" wx:key="*this" class="turn-line num">{{change}}</text>
+              </view>
+              <view wx:if="{{item.deliverySummary}}" class="turn-section">
+                <text class="turn-label">送货核对 · {{item.deliverySummary.customer}}</text>
+                <text wx:for="{{item.deliverySummary.edits}}" wx:for-item="edit" wx:key="lineId" class="turn-line num">{{edit.name}} 原订 {{edit.originalQuantity}} · 实收 {{edit.receivedQuantity}} · 单价 {{edit.price || '待补价'}}</text>
+                <text class="turn-line num">{{item.deliverySummary.totalLabel}} · {{item.deliverySummary.outcome}}</text>
+              </view>
+              <view wx:if="{{item.previewLabel}}" class="turn-section">
+                <text class="turn-label">{{item.previewLabel}}</text>
+              </view>
+              <view wx:if="{{item.questions.length}}" class="turn-section">
+                <text class="turn-label">当时的待确认</text>
+                <text wx:for="{{item.questions}}" wx:for-item="question" wx:key="*this" class="turn-line">{{question}}</text>
+              </view>
+              <text wx:if="{{item.reply}}" class="turn-reply">{{item.reply}}</text>
+              <text wx:if="{{!item.changes.length && !item.deliverySummary && !item.previewLabel && !item.questions.length && !item.reply}}" class="turn-reply">这一轮已记录。</text>
+            </view>
+          </view>
+        </view>
+      </view>
+    </block>
   </block>
+
   <block wx:else>
-    <view wx:if="{{!trips.length}}" class="hint">{{busy ? '正在读取趟次…' : '还没有正式送货单。'}}</view>
-    <button wx:for="{{trips}}" wx:key="id" class="card history-item" bindtap="openTrip" data-id="{{item.id}}" disabled="{{busy}}">
-      <view class="section-title">{{item.time}}<text wx:if="{{item.current}}" class="history-current">进行中</text></view>
-      <view class="history-meta">{{item.customers}} 家 · {{item.lines}} 行 · {{item.delivered}}/{{item.customers}} 家已送达</view>
-      <view>{{item.total}}</view>
-    </button>
-    <button wx:if="{{nextBefore}}" bindtap="loadMore" loading="{{busy}}" disabled="{{busy}}">查看更早趟次</button>
+    <view wx:if="{{!trips.length}}" class="card">
+      <view class="hint">{{busy ? '正在读取趟次…' : '还没有正式送货单。'}}</view>
+    </view>
+    <view wx:for="{{trips}}" wx:key="id" class="card history-item" bindtap="openTrip" data-id="{{item.id}}">
+      <view class="history-item-head">
+        <text class="section-title">{{item.time}}</text>
+        <text wx:if="{{item.current}}" class="history-current">进行中</text>
+      </view>
+      <view class="history-meta num">{{item.customers}} 家 · {{item.lines}} 行 · {{item.delivered}}/{{item.customers}} 家已送达</view>
+      <view class="history-total num">{{item.total}}</view>
+      <view class="shop-arrow">›</view>
+    </view>
+    <button wx:if="{{nextBefore}}" class="btn-secondary" bindtap="loadMore" loading="{{busy}}" disabled="{{busy}}">查看更早趟次</button>
   </block>
 </view>

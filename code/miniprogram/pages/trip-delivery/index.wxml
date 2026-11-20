@@ -1,9 +1,41 @@
-<import src="../order-templates.wxml" />
 <view class="container">
   <view class="title">送货单</view>
   <view wx:if="{{error}}" class="error">{{error}}</view>
-  <button wx:if="{{!signedIn}}" class="primary" bindtap="goAssistant">去助手登录</button>
+  <view wx:if="{{!signedIn}}" class="card">
+    <view class="hint">微信登录后按门店核对送货与本次应收。</view>
+    <button class="btn-primary" bindtap="goAssistant">去助手登录</button>
+  </view>
   <view wx:elif="{{busy && !draft}}" class="hint">正在读取送货单…</view>
   <block wx:elif="{{sheetTarget}}"><include src="../workspace/sheet.wxml" /></block>
-  <block wx:else><include src="../workspace/delivery.wxml" /></block>
+  <block wx:else>
+    <view wx:if="{{!formal}}" class="card">
+      <view class="hint">这趟还没确认出单，出单后在这里逐家核对送货与应收。</view>
+      <button class="btn-primary" bindtap="goAssistant">去助手录单</button>
+    </view>
+    <block wx:else>
+      <view class="delivery-overview">
+        <text class="num">{{formal.deliveredCount}}/{{formal.customers.length}} 家已送达</text>
+        <text class="num">{{formal.totalLabel}}</text>
+      </view>
+      <view wx:for="{{formal.deliveryRows}}" wx:key="id"
+        class="card shop-row {{item.completed ? 'shop-row-done' : ''}}"
+        bindtap="openSheet" data-trip-id="{{formal.id}}" data-sheet-id="{{item.id}}">
+        <view class="shop-main">
+          <view class="shop-title-row">
+            <text class="shop-name">{{item.customer}}</text>
+            <text class="status-tag {{item.completed ? 'status-done' : 'status-pending'}}">{{item.completed ? '已送达' : '待送达'}}</text>
+            <text wx:if="{{item.pendingPrices}}" class="status-tag status-unpriced num">{{item.pendingPrices}} 项待补价</text>
+          </view>
+          <view class="shop-meta num">共 {{item.lineCount}} 项货品</view>
+        </view>
+        <view class="shop-right">
+          <view class="shop-amount-label">{{item.amountTitle}}</view>
+          <view class="shop-amount num {{item.pendingPriceOnly ? 'pending-price' : ''}}">{{item.dueLabel}}</view>
+        </view>
+        <view class="shop-arrow">›</view>
+      </view>
+      <button wx:if="{{draftConfirmed}}" class="{{formal.unfinished.length ? 'btn-secondary' : 'btn-primary'}} next-trip-btn"
+        bindtap="nextTrip" disabled="{{busy}}" loading="{{busy}}">开始下一趟</button>
+    </block>
+  </block>
 </view>

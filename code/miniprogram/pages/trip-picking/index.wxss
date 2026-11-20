@@ -1,4 +1,23 @@
 @import "../workspace/index.wxss";
-.picking-row { display: flex; align-items: center; justify-content: space-between; gap: 20rpx; min-height: 70rpx; }
-.picking-row .product { font-size: 32rpx; }
-.picking-quantity { font-size: 37rpx; font-weight: 750; color: #12664d; white-space: nowrap; }
+.picking-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16rpx;
+  padding-bottom: 16rpx;
+  border-bottom: 1rpx solid var(--hairline);
+}
+.picking-count { font-size: 26rpx; color: var(--ink-3); white-space: nowrap; }
+.picking-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24rpx;
+  min-height: 96rpx;
+  padding: 20rpx 0;
+}
+.picking-row:last-child { border-bottom: 0; padding-bottom: 0; }
+.picking-info { min-width: 0; }
+.picking-name { font-size: 34rpx; font-weight: 650; color: var(--ink); }
+.picking-spec { font-size: 26rpx; color: var(--ink-2); margin-top: 4rpx; }
+.picking-quantity { font-size: 40rpx; font-weight: 700; color: var(--primary); white-space: nowrap; }

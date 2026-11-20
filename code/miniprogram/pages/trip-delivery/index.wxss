@@ -1,1 +1,47 @@
 @import "../workspace/index.wxss";
+.delivery-overview {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8rpx 20rpx;
+  margin: 24rpx 0 8rpx;
+  font-size: 28rpx;
+  color: var(--ink-2);
+}
+.shop-row {
+  display: flex;
+  align-items: center;
+  gap: 16rpx;
+  min-height: 116rpx;
+  padding: 24rpx 26rpx;
+  margin: 16rpx 0;
+}
+.shop-row:active { background: var(--surface-sunken); }
+.shop-main { flex: 1; min-width: 0; }
+.shop-title-row { display: flex; flex-wrap: wrap; align-items: center; gap: 12rpx; }
+.shop-name { font-size: 34rpx; font-weight: 650; color: var(--ink); }
+.shop-meta { font-size: 26rpx; color: var(--ink-3); margin-top: 8rpx; }
+.status-tag {
+  font-size: 24rpx;
+  font-weight: 500;
+  padding: 4rpx 14rpx;
+  border-radius: var(--radius-sm);
+}
+.status-done { background: var(--success-weak); color: var(--success); }
+.status-pending { background: var(--canvas-sub); color: var(--ink-2); }
+.status-unpriced { background: var(--warning-weak); color: var(--warning); }
+.shop-right { text-align: right; flex: none; }
+.shop-amount-label { font-size: 24rpx; color: var(--ink-3); }
+.shop-amount { font-size: 34rpx; font-weight: 700; color: var(--ink); }
+.shop-row-done .shop-amount { color: var(--primary); }
+.pending-price { color: var(--warning); }
+.shop-arrow { font-size: 38rpx; color: var(--ink-3); }
+.sheet-head { display: flex; align-items: center; justify-content: space-between; gap: 16rpx; }
+.sheet-title { font-size: 34rpx; font-weight: 650; color: var(--ink); }
+.sheet-back-btn { height: var(--tap-card-btn); }
+.field-actions { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14rpx; margin-top: 16rpx; }
+.field-btn { height: 80rpx; margin: 0; }
+.line-edit-btn { height: 80rpx; margin-top: 14rpx; }
+.sheet-submit-btn { margin-top: 16rpx; }
+.next-trip-btn { margin-top: 28rpx; }

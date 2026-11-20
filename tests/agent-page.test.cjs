@@ -421,6 +421,12 @@ test('A1 manual form uses the same session and detects an unsaved edit after cha
   assert.equal(reopened.data.dirty, false);
 });
 
+test('History page is a read-only three-tab archive without mini controls', () => {
+  const wxml = fs.readFileSync(require('node:path').join(__dirname, '../code/dist/pages/history/index.wxml'), 'utf8');
+  assert.equal(wxml.includes('size="mini"'), false);
+  for (const label of ['送货单', '取货单', '对话记录']) assert.ok(wxml.includes(label), `缺少${label}栏`);
+});
+
 test('A1 tabs share login, refresh the current trip and page through read-only history', async t => {
   const draft = order();
   const { deliveryLines, deliverySummary } = require('../code/dist/core/delivery-execution');
@@ -447,6 +453,7 @@ test('A1 tabs share login, refresh the current trip and page through read-only h
   let advanced = false;
   let revision = 0;
   let edits = {};
+  let turnsRequests = 0;
   const route = '/trips/' + draft.id + '/sheets/' + draft.customers[0].id;
   const latestTrip = () => ({
     ...formal, deliveryEdits: edits, sheets: formal.sheets.map(sheet => ({ ...sheet, deliveryCompleted: delivered, reviewed: delivered })),
@@ -490,6 +497,16 @@ test('A1 tabs share login, refresh the current trip and page through read-only h
       return true;
     }
     if (r.path === '/trips') { r.ok(r.query.get('before') ? { trips: [old], nextBefore: null } : { trips: [current], nextBefore: current.id }); return true; }
+    if (r.path === '/trips/old/turns') {
+      turnsRequests++;
+      r.ok({ tripId: 'old', turns: [{ id: 'old-turn', status: 'completed', revision: 0, materialIds: [], text: '老王两箱水饺',
+        events: [
+          { seq: 1, kind: 'change', payload: { lines: ['老王 水饺 +2 箱'] } },
+          { seq: 2, kind: 'preview', payload: { preview: { ...summary, previewId: 'old-pre', draftId: 'old', revision: 0, choices: [null] } } },
+          { seq: 3, kind: 'end', payload: { status: 'completed', text: '草稿已更新。', revision: 0 } },
+        ] }] });
+      return true;
+    }
     if (r.path === '/trips/' + draft.id || r.path === '/trips/old') {
       r.ok({ ...latestTrip(), trip: { ...latestTrip().trip, id: r.path.split('/').at(-1) } }); return true;
     }
@@ -512,8 +529,25 @@ test('A1 tabs share login, refresh the current trip and page through read-only h
   assert.match(history.data.trips[1].total, /待补价/);
   await history.openTrip(tap({ id: old.id }));
   assert.equal(history.data.formal.id, old.id);
+  assert.equal(history.data.historyTab, 'delivery');
+  assert.equal(history.data.selectedShop, null);
+  assert.equal(history.data.selectedTime, history.data.trips[1].time);
   assert.equal(history.data.formal.deliveryRows[0].lines[0].originalQuantity, '2');
   assert.equal(history.data.formal.deliveryRows[0].lines[0].quantity, '2');
+  await history.openHistoryShop(tap({ sheetId: draft.customers[0].id }));
+  assert.equal(history.data.selectedShop.customer, '老王');
+  history.closeHistoryShop();
+  assert.equal(history.data.selectedShop, null);
+  await history.switchHistoryTab(tap({ tab: 'picking' }));
+  assert.equal(history.data.historyTab, 'picking');
+  await history.switchHistoryTab(tap({ tab: 'turns' }));
+  assert.equal(history.data.historyTab, 'turns');
+  assert.equal(history.data.tripTurns.length, 1);
+  assert.deepEqual(history.data.tripTurns[0].changes, ['老王 水饺 +2 箱']);
+  assert.match(history.data.tripTurns[0].previewLabel, /送货单预览/);
+  await history.switchHistoryTab(tap({ tab: 'delivery' }));
+  await history.switchHistoryTab(tap({ tab: 'turns' }));
+  assert.equal(turnsRequests, 1);
   assert.equal(history.saveFieldEdit, undefined);
   await delivery.openSheet(tap({ tripId: draft.id, sheetId: draft.customers[0].id }));
   delivery.beginFieldEdit(tap({ id: draft.customers[0].items[0].id }));
@@ -662,6 +696,71 @@ test('Agent drops the top strip and keeps the next action only on the latest lin
   assert.equal(titles.at(-1), '送货助手（0/1 已送达）');
   assert.match(page.data.deliverySummary.label, /0\/1/);
   assert.ok(requests.some(request => request.path === '/trips/confirm'));
+});
+
+test('Delivery MVP lists shops before opening a sheet and picking stays a flat read-only view', async t => {
+  const deliveryWxml = fs.readFileSync(require.resolve('../code/dist/pages/trip-delivery/index.wxml'), 'utf8');
+  assert.equal(deliveryWxml.includes('order-line'), false);
+  assert.equal(deliveryWxml.includes('原订'), false);
+  assert.equal(deliveryWxml.includes('size="mini"'), false);
+  const pickingWxml = fs.readFileSync(require.resolve('../code/dist/pages/trip-picking/index.wxml'), 'utf8');
+  const pickingFragment = fs.readFileSync(require.resolve('../code/dist/pages/workspace/picking.wxml'), 'utf8');
+  for (const wxml of [pickingWxml, pickingFragment]) {
+    assert.equal(wxml.includes('<checkbox'), false);
+    assert.equal(wxml.includes('openSheet'), false);
+  }
+
+  const draft = order();
+  draft.customers.push({
+    id: 'c-2', customer: '老李', partyId: null,
+    items: [{ id: 'i-2', product: '汤圆', brand: '', specification: '', unit: '箱', quantity: '1', price: '' }],
+  });
+  const { page, pageFor, handle } = setup(t, draft);
+  await page.onShow();
+  await page.login();
+  const summary = previewTrip(draft, true);
+  const statuses = statusesFor(summary.customers, 'pending');
+  const formal = { trip: { id: draft.id, origin: 's2', versions: [{ ...summary, version: 1, savedAt: '2026-11-20T00:00:00Z' }],
+    statuses, statusRevision: 0 }, picking: pickingList(summary.customers), deliveryEdits: {}, sheets: [] };
+  const sheetId = draft.customers[0].id;
+  handle(request => {
+    if (request.path === '/workspace') {
+      request.ok({ draft, parties: [], draftConfirmed: true, currentTrip: { id: draft.id } });
+      return true;
+    }
+    if (request.path === `/trips/${draft.id}`) { request.ok(formal); return true; }
+    if (request.path === `/trips/${draft.id}/sheets/${sheetId}`) {
+      const customer = summary.customers[0];
+      const lines = deliveryLines(customer, {}).map(line => ({ ...line, status: 'pending' }));
+      request.ok({ sheet: { tripId: draft.id, sheetId, customer: customer.customer, version: 1, statusRevision: 0,
+        reviewed: false, deliveryCompleted: false, orderCents: customer.totalCents, execution: deliverySummary(lines),
+        amounts: deliveredBalance(customer, statuses, 0), lines } });
+      return true;
+    }
+    return false;
+  });
+
+  const delivery = pageFor('trip-delivery');
+  await delivery.onShow();
+  assert.equal(delivery.data.sheetTarget, null);
+  assert.equal(delivery.data.formal.deliveredCount, 0);
+  const [first, second] = delivery.data.formal.deliveryRows;
+  assert.equal(first.customer, '老王');
+  assert.equal(first.dueLabel, '¥164.00');
+  assert.equal(first.amountTitle, '预计应收');
+  assert.equal(first.lineCount, 1);
+  assert.equal(second.pendingPrices, 1);
+  assert.equal(second.pendingPriceOnly, true);
+  assert.equal(second.dueLabel, '待补价');
+  assert.notEqual(second.dueLabel, '¥0.00');
+
+  await delivery.openSheet(tap({ tripId: draft.id, sheetId }));
+  assert.ok(delivery.data.sheetTarget);
+  assert.equal(delivery.data.sheet.customer, '老王');
+  assert.equal(delivery.data.sheet.lines.length, 1);
+  assert.equal(delivery.data.sheet.lines[0].originalQuantity, '2');
+  delivery.closeSheet();
+  assert.equal(delivery.data.sheetTarget, null);
 });
 
 test('Agent starts the next trip from delivery cards with a guard for unfinished shops', async t => {

@@ -98,17 +98,18 @@ function draftSummary(draft: TripDraft, pending: number) {
   })).filter(customer => customer.lines.length);
   const lines = customers.reduce((sum, customer) => sum + customer.lines.length, 0);
   const issues = pending || (lines ? textOrderQuestions(draft).reduce((sum, customer) => sum + customer.issues.length, 0) : 0);
-  return { customers, label: `本趟草稿 · ${customers.length} 家 ${lines} 行${issues ? `，${issues} 处待确认` : ''}` };
+  return { customers, hasLines: lines > 0,
+    label: `本趟草稿 · ${customers.length} 家 ${lines} 行${issues ? `，${issues} 处待确认` : ''}` };
 }
 
 Page({
   data: {
     signedIn: false, busy: false, polling: false, confirmed: false, error: '', text: '', textOrderLimit,
     turns: [] as ReturnType<typeof view>[], attachments: [] as Attachment[], pendingMaterial: '', uploadLabel: '',
-    draftsAvailable: false, scrollTo: '', voicePhase: '', voiceRetry: false,
+    draftsAvailable: false, scrollTo: '', voicePhase: '', voiceRetry: false, inputMode: 'text' as 'text' | 'voice',
     readyImages: [] as Attachment[], uploadRows: [] as (MaterialSource & { id?: string; local: boolean })[],
     draftStrip: null as ReturnType<typeof draftSummary> | null, draftExpanded: false, issuedCard: false, revokeFailed: false,
-    deliveryStrip: null as ReturnType<typeof deliverySummaryView> | null, focusInput: false,
+    deliveryStrip: null as ReturnType<typeof deliverySummaryView> | null, focusInput: false, imageLimit,
   },
   draft: null as TripDraft | null,
   turns: [] as AgentTurn[],
@@ -120,6 +121,7 @@ Page({
   pending: new Map<string, string>(),
   voiceCapture: null as ReturnType<typeof startVoiceRecording> | null,
   voiceFile: null as VoiceFile | null,
+  discardVoice: false,
   pauseUpload: false,
   retiredToken: '',
 
@@ -162,7 +164,8 @@ Page({
     this.delivery = null;
     this.setData({ signedIn: false, busy: false, polling: false, confirmed: false, draftsAvailable: false,
       error: '', text: '', turns: [], attachments: [], readyImages: [], uploadRows: [], pendingMaterial: '',
-      scrollTo: '', draftStrip: null, deliveryStrip: null, focusInput: false, draftExpanded: false, issuedCard: false, voiceRetry: false, revokeFailed: !!this.retiredToken });
+      scrollTo: '', draftStrip: null, deliveryStrip: null, focusInput: false, draftExpanded: false, issuedCard: false,
+      voiceRetry: false, inputMode: 'text', revokeFailed: !!this.retiredToken });
   },
 
   async run(action: () => Promise<void>) {
@@ -224,10 +227,12 @@ Page({
     const prefill = draftConfirmed && target?.tripId === draft.id && !this.data.text.trim();
     if (changedMode || !sameTrip) this.voiceFile = null;
     this.setData({ confirmed: draftConfirmed, draftsAvailable: true, polling: !!active,
-      ...(changedMode || !sameTrip ? { text: '', attachments: [], readyImages: [], uploadRows: [], draftExpanded: false, pendingMaterial: '', voiceRetry: false } : {}),
-      ...(prefill ? { text: `${target.name}：`, focusInput: !active } : { focusInput: false }) });
+      ...(changedMode || !sameTrip ? { text: '', attachments: [], readyImages: [], uploadRows: [], draftExpanded: false,
+        pendingMaterial: '', voiceRetry: false, inputMode: 'text' } : {}),
+      ...(prefill ? { text: `${target.name}：`, focusInput: !active, inputMode: 'text' } : { focusInput: false }) });
     this.render();
     if (active) this.schedule();
+    if (!draftConfirmed) void this.syncMaterials(draft, generation);
   },
 
   render() {
@@ -444,13 +449,32 @@ Page({
     wx.switchTab({ url: '/pages/trip-picking/index' });
   },
 
-  chooseImage(event: WechatMiniprogram.TouchEvent) {
+  openImageMenu(): void {
     const draft = this.draft;
+    if (!draft || this.data.confirmed || this.data.busy || this.data.polling || !this.data.draftsAvailable ||
+      this.data.attachments.length >= imageLimit) return;
+    wx.showActionSheet({
+      itemList: ['从微信聊天选图', '从手机相册选图'],
+      success: ({ tapIndex }) => {
+        if (tapIndex === 0) void this.pickAndUpload(false);
+        else if (tapIndex === 1) void this.pickAndUpload(true);
+      },
+      fail: () => {},
+    });
+  },
+
+  chooseImage(event: WechatMiniprogram.TouchEvent) {
     const { album, key } = event.currentTarget.dataset;
-    if (!draft || this.data.confirmed || this.data.polling || this.data.attachments.length >= imageLimit) return;
+    return this.pickAndUpload(album === 'yes', key);
+  },
+
+  pickAndUpload(album: boolean, key?: string): Promise<void> | undefined {
+    const draft = this.draft;
+    if (!draft || this.data.confirmed || this.data.busy || this.data.polling || !this.data.draftsAvailable ||
+      this.data.attachments.length >= imageLimit) return;
     return this.run(async () => {
       const linked = this.data.uploadRows.find(row => row.requestId === key);
-      const file = await chooseMaterial(album === 'yes');
+      const file = await chooseMaterial(album);
       if (!file) return;
       if (!materialImagePattern.test(file.name)) throw new Error('请选择 JPG、PNG、WebP 或 HEIC 图片。');
       const info = await materialInfo(file.path);
@@ -479,17 +503,29 @@ Page({
   images() {
     const draft = this.draft;
     if (!draft || this.data.polling) return;
-    return this.run(async () => {
-      const { materials } = await workspaceRequest<{ materials: Material[] }>('GET', '/materials', agentSession.token);
-      const local = stagedMaterials().filter(item => item.draftId === draft.id);
-      const current = materials.filter(item => item.draftId === draft.id);
-      const remote = current.filter(item => item.status === 'uploading').map(item =>
-        ({ ...item, local: local.some(source => sameMaterial(source, item)) }));
-      this.setData({ readyImages: current.filter(item => item.status === 'ready' && !item.organized &&
-        !this.data.attachments.some(attached => attached.id === item.id)),
-        uploadRows: [...remote, ...local.filter(item => item.revision === draft.revision &&
-          !current.some(material => material.requestId === item.requestId)).map(item => ({ ...item, local: true }))] });
-    });
+    const generation = this.generation;
+    return this.run(() => this.syncMaterials(draft, generation));
+  },
+
+  async syncMaterials(draft: TripDraft, generation: number) {
+    let local: MaterialSource[] = [];
+    try {
+      if (typeof wx.getStorageSync === 'function') local = stagedMaterials().filter(item => item.draftId === draft.id);
+    } catch { local = []; }
+    let materials: Material[];
+    try {
+      const result = await workspaceRequest<{ materials: Material[] }>('GET', '/materials', agentSession.token);
+      materials = result.materials;
+    } catch { return; }
+    const currentDraft = this.draft;
+    if (generation !== this.generation || !agentSession.token || !currentDraft || currentDraft.id !== draft.id) return;
+    const current = materials.filter(item => item.draftId === currentDraft.id);
+    const remote = current.filter(item => item.status === 'uploading').map(item =>
+      ({ ...item, local: local.some(source => sameMaterial(source, item)) }));
+    this.setData({ readyImages: current.filter(item => item.status === 'ready' && !item.organized &&
+      !this.data.attachments.some(attached => attached.id === item.id)),
+      uploadRows: [...remote, ...local.filter(item => item.revision === currentDraft.revision &&
+        !current.some(material => material.requestId === item.requestId)).map(item => ({ ...item, local: true }))] });
   },
 
   resumeImage(event: WechatMiniprogram.TouchEvent) {
@@ -515,6 +551,20 @@ Page({
     this.setData({ attachments: this.data.attachments.filter(item => item.id !== event.currentTarget.dataset.id) });
   },
 
+  toggleInputMode() {
+    if (this.data.voicePhase === '录音中') {
+      this.discardVoice = true;
+      this.voiceCapture?.cancel();
+    }
+    const inputMode = this.data.inputMode === 'text' ? 'voice' : 'text';
+    this.setData({ inputMode, ...(inputMode === 'text' ? { focusInput: !this.data.busy } : { focusInput: false }) });
+  },
+
+  voiceTap() {
+    if (this.data.voicePhase === '录音中') this.stopRecording();
+    else this.record();
+  },
+
   record() {
     const draft = this.draft;
     if (!draft || this.data.polling) return;
@@ -522,10 +572,14 @@ Page({
       this.setData({ voicePhase: '准备录音', voiceRetry: false });
       try {
         this.voiceCapture = startVoiceRecording(() => this.setData({ voicePhase: '录音中' }));
-        const path = await this.voiceCapture.done;
+        const path = await this.voiceCapture.done.catch(error => {
+          if (!this.discardVoice) throw error;
+          return '';
+        });
+        if (!path) return;
         this.voiceFile = { draft, path };
         await this.transcribe();
-      } finally { this.voiceCapture = null; this.setData({ voicePhase: '' }); }
+      } finally { this.voiceCapture = null; this.discardVoice = false; this.setData({ voicePhase: '' }); }
     });
   },
 
@@ -551,7 +605,7 @@ Page({
       if (!result.text.trim()) throw new Error('语音转写没有返回文字，请重试。');
       if (text.length > textOrderLimit) throw new Error('转写后文字太长，请缩短输入框内容再重试。');
       this.voiceFile = null;
-      this.setData({ text });
+      this.setData({ text, inputMode: 'text' });
     } catch (error) {
       if (error instanceof VoiceFileError || (error instanceof WorkspaceError && error.status < 500)) this.voiceFile = null;
       this.setData({ voiceRetry: !!this.voiceFile });

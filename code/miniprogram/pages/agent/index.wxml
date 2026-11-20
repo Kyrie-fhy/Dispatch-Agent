@@ -16,12 +16,17 @@
         <view wx:for="{{deliveryStrip.shops}}" wx:key="sheetId" class="preview-line detail">
           <text>{{item.customer}} · {{item.locked ? '已送达' : '未送达'}}</text><text>{{item.description}}</text>
         </view>
+        <button class="logout" size="mini" bindtap="logout" disabled="{{busy}}">退出登录</button>
       </scroll-view>
     </view>
     <view class="draft-strip" wx:if="{{draftStrip}}">
       <view class="draft-header">
         <button size="mini" class="draft-toggle" bindtap="toggleDraft">{{draftStrip.label}} {{draftExpanded ? '▴' : '▾'}}</button>
-        <button wx:if="{{!confirmed}}" size="mini" bindtap="openWorkspace" disabled="{{busy}}">手动改</button>
+        <view class="draft-actions">
+          <button wx:if="{{!confirmed && draftStrip.hasLines}}" size="mini" class="primary" bindtap="previewShortcut"
+            disabled="{{busy || polling || !draftsAvailable}}">出单</button>
+          <button wx:if="{{!confirmed}}" size="mini" bindtap="openWorkspace" disabled="{{busy}}">手动改</button>
+        </view>
       </view>
       <scroll-view wx:if="{{draftExpanded}}" scroll-y class="draft-detail">
         <view wx:for="{{draftStrip.customers}}" wx:for-item="customer" wx:key="id" class="detail">
@@ -31,6 +36,7 @@
           </view>
         </view>
         <text wx:if="{{!draftStrip.customers.length}}" class="muted">草稿里还没有货品</text>
+        <button class="logout" size="mini" bindtap="logout" disabled="{{busy}}">退出登录</button>
       </scroll-view>
     </view>
     <scroll-view scroll-y class="conversation" scroll-into-view="{{scrollTo}}">
@@ -120,36 +126,52 @@
     </scroll-view>
     <view class="composer">
       <text wx:if="{{error}}" class="error">{{error}}</text>
-      <view wx:if="{{!confirmed}}" class="file-list">
-        <view wx:for="{{attachments}}" wx:key="id" class="file">
-          <text>{{item.name}}</text><button size="mini" data-id="{{item.id}}" bindtap="removeImage">移除</button>
-        </view>
+      <view wx:if="{{!confirmed && (uploadRows.length || readyImages.length)}}" class="file-list">
         <view wx:for="{{readyImages}}" wx:key="id" class="file">
-          <text>{{item.name}}</text><button size="mini" data-id="{{item.id}}" bindtap="attachReady">附上</button>
+          <text class="file-name">{{item.name}}</text>
+          <button size="mini" data-id="{{item.id}}" bindtap="attachReady">附上</button>
         </view>
         <view wx:for="{{uploadRows}}" wx:key="requestId" class="file">
-          <text>{{item.name}}</text>
+          <text class="file-name">{{item.name}}</text>
           <button wx:if="{{item.local}}" size="mini" disabled="{{busy || polling}}" data-key="{{item.requestId}}" bindtap="resumeImage">继续上传</button>
           <button wx:else size="mini" disabled="{{busy || polling}}" data-key="{{item.requestId}}" data-album="yes" bindtap="chooseImage">重选原图</button>
         </view>
         <text wx:if="{{uploadLabel}}" class="muted">{{pendingMaterial}} {{uploadLabel}}</text>
       </view>
-      <text wx:if="{{voicePhase}}" class="muted">{{voicePhase}}</text>
-      <textarea class="input" value="{{text}}" maxlength="{{textOrderLimit}}" auto-height show-confirm-bar="{{false}}" focus="{{focusInput && !busy}}"
-        placeholder="{{confirmed ? '说哪家少收、补单价，或问还剩哪几家' : '发订单，或告诉我怎么改'}}" disabled="{{busy}}" bindinput="editText" />
-      <view class="actions">
-        <block wx:if="{{!confirmed}}">
-          <button size="mini" disabled="{{busy || polling || !draftsAvailable}}" data-album="yes" bindtap="chooseImage">相册</button>
-          <button size="mini" disabled="{{busy || polling || !draftsAvailable}}" bindtap="chooseImage">聊天图片</button>
-          <button size="mini" disabled="{{busy || polling || !draftsAvailable}}" bindtap="images">上传记录</button>
-        </block>
-        <button wx:if="{{voicePhase === '录音中'}}" size="mini" bindtap="stopRecording">结束录音</button>
-        <button wx:else size="mini" disabled="{{busy || polling || !draftsAvailable}}" bindtap="record">录音</button>
-        <button wx:if="{{voiceRetry}}" size="mini" disabled="{{busy || polling}}" bindtap="retryVoice">重试转写</button>
-        <button wx:if="{{!confirmed}}" size="mini" bindtap="previewShortcut" disabled="{{busy || polling || !draftsAvailable}}">生成送货单</button>
-        <button size="mini" class="primary send" disabled="{{busy || polling || !draftsAvailable || (!text && !attachments.length)}}" bindtap="send">发送</button>
+      <view wx:if="{{!confirmed && attachments.length}}" class="attachment-row">
+        <view wx:for="{{attachments}}" wx:key="id" class="attachment">
+          <text class="attachment-name">{{item.name}}</text>
+          <button class="close-button" data-id="{{item.id}}" bindtap="removeImage" aria-label="移除图片">
+            <image class="close-icon" src="/pages/agent/icons/close.svg" />
+          </button>
+        </view>
       </view>
-      <button class="logout" size="mini" bindtap="logout" disabled="{{busy}}">退出登录</button>
+      <text wx:if="{{voicePhase}}" class="voice-status">{{voicePhase}}</text>
+      <view class="composer-bar">
+        <button wx:if="{{!confirmed}}" class="image-button" aria-label="上传订单图片"
+          disabled="{{busy || polling || !draftsAvailable || attachments.length >= imageLimit}}" bindtap="openImageMenu">
+          <image class="image-button-icon" src="/pages/agent/icons/image.svg" />
+        </button>
+        <button class="mode-button" aria-label="切换语音或打字" bindtap="toggleInputMode">
+          <image class="mode-icon" src="{{inputMode === 'text' ? '/pages/agent/icons/mic.svg' : '/pages/agent/icons/keyboard.svg'}}" />
+        </button>
+        <textarea wx:if="{{inputMode === 'text'}}" class="input" value="{{text}}" maxlength="{{textOrderLimit}}" auto-height
+          show-confirm-bar="{{false}}" focus="{{focusInput && !busy}}"
+          placeholder="{{confirmed ? '说哪家少收、补单价，或问还剩哪几家' : '发订单，或告诉我怎么改'}}" disabled="{{busy}}" bindinput="editText" />
+        <view wx:else class="voice-wrap">
+          <view class="voice-pad {{voicePhase === '录音中' ? 'recording' : ''}}" bindtap="voiceTap">
+            <image class="voice-icon" src="{{voicePhase === '录音中' ? '/pages/agent/icons/stop.svg' : '/pages/agent/icons/mic.svg'}}" />
+            <view wx:if="{{voicePhase === '录音中'}}" class="recording-dot" />
+          </view>
+          <button wx:if="{{voiceRetry}}" class="retry-button" aria-label="重试转写" disabled="{{busy || polling}}" bindtap="retryVoice">
+            <image class="retry-icon" src="/pages/agent/icons/retry.svg" />
+          </button>
+        </view>
+        <button class="send-button {{!busy && !polling && draftsAvailable && (text || (!confirmed && attachments.length)) ? 'ready' : ''}}"
+          aria-label="发送" disabled="{{busy || polling || !draftsAvailable || (!text && (confirmed || !attachments.length))}}" bindtap="send">
+          <image class="send-icon" src="/pages/agent/icons/send.svg" />
+        </button>
+      </view>
     </view>
   </block>
 </view>

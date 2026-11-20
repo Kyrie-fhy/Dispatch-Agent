@@ -59,6 +59,7 @@ function setup(t, initialDraft) {
       if (path === '/agent/card-actions') return entry.ok({ recorded: true });
       if (onRequest?.(entry)) return;
       if (path === '/agent/conversation') return entry.ok({ draft: structuredClone(draft), draftConfirmed: confirmed, confirmedPreviewId, turns: structuredClone(turns), delivery: structuredClone(delivery) });
+      if (path === '/materials') return entry.ok({ materials: [] });
       if (path === '/workspace') return entry.ok({ draft: structuredClone(draft), parties: [], draftConfirmed: confirmed, currentTrip: null });
       assert.fail(`Unhandled request ${entry.method} ${path}`);
     },
@@ -306,6 +307,81 @@ test('A1 restores failed messages, renders revision-safe undo and only confirms 
   assert.equal(page.data.turns.at(-1).checklist[0].state, 'done');
   assert.equal(page.data.turns.at(-1).issued, true);
   assert.ok(requests.filter(r => r.path === '/trips/confirm').every(r => r.data.requestId));
+});
+
+test('Agent composer routes image picks, toggles voice input, and stays quiet after confirmation', async t => {
+  const draft = order();
+  const { page, requests, handle, setConfirmed } = setup(t, draft);
+  const menuCalls = [];
+  const picked = [];
+  const recorder = {};
+  Object.assign(global.wx, {
+    showActionSheet: ({ itemList, success }) => {
+      menuCalls.push(itemList);
+      success({ tapIndex: menuCalls.length === 1 ? 0 : 1 });
+    },
+    chooseMessageFile: ({ fail }) => { picked.push('chat'); fail({ errMsg: 'chooseMessageFile:fail cancel' }); },
+    chooseMedia: ({ fail }) => { picked.push('album'); fail({ errMsg: 'chooseMedia:fail cancel' }); },
+    authorize: ({ success }) => success(),
+    getRecorderManager: () => ({
+      onStart(callback) { recorder.start = callback; }, onStop(callback) { recorder.stop = callback; },
+      onError() {}, onInterruptionBegin() {}, start() { recorder.start(); },
+      stop() { recorder.stop({ tempFilePath: 'composer.pcm', duration: 1200 }); },
+    }),
+    getFileSystemManager: () => ({ readFile: ({ success }) => success({ data: new ArrayBuffer(32000) }) }),
+    arrayBufferToBase64: bytes => Buffer.from(bytes).toString('base64'),
+  });
+  handle(request => {
+    if (request.path === '/agent/transcription') {
+      request.ok({ draftId: draft.id, revision: draft.revision, text: '明天加两箱水饺' });
+      return true;
+    }
+    if (request.path === '/agent/turns') {
+      assert.equal(request.data.text, '生成送货单');
+      assert.deepEqual(request.data.direct, { intent: 'preview' });
+      request.ok({ turnId: 'preview-turn' }, 202);
+      return true;
+    }
+  });
+  await page.onShow();
+  await page.login();
+  assert.equal(page.data.signedIn, true);
+  assert.equal(page.data.draftStrip.hasLines, true);
+
+  await page.previewShortcut();
+  assert.deepEqual(requests.find(request => request.path === '/agent/turns').data.direct, { intent: 'preview' });
+  page.stopPolling();
+  page.setData({ polling: false });
+
+  page.openImageMenu();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(menuCalls[0], ['从微信聊天选图', '从手机相册选图']);
+  assert.deepEqual(picked, ['chat']);
+  page.openImageMenu();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(picked, ['chat', 'album']);
+
+  page.toggleInputMode();
+  assert.equal(page.data.inputMode, 'voice');
+  page.toggleInputMode();
+  assert.equal(page.data.inputMode, 'text');
+  page.toggleInputMode();
+  const recording = page.record();
+  assert.equal(page.data.voicePhase, '录音中');
+  page.stopRecording();
+  await recording;
+  assert.equal(page.data.inputMode, 'text');
+  assert.equal(page.data.voicePhase, '');
+  assert.match(page.data.text, /明天加两箱水饺/);
+
+  setConfirmed(true, 'pre-1');
+  const materialsBefore = requests.filter(request => request.path === '/materials').length;
+  await page.onShow();
+  assert.equal(page.data.confirmed, true);
+  assert.equal(requests.filter(request => request.path === '/materials').length, materialsBefore);
+  page.openImageMenu();
+  assert.equal(menuCalls.length, 2);
+  assert.deepEqual(picked, ['chat', 'album']);
 });
 
 test('A1 manual form uses the same session and detects an unsaved edit after chat updates the draft', async t => {

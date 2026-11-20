@@ -13,6 +13,7 @@ import { DraftStore } from './drafts';
 import { DeliveryStore, readDeliveryApply } from './delivery';
 import { LedgerStore } from './ledger';
 import { MaterialStore, readMaterialInput } from './materials';
+import { MemoryStore } from './memory';
 import { TripStore } from './trips';
 import { readConfirmInput, readDeliveryEdit, readDeliveryInput, readNextInput, readOpeningInput, readPreviewInput, readReceiptInput,
   readCommand, readReviewInput, uuidPattern, validRevision, validSheetKey } from './request-input';
@@ -69,7 +70,7 @@ function resourceId(path: string, collection: 'drafts' | 'trips'): string | null
 }
 
 async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery: DeliveryStore, ledger: LedgerStore, amendments: AmendmentStore,
-  materials: MaterialStore, textOrders: TextOrders, agent: AgentRuntime, request: IncomingMessage, response: ServerResponse,
+  materials: MaterialStore, textOrders: TextOrders, agent: AgentRuntime, memory: MemoryStore, request: IncomingMessage, response: ServerResponse,
   wechat?: WechatLogin, speechModel?: SpeechModel): Promise<void> {
   const host = request.headers.host ?? '';
   if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host)) {
@@ -126,6 +127,26 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
   }
   if (method === 'POST' && path === '/v1/agent/card-actions') {
     sendJson(response, 200, await agent.store.card(account, await readJson(request, response)));
+    return;
+  }
+  if (method === 'GET' && path === '/v1/agent/memory') {
+    const id = new URL(request.url ?? path, 'http://127.0.0.1').searchParams.get('draftId');
+    if (typeof id !== 'string' || !uuidPattern.test(id)) {
+      throw new HttpError(400, 'invalid_id', '请提供有效的草稿编号');
+    }
+    sendJson(response, 200, await memory.agentMemory(account, id));
+    return;
+  }
+  if (method === 'POST' && path === '/v1/agent/customer-choice') {
+    sendJson(response, 200, await memory.chooseDraftCustomer(account, await readJson(request, response)));
+    return;
+  }
+  if (method === 'GET' && path === '/v1/customer-aliases') {
+    sendJson(response, 200, await memory.aliasList(account));
+    return;
+  }
+  if (method === 'POST' && path === '/v1/customer-aliases/unbind') {
+    sendJson(response, 200, await memory.unbindCustomerAlias(account, await readJson(request, response)));
     return;
   }
   const turnRoute = /^\/v1\/agent\/turns\/([^/]+)\/(events|undo)$/.exec(path);
@@ -321,11 +342,12 @@ export async function startLocalServer(pool: Pool, port: number, wechat?: Wechat
   const ledger = new LedgerStore(pool);
   const amendments = new AmendmentStore(pool);
   const materials = new MaterialStore(pool);
+  const memory = new MemoryStore(pool);
   const textOrders = new TextOrders(pool, textModel, imageModel);
   const agent = new AgentRuntime(pool, trips, textOrders, agentModel, intentModel, deliveryModel);
   await agent.store.interrupt();
   const server = createServer({ requestTimeout: 15_000 }, (request, response) => {
-    void handle(pool, store, trips, delivery, ledger, amendments, materials, textOrders, agent, request, response, wechat, speechModel).catch(error => {
+    void handle(pool, store, trips, delivery, ledger, amendments, materials, textOrders, agent, memory, request, response, wechat, speechModel).catch(error => {
       if (response.destroyed) return;
       if (error instanceof HttpError) {
         sendJson(response, error.status, { error: error.code, message: error.message });

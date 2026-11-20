@@ -102,7 +102,7 @@ async function visibleEvents(client: PoolClient, account: string, id: string, af
   const { rows } = await client.query<AgentEvent>(`
     SELECT seq::float8, kind, payload FROM dispatch.agent_events
     WHERE account_id = $1 AND turn_id = $2 AND seq > $3
-      AND kind IN ('progress', 'plan', 'step', 'questions', 'preview', 'change', 'undo', 'end', 'delivery_proposal', 'delivery_applied') ORDER BY seq`, [account, id, after]);
+      AND kind IN ('progress', 'plan', 'step', 'questions', 'preview', 'change', 'undo', 'end', 'delivery_proposal', 'delivery_applied', 'customer_links') ORDER BY seq`, [account, id, after]);
   return rows;
 }
 

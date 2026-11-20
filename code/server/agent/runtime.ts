@@ -1,19 +1,21 @@
 import { randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
-import type { PlanStep, Question, StepState } from '../../miniprogram/core/agent';
+import type { CustomerLink, PlanStep, Question, StepState } from '../../miniprogram/core/agent';
 import { isObject, nullablePrice } from '../../miniprogram/core/orders';
+import { resolveCustomerMention } from '../../miniprogram/core/memory';
 import { spokenNumbers } from '../../miniprogram/core/spoken-numbers';
 import { textOrderQuestions } from '../../miniprogram/core/text-order';
-import { previewTrip, resolveCustomerChoices } from '../../miniprogram/core/trips';
+import { previewTrip, resolveCustomerChoices, type TripDraft } from '../../miniprogram/core/trips';
 import { readAccount, readParties, readWorkspace, workspaceDraft, writeAccount } from '../account-workspace';
 import { readSaveDraft } from '../draft-input';
 import { HttpError } from '../http-error';
+import { readDirectory } from '../memory';
 import type { ModelTrace } from '../text-model';
 import { isPlaceholder, normalized, readImageOrder, readable, targetRows, TextOrders } from '../text-orders';
 import { TripStore } from '../trips';
 import { invalidTool, prepareEdits, PreviousQuestions } from './edit';
 import { AgentMessage, AgentModel, AgentModelTrace, agentPrompt, agentPromptVersion, otherPrompt } from './model';
-import { AgentStore, checkDraft, Input, saveChange, TurnKey } from './store';
+import { AgentStore, checkDraft, event, Input, saveChange, TurnKey } from './store';
 import type { Intent, IntentModel } from './intent';
 import { runDelivery } from './delivery';
 import type { DeliveryModel } from './delivery-model';
@@ -230,6 +232,12 @@ export class AgentRuntime {
       let questionSource: string | undefined;
       if (intent.draft || input.materialIds.length) {
         await begin('check');
+        const links = await this.linkCustomers(run, context.draft);
+        if (links.length) {
+          const recognized = new Set(links.flatMap(link => [link.spoken, link.canonicalName]));
+          run.questions = run.questions.filter(question =>
+            !(recognized.has(question.customer) && question.options.includes('新建客户')));
+        }
         if (run.revision !== input.revision) run.questions.push(...await this.requiredQuestions(run));
         if (!answering && previous) {
           const carried = previous.payload.questions.filter(question => !confirmation || !matchesConfirmation(question, confirmation));
@@ -299,6 +307,59 @@ export class AgentRuntime {
       for (const item of steps) if (!terminal.has(item.id)) await step(item.id, 'skipped');
       await this.store.finish(key, 'failed', message, code);
     }
+  }
+
+  private async linkCustomers(run: Run, start: TripDraft): Promise<CustomerLink[]> {
+    const { account, draftId } = run.key;
+    const before = new Map(start.customers.map(customer => [customer.id, customer]));
+    const requestId = randomUUID();
+    const result = await writeAccount(this.pool, account, requestId,
+      { action: 'agent-link-customers', turnId: run.key.id, revision: run.revision }, async (client, workspace) => {
+        checkDraft(workspace, draftId, run.revision, true);
+        const directory = await readDirectory(client, account);
+        if (!directory.customers.length) return { changed: false as const };
+        const draft = workspaceDraft(workspace);
+        const lines: string[] = [];
+        const links: CustomerLink[] = [];
+        for (const customer of [...draft.customers]) {
+          const spoken = customer.customer.trim();
+          if (!spoken || typeof customer.partyId === 'string') continue;
+          const original = before.get(customer.id);
+          if (original && original.customer === customer.customer && original.partyId === customer.partyId) continue;
+          const mention = resolveCustomerMention(directory, customer.customer);
+          if (mention.status === 'resolved') {
+            const sibling = draft.customers.find(entry => entry !== customer && entry.partyId === mention.customerId);
+            if (sibling) {
+              sibling.items.push(...customer.items);
+              draft.customers = draft.customers.filter(entry => entry !== customer);
+              lines.push(`${spoken} → ${mention.canonicalName}（并入同一家）`);
+            } else {
+              customer.customer = mention.canonicalName;
+              customer.partyId = mention.customerId;
+              lines.push(mention.matchedBy === 'alias'
+                ? `${spoken} → ${mention.canonicalName}（记住的叫法）`
+                : `${mention.canonicalName}：认出熟客`);
+            }
+            links.push({ draftCustomerId: customer.id, spoken, customerId: mention.customerId,
+              canonicalName: mention.canonicalName, matchedBy: mention.matchedBy, merged: Boolean(sibling) });
+          } else if (customer.partyId === null) {
+            delete customer.partyId;
+            lines.push(`${spoken}：待选店`);
+          }
+        }
+        if (!lines.length) return { changed: false as const };
+        const { draft: saved } = readSaveDraft(draftId, { ...draft, revision: run.revision, requestId });
+        const revision = run.revision + 1;
+        await client.query('UPDATE dispatch.workspaces SET draft_revision = $2, draft_customers = $3 WHERE account_id = $1',
+          [account, revision, JSON.stringify(saved.customers)]);
+        await saveChange(client, run.key, revision, lines, run.signal);
+        if (links.length) await event(client, run.key, 'customer_links', { links });
+        return { changed: true as const, revision, lines, links };
+      });
+    if (!result.changed) return [];
+    run.revision = result.revision;
+    run.lines.push(...result.lines);
+    return result.links;
   }
 
   private async selectCustomer(run: Run, draft: Awaited<ReturnType<AgentRuntime['readDraft']>>, answer: string) {
@@ -398,13 +459,12 @@ export class AgentRuntime {
       const workspace = await readWorkspace(client, account);
       checkDraft(workspace, draftId, run.revision);
       const draft = workspaceDraft(workspace);
-      const parties = await readParties(client, account);
       return textOrderQuestions(draft).map(({ id, name, issues }) => {
         const customer = draft.customers.find(entry => entry.id === id);
-        const options = customer?.customer.trim() && customer.partyId === undefined
-          ? [...parties.flatMap((party, i) => normalized(party.name) === normalized(name) ? [customerOption(i + 1, party.name)] : []), '新建客户']
-          : [];
-        return { customer: name, text: issues.join('；'), options };
+        const choosing = Boolean(customer?.customer.trim() && customer.partyId === undefined);
+        const text = issues.map(issue => choosing && issue === '请选择已有客户或明确新建'
+          ? '是哪家熟客？请在下方选店，或新建客户。' : issue).join('；');
+        return { customer: name, text, options: [] };
       });
     });
   }

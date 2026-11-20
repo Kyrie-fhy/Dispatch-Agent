@@ -37,12 +37,20 @@
             </view>
           </block>
           <block wx:else>
-            <text class="card-title">本趟已出单 · 送货现场助手</text>
+            <text class="card-title">{{deliverySummary && deliverySummary.allDelivered ? '本趟已全部送达' : '本趟已出单 · 送货现场助手'}}</text>
             <text wx:if="{{deliverySummary}}" class="muted num">{{deliverySummary.label}}</text>
-            <text class="muted">说哪家少收、补单价，或问还剩哪几家；也可以直接去送货单核对。</text>
+            <text class="muted">{{deliverySummary && deliverySummary.allDelivered ? '本趟送货已完成；点「开始下一趟」即可开启新对话、继续传图录新单。' : '说哪家少收、补单价，或问还剩哪几家；如需录入下一趟新订单图片，请点「开始下一趟」。'}}</text>
             <view class="card-actions">
-              <button class="card-btn-primary" bindtap="openDelivery" disabled="{{busy}}">去送货单</button>
-              <button class="card-btn-secondary" bindtap="showPickingList" disabled="{{busy}}">去取货清单</button>
+              <block wx:if="{{deliverySummary && deliverySummary.allDelivered}}">
+                <button class="card-btn-primary" bindtap="nextTrip" disabled="{{busy || polling}}">开始下一趟</button>
+                <button class="card-btn-secondary" bindtap="openDelivery" disabled="{{busy}}">去送货单</button>
+                <button class="card-btn-ghost" bindtap="showPickingList" disabled="{{busy}}">去取货清单</button>
+              </block>
+              <block wx:else>
+                <button class="card-btn-primary" bindtap="openDelivery" disabled="{{busy}}">去送货单</button>
+                <button class="card-btn-secondary" bindtap="showPickingList" disabled="{{busy}}">去取货清单</button>
+                <button class="card-btn-ghost" bindtap="nextTrip" disabled="{{busy || polling}}">开始下一趟</button>
+              </block>
             </view>
           </block>
         </view>
@@ -55,7 +63,7 @@
           </view>
           <view class="avatar mine">我</view>
         </view>
-        <view class="assistant-row" wx:if="{{turn.checklist.length || turn.reply || turn.changes.length || turn.questions.length || turn.preview || turn.delivery || turn.canRetry || turn.showDraftActions || turn.showPostDeliveryLink}}">
+        <view class="assistant-row" wx:if="{{turn.checklist.length || turn.reply || turn.changes.length || turn.questions.length || turn.preview || turn.delivery || turn.canRetry || turn.showDraftActions || turn.showDeliveryFooter}}">
           <view class="avatar helper">助</view>
           <view class="assistant-content">
             <text class="assistant-name">{{confirmed ? '送货助手' : '录单助手'}}</text>
@@ -129,7 +137,10 @@
                   </view>
                 </scroll-view>
               </view>
-              <view wx:if="{{turn.showDraftActions || (turn.preview && turn.preview.active) || turn.issued || turn.canRetry || turn.showPostDeliveryLink}}" class="card-actions">
+              <view wx:if="{{turn.showDeliveryFooter}}" class="detail">
+                <text class="muted">{{turn.allDelivered ? '本趟已全部送达；点「开始下一趟」即可开启新对话、继续传图录新单。' : '本趟送货核对中；如需录入下一趟新订单图片，请点「开始下一趟」。'}}</text>
+              </view>
+              <view wx:if="{{turn.showDraftActions || (turn.preview && turn.preview.active) || turn.showDeliveryFooter || turn.canRetry}}" class="card-actions">
                 <block wx:if="{{turn.showDraftActions}}">
                   <button wx:if="{{!turn.hasPendingQuestions && draftSummary && draftSummary.hasLines}}" class="card-btn-primary"
                     bindtap="previewShortcut" disabled="{{busy || polling || !draftsAvailable}}">生成送货单</button>
@@ -142,15 +153,26 @@
                   <button class="card-btn-secondary" disabled="{{busy || polling}}" data-turn="{{turn.id}}" bindtap="continueEditing">继续修改</button>
                   <button class="card-btn-ghost" bindtap="openWorkspace" disabled="{{busy}}">手动改</button>
                 </block>
-                <block wx:if="{{turn.issued}}">
-                  <button class="card-btn-primary" bindtap="showPickingList" disabled="{{busy}}">去取货清单</button>
-                  <button class="card-btn-secondary" bindtap="openDelivery" disabled="{{busy}}">去送货单</button>
+                <block wx:if="{{turn.showDeliveryFooter}}">
+                  <block wx:if="{{turn.allDelivered}}">
+                    <button class="card-btn-primary" bindtap="nextTrip" disabled="{{busy || polling}}">开始下一趟</button>
+                    <button class="card-btn-secondary" bindtap="openDelivery" disabled="{{busy}}">去送货单</button>
+                    <button class="card-btn-ghost" bindtap="showPickingList" disabled="{{busy}}">去取货清单</button>
+                  </block>
+                  <block wx:elif="{{turn.issued}}">
+                    <button class="card-btn-primary" bindtap="showPickingList" disabled="{{busy}}">去取货清单</button>
+                    <button class="card-btn-secondary" bindtap="openDelivery" disabled="{{busy}}">去送货单</button>
+                    <button class="card-btn-ghost" bindtap="nextTrip" disabled="{{busy || polling}}">开始下一趟</button>
+                  </block>
+                  <block wx:else>
+                    <button class="card-btn-secondary" bindtap="openDelivery" disabled="{{busy}}">去送货单</button>
+                    <button class="card-btn-ghost" bindtap="nextTrip" disabled="{{busy || polling}}">开始下一趟</button>
+                  </block>
                 </block>
                 <block wx:if="{{turn.canRetry}}">
                   <button class="card-btn-secondary" disabled="{{busy || polling}}" data-id="{{turn.id}}" bindtap="retry">把原消息放回输入框</button>
                   <button wx:if="{{!confirmed}}" class="card-btn-ghost" bindtap="openWorkspace" disabled="{{busy}}">手动改</button>
                 </block>
-                <button wx:if="{{turn.showPostDeliveryLink}}" class="card-btn-secondary" bindtap="openDelivery" disabled="{{busy}}">去送货单</button>
               </view>
               <text wx:if="{{turn.elapsed}}" class="elapsed num">{{turn.elapsed}}</text>
             </view>

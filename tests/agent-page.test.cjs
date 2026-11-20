@@ -662,3 +662,54 @@ test('Agent drops the top strip and keeps the next action only on the latest lin
   assert.match(page.data.deliverySummary.label, /0\/1/);
   assert.ok(requests.some(request => request.path === '/trips/confirm'));
 });
+
+test('Agent starts the next trip from delivery cards with a guard for unfinished shops', async t => {
+  const draft = order();
+  const { page, requests, event, handle, setDraft, setConfirmed, setDelivery, setTurns } = setup(t, draft);
+  const turn = { id: 'turn-1', text: '老王水饺两箱', materialIds: [], revision: draft.revision, status: 'completed',
+    events: [event('end', { status: 'completed', text: '已整理', revision: draft.revision })] };
+  const shops = locked => [{ sheetId: draft.customers[0].id, customer: '老王', locked, totalCents: 16400, pendingPrices: 0 }];
+  setConfirmed(true);
+  setDelivery({ tripId: draft.id, version: 1, statusRevision: 0, shops: shops(false) });
+  setTurns([turn]);
+  await page.onShow();
+  await page.login();
+  assert.equal(page.data.deliverySummary.allDelivered, false);
+  assert.equal(page.data.turns.at(-1).showDeliveryFooter, true);
+  assert.equal(page.data.turns.at(-1).allDelivered, false);
+
+  let modal;
+  global.wx.showModal = spec => { modal = spec; };
+  await page.nextTrip();
+  assert.match(modal.content, /还有 1 家没确认送达：老王/);
+  assert.match(modal.content, /历史/);
+  modal.success({ confirm: false });
+  assert.equal(requests.some(request => request.path === '/trips/next-draft'), false);
+  assert.equal(page.data.confirmed, true);
+
+  setDelivery({ tripId: draft.id, version: 1, statusRevision: 1, shops: shops(true) });
+  await page.onShow();
+  assert.equal(page.data.deliverySummary.allDelivered, true);
+  assert.equal(page.data.turns.at(-1).allDelivered, true);
+  assert.equal(page.data.turns.at(-1).showDeliveryFooter, true);
+  assert.equal(page.data.navTitle, '送货助手（1/1 已送达）');
+
+  global.wx.showModal = () => assert.fail('全部送达时无需弹窗，直接开始下一趟');
+  handle(request => {
+    if (request.path !== '/trips/next-draft') return false;
+    assert.equal(request.data.draftId, draft.id);
+    assert.ok(request.data.requestId);
+    setDraft({ ...draft, id: 'next-trip', revision: 0 });
+    setConfirmed(false);
+    setTurns([]);
+    setDelivery(null);
+    request.ok({ draft: { ...draft, id: 'next-trip', revision: 0 } });
+    return true;
+  });
+  await page.nextTrip();
+  assert.ok(requests.some(request => request.path === '/agent/card-actions' && request.data.action === 'next'));
+  assert.ok(requests.some(request => request.path === '/trips/next-draft'));
+  assert.equal(page.data.confirmed, false);
+  assert.equal(page.data.turns.length, 0);
+  assert.equal(page.data.navTitle, '录单助手');
+});

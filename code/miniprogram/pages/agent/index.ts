@@ -77,11 +77,12 @@ function view(turn: AgentTurn, revision: number, confirmed: boolean, last: boole
   const showDraftActions = showDraftSummary;
   const canUndo = Boolean(!confirmed && !undone && !!changes.length && end?.revision === revision && turn.status !== 'running');
   const showStandaloneUndo = Boolean(canUndo && !showDraftActions);
-  const showPostDeliveryLink = Boolean(last && confirmed && turn.status === 'completed' && !issued && !deliveryActive);
+  const allDelivered = Boolean(delivery && delivery.shops.length > 0 && delivery.shops.every(shop => shop.locked));
+  const showDeliveryFooter = Boolean(last && confirmed && turn.status === 'completed' && !deliveryActive);
   return { id: turn.id, text: turn.text, pictures: turn.materialIds.length, checklist, questions, changes, undone, issued,
     status: turn.status, reply: changes.length && end?.text === '草稿已更新。' ? '' : end?.text ?? '',
     elapsed: end?.elapsedMs === undefined ? '' : `用时 ${Math.max(1, Math.round(end.elapsedMs / 1000))} 秒`,
-    canAnswer, hasPendingQuestions, showDraftSummary, showDraftActions, showStandaloneUndo, showPostDeliveryLink,
+    canAnswer, hasPendingQuestions, showDraftSummary, showDraftActions, showStandaloneUndo, showDeliveryFooter, allDelivered,
     canRetry: last && (turn.status === 'failed' || turn.status === 'interrupted'),
     canUndo,
     preview: preview ? { ...tripView(preview), id: preview.previewId,
@@ -93,7 +94,10 @@ function view(turn: AgentTurn, revision: number, confirmed: boolean, last: boole
 }
 
 function deliverySummaryView(progress: DeliveryProgress) {
-  return { label: `本趟送货 · ${progress.shops.filter(shop => shop.locked).length}/${progress.shops.length} 家已送达`,
+  const unfinished = progress.shops.filter(shop => !shop.locked).map(shop => shop.customer);
+  const allDelivered = progress.shops.length > 0 && unfinished.length === 0;
+  return { label: `本趟送货 · ${progress.shops.length - unfinished.length}/${progress.shops.length} 家已送达`,
+    unfinished, allDelivered,
     shops: progress.shops.map(shop => ({ ...shop, description: `${shop.locked ? '已锁定应收' : '预计应收'} ¥${money(shop.totalCents)}` +
       (shop.pendingPrices ? ` · ${shop.pendingPrices} 项待补价` : '') })) };
 }
@@ -468,6 +472,41 @@ Page({
   showPickingList() {
     this.card('picking');
     wx.switchTab({ url: '/pages/trip-picking/index' });
+  },
+
+  nextTrip(): Promise<void> | undefined {
+    const draft = this.draft;
+    if (!draft || !this.data.confirmed || !agentSession.token || this.data.busy || this.data.polling) return;
+    const unfinished = this.data.deliverySummary?.unfinished ?? [];
+    if (unfinished.length && typeof wx.showModal === 'function') {
+      const token = agentSession.token;
+      const draftId = draft.id;
+      wx.showModal({
+        title: '开始下一趟',
+        content: `还有 ${unfinished.length} 家没确认送达：${unfinished.join('、')}。原单仍可在「历史」查看，确定开始下一趟吗？`,
+        confirmText: '开始下一趟',
+        success: ({ confirm }) => {
+          if (confirm && token === agentSession.token && this.draft?.id === draftId) void this.startNextTrip(draftId);
+        },
+      });
+      return;
+    }
+    return this.startNextTrip(draft.id);
+  },
+
+  startNextTrip(draftId: string): Promise<void> | undefined {
+    this.card('next');
+    return this.run(async () => {
+      try {
+        await this.request('/trips/next-draft', { draftId });
+        await this.reload();
+      } catch (error) {
+        if (error instanceof WorkspaceError && ['draft_open', 'draft_changed', 'draft_not_found'].includes(error.code)) {
+          await this.reload();
+        }
+        throw error;
+      }
+    });
   },
 
   openImageMenu(): void {

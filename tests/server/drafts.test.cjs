@@ -2286,7 +2286,7 @@ for (const scenario of [...a1.cases, ...newCases]) {
     const liveIntent = a1Live ? configuredIntentModel(process.env, 'A') : null;
     if (a1Live) assert.ok(liveModel && liveIntent, '请配置 DISPATCH_TEXT_MODEL_KEY');
     for (let sample = 1; sample <= (a1Live ? 3 : 1); sample++) {
-      await t.test(`sample ${sample}`, async sampleTest => {
+      await t.test(`A1 Harness: ${scenario.id} #${sample}`, async sampleTest => {
         const db = await isolatedDatabase(sampleTest);
         let action;
         let expectedIntent;
@@ -3211,16 +3211,21 @@ async function seedMemoryScenario(api, db, token, scenario) {
   return parties;
 }
 
-function checkMemoryTurn(result, after, memory, turn, parties) {
+function checkMemoryTurn(result, after, memory, turn, parties, live = false) {
   const expected = turn.expect;
   const links = result.events.find(event => event.kind === 'customer_links')?.payload.links ?? [];
-  assert.equal(links.length, expected.links.length, `关联数不符：${JSON.stringify(links)}`);
-  for (const target of expected.links) {
-    const link = links.find(candidate => candidate.customerId === parties.get(target.canonicalName));
-    assert.ok(link, `未关联到 ${target.canonicalName}：${JSON.stringify(links)}`);
-    assert.equal(link.canonicalName, target.canonicalName);
-    assert.equal(link.matchedBy, target.matchedBy);
-    assert.equal(Boolean(link.merged), Boolean(target.merged));
+  // 真实模型可以直接按正式店名写进草稿已有客户单，此时没有新的 customer_links；
+  // 固定模式仍强制走 linkCustomers 合并，保证服务端合并逻辑持续受测。
+  const directExisting = Boolean(live && expected.allowDirectExistingCustomer && links.length === 0);
+  if (!directExisting) {
+    assert.equal(links.length, expected.links.length, `关联数不符：${JSON.stringify(links)}`);
+    for (const target of expected.links) {
+      const link = links.find(candidate => candidate.customerId === parties.get(target.canonicalName));
+      assert.ok(link, `未关联到 ${target.canonicalName}：${JSON.stringify(links)}`);
+      assert.equal(link.canonicalName, target.canonicalName);
+      assert.equal(link.matchedBy, target.matchedBy);
+      assert.equal(Boolean(link.merged), Boolean(target.merged));
+    }
   }
 
   const customers = after.customers.map(customer => ({
@@ -3268,7 +3273,7 @@ function checkMemoryTurn(result, after, memory, turn, parties) {
 
   if (expected.change) {
     const changed = result.events.filter(event => event.kind === 'change').flatMap(event => event.payload.lines).join(' ');
-    assert.match(changed, expected.change);
+    assert.match(changed, directExisting ? /新增 1 行/ : expected.change);
   }
 }
 
@@ -3344,6 +3349,14 @@ test('A3 Harness: 全量记忆场景', { timeout: 1_800_000 }, async t => {
                     detail: { spoken: link.spoken, canonicalName: link.canonicalName, customerId: link.customerId } });
                 }
               }
+              // 任何静默绑定都必须落在本场景预设熟客上，防止模型幻觉出的客户编号被并入草稿。
+              const presetParties = new Set(parties.values());
+              for (const customer of after.customers) {
+                if (typeof customer.partyId === 'string' && !presetParties.has(customer.partyId)) {
+                  redLines.push({ scenario: scenario.id, sample, text: turn.text, kind: 'wrong_customer',
+                    detail: { customer: customer.customer, partyId: customer.partyId } });
+                }
+              }
               const spokenPrices = (turn.spokenPrices ?? []).map(Number);
               for (const item of after.customers.flatMap(customer => customer.items)) {
                 const price = a3Price(item);
@@ -3353,7 +3366,7 @@ test('A3 Harness: 全量记忆场景', { timeout: 1_800_000 }, async t => {
                 }
               }
 
-              checkMemoryTurn(result, after, memoryResponse.data, turn, parties);
+              checkMemoryTurn(result, after, memoryResponse.data, turn, parties, a3Live);
               row.after = after.customers.map(customer => ({
                 name: customer.customer,
                 partyId: customer.partyId ?? null,
@@ -3394,7 +3407,8 @@ test('A3 Harness: 全量记忆场景', { timeout: 1_800_000 }, async t => {
     redLineDetails: redLines,
     medianMs: a3Median(rows.map(row => row.elapsedMs)),
     medianCalls: a3Median(rows.map(row => row.calls)),
-    failures: rows.filter(row => !row.ok).map(({ scenario, sample, text, reason }) => ({ scenario, sample, text, reason })),
+    failures: rows.filter(row => !row.ok).map(({ scenario, sample, text, reason, models }) => ({ scenario, sample, text, reason,
+      toolCalls: (models ?? []).flatMap(model => model.toolCalls ?? []) })),
   };
   t.diagnostic(`A3 SUMMARY ${JSON.stringify(summary)}`);
   assert.equal(trials.length, a3.cases.length * (a3Live ? 3 : 1));

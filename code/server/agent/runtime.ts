@@ -14,7 +14,7 @@ import type { ModelTrace } from '../text-model';
 import { isPlaceholder, normalized, readImageOrder, readable, targetRows, TextOrders } from '../text-orders';
 import { TripStore } from '../trips';
 import { invalidTool, prepareEdits, PreviousQuestions } from './edit';
-import { AgentMessage, AgentModel, AgentModelTrace, agentPrompt, agentPromptVersion, otherPrompt } from './model';
+import { AgentMessage, AgentModel, AgentModelTrace, AgentReply, agentPrompt, agentPromptVersion, otherPrompt, summarizeToolCalls } from './model';
 import { AgentStore, checkDraft, event, Input, saveChange, TurnKey } from './store';
 import type { Intent, IntentModel } from './intent';
 import { runDelivery } from './delivery';
@@ -414,13 +414,19 @@ export class AgentRuntime {
   private async complete(run: Run, prompt: string, input: object, allowed: readonly string[]) {
     const started = Date.now();
     let trace: AgentModelTrace | undefined;
+    let reply: AgentReply | undefined;
     try {
       if (!this.model) throw new HttpError(503, 'agent_model_unavailable', '助手暂未开启，可以手动填写。');
       const messages: AgentMessage[] = [{ role: 'system', content: prompt },
         { role: 'user', content: JSON.stringify(input) }];
-      return await withDeadline(this.model(messages, run.signal, value => { trace = value; }, allowed), run.signal);
+      reply = await withDeadline(this.model(messages, run.signal, value => { trace = value; }, allowed), run.signal);
+      return reply;
     } finally {
-      await this.recordModel(run, started, trace, { phase: allowed.length ? 'edit' : 'other' });
+      // 测试桩和部分模型实现不会回填 trace，这里用回复里的原始工具调用补齐内部记录。
+      const toolCalls = trace?.toolCalls?.length ? trace.toolCalls
+        : reply?.tool_calls?.length ? summarizeToolCalls(reply.tool_calls) : undefined;
+      await this.recordModel(run, started, trace, { phase: allowed.length ? 'edit' : 'other',
+        ...(toolCalls ? { toolCalls } : {}) });
     }
   }
 

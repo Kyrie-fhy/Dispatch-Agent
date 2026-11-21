@@ -133,6 +133,7 @@ const cases = [
       text: '老王再加一箱春卷',
       fixture: edit(add('老王', '春卷', '1')),
       expect: {
+        allowDirectExistingCustomer: true,
         links: [{ spoken: '老王', canonicalName: '王记餐饮', matchedBy: 'alias', merged: true }],
         customers: [{
           name: '王记餐饮', party: 'linked',

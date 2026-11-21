@@ -59,9 +59,38 @@ function quantityQuestion(row: ReturnType<typeof targetRows>[number], quantity: 
   }] };
 }
 
+const unionKeys = ['customerNumber', 'partyNumber', 'partyId'] as const;
+
+function normalizeAddFill(op: Record<string, unknown>, draft: TripDraft): Record<string, unknown> {
+  const normalizedOp = { ...op };
+  if (normalizedOp.action === 'add') {
+    // add 只按客户名称归属；行号 target 与选择客户用的联合键对新增没有意义。
+    delete normalizedOp.target;
+    const spoken = typeof normalizedOp.customer === 'string' ? normalizedOp.customer.trim() : '';
+    const number = normalizedOp.customerNumber;
+    if (!spoken && Number.isSafeInteger(number) && Number(number) > 0) {
+      // 数字序号只还原成草稿里已有的称呼，真正的归属仍交给认人和合并流程复核，
+      // 不能凭模型给出的序号把新名字直接塞进某位熟客。
+      const row = draft.customers[Number(number) - 1];
+      if (row?.customer.trim()) normalizedOp.customer = row.customer.trim();
+    }
+  }
+  for (const key of unionKeys) delete normalizedOp[key];
+  for (const field of textFields) {
+    if (normalizedOp[field] === null) delete normalizedOp[field];
+  }
+  for (const field of ['quantity', 'price'] as const) {
+    const value = normalizedOp[field];
+    if (typeof value === 'number' && Number.isFinite(value)) normalizedOp[field] = String(value);
+  }
+  return normalizedOp;
+}
+
 export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[], source: string, previous?: PreviousQuestions, confirmed = false) {
   if (!isObject(value) || !Array.isArray(value.operations) || !value.operations.length || value.operations.length > 24) invalidTool();
-  const edits = value.operations.filter((op: unknown) => isObject(op) && (op.action === 'add' || op.action === 'fill'));
+  const operations = value.operations.map((op: unknown) => isObject(op) && (op.action === 'add' || op.action === 'fill')
+    ? normalizeAddFill(op, draft) : op);
+  const edits = operations.filter((op: unknown) => isObject(op) && (op.action === 'add' || op.action === 'fill'));
   const next = structuredClone(draft);
   const initial = targetRows(draft);
   const actualRows = initial.filter(entry => !isPlaceholder(entry.item));
@@ -113,7 +142,7 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
     next.customers = merged.draft.customers;
   }
 
-  for (const op of value.operations as unknown[]) {
+  for (const op of operations as unknown[]) {
     if (!isObject(op)) invalidTool();
     if (op.action === 'add' || op.action === 'fill') continue;
     if (op.action === 'set_customer') {

@@ -343,8 +343,11 @@ export class AgentRuntime {
             links.push({ draftCustomerId: sibling ? sibling.id : customer.id, spoken, customerId: mention.customerId,
               canonicalName: mention.canonicalName, matchedBy: mention.matchedBy, merged: Boolean(sibling) });
           } else if (customer.partyId === null) {
-            delete customer.partyId;
-            lines.push(`${spoken}：待选店`);
+            // 回合开始前就是 null 的，是配送员亲手选的「新建客户」；改名后不要退回待选店。
+            if (before.get(customer.id)?.partyId !== null) {
+              delete customer.partyId;
+              lines.push(`${spoken}：待选店`);
+            }
           }
         }
         if (!lines.length) return { changed: false as const };

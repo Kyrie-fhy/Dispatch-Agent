@@ -2904,6 +2904,33 @@ test('A3 does not re-link a customer after the courier says it is not him', { ti
   assert.equal(after.customers[0].items[0].quantity, '3');
 });
 
+test('A3 keeps an explicitly new customer new when the turn fills its name', { timeout: 30_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const model = async messages => {
+    const { text } = JSON.parse(messages[1].content);
+    assert.equal(text, '阿强饭店一箱汤圆');
+    return makeToolReply(a1.edit({ action: 'fill', target: 1, customer: '阿强饭店' }));
+  };
+  const api = await start(db, undefined, undefined, undefined, undefined, model);
+  const token = await login(api, 'a');
+  await seedParty(api, token, '王记餐饮');
+
+  // 配送员已选择「新建客户」；随后清空名称，再由助手回合补上店名。
+  const pending = await putCustomers(api, token, await read(api, token), randomUUID(), [{
+    id: 'new-shop', customer: '', partyId: null, items: [line('new-line', '安井', '箱', '1', '20')],
+  }]);
+  assert.equal(pending.customers[0].partyId, null);
+  const submitted = await agentPost(api, token, 'turns', agentInput(pending, '阿强饭店一箱汤圆'));
+  assert.equal(submitted.status, 202);
+  const turn = await waitForAgent(api, token, submitted.data.turnId);
+  assert.equal(turn.status, 'completed');
+  assert.equal(turn.events.some(event => event.kind === 'questions'), false);
+  assert.equal(turn.events.some(event => event.kind === 'customer_links'), false);
+  const after = await read(api, token);
+  assert.equal(after.customers[0].customer, '阿强饭店');
+  assert.equal(after.customers[0].partyId, null);
+});
+
 test('A3 treats a new name as a new customer when the account has no known customers', { timeout: 30_000 }, async t => {
   const db = await isolatedDatabase(t);
   const model = agentFixture({ '阿强一箱汤圆': a1.edit(a1.add('阿强', '汤圆', '1')) });

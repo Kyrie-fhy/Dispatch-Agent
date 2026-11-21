@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { Pool, type PoolClient } from 'pg';
 import type { CustomerLink, PlanStep, Question, StepState } from '../../miniprogram/core/agent';
 import { isObject, nullablePrice } from '../../miniprogram/core/orders';
-import { resolveCustomerMention } from '../../miniprogram/core/memory';
+import { resolveCustomerMention, type CustomerDirectory } from '../../miniprogram/core/memory';
 import { spokenNumbers } from '../../miniprogram/core/spoken-numbers';
 import { textOrderQuestions } from '../../miniprogram/core/text-order';
 import { previewTrip, resolveCustomerChoices, type TripDraft } from '../../miniprogram/core/trips';
@@ -14,7 +14,7 @@ import type { ModelTrace } from '../text-model';
 import { isPlaceholder, normalized, readImageOrder, readable, targetRows, TextOrders } from '../text-orders';
 import { TripStore } from '../trips';
 import { invalidTool, prepareEdits, PreviousQuestions } from './edit';
-import { AgentMessage, AgentModel, AgentModelTrace, agentPrompt, agentPromptVersion, otherPrompt } from './model';
+import { AgentMessage, AgentModel, AgentModelTrace, AgentReply, agentPrompt, agentPromptVersion, otherPrompt, summarizeToolCalls } from './model';
 import { AgentStore, checkDraft, event, Input, saveChange, TurnKey } from './store';
 import type { Intent, IntentModel } from './intent';
 import { runDelivery } from './delivery';
@@ -309,7 +309,8 @@ export class AgentRuntime {
     }
   }
 
-  private async linkCustomers(client: PoolClient, account: string, draft: TripDraft, start: TripDraft) {
+  private async linkCustomers(client: PoolClient, account: string, draft: TripDraft, start: TripDraft,
+    directory?: CustomerDirectory) {
     const before = new Map(start.customers.map(customer => [customer.id, customer]));
     const changed = draft.customers.filter(customer => {
       const original = before.get(customer.id);
@@ -319,10 +320,10 @@ export class AgentRuntime {
     const lines: string[] = [];
     const links: CustomerLink[] = [];
     if (!changed.length) return { lines, links };
-    const directory = await readDirectory(client, account);
+    const resolved = directory ?? await readDirectory(client, account);
     for (const customer of changed) {
       const spoken = customer.customer.trim();
-      const mention = resolveCustomerMention(directory, spoken);
+      const mention = resolveCustomerMention(resolved, spoken);
       if (mention.status !== 'resolved') {
         lines.push(`${spoken}：待选店`);
         continue;
@@ -414,13 +415,19 @@ export class AgentRuntime {
   private async complete(run: Run, prompt: string, input: object, allowed: readonly string[]) {
     const started = Date.now();
     let trace: AgentModelTrace | undefined;
+    let reply: AgentReply | undefined;
     try {
       if (!this.model) throw new HttpError(503, 'agent_model_unavailable', '助手暂未开启，可以手动填写。');
       const messages: AgentMessage[] = [{ role: 'system', content: prompt },
         { role: 'user', content: JSON.stringify(input) }];
-      return await withDeadline(this.model(messages, run.signal, value => { trace = value; }, allowed), run.signal);
+      reply = await withDeadline(this.model(messages, run.signal, value => { trace = value; }, allowed), run.signal);
+      return reply;
     } finally {
-      await this.recordModel(run, started, trace, { phase: allowed.length ? 'edit' : 'other' });
+      // 测试桩和部分模型实现不会回填 trace，这里用回复里的原始工具调用补齐内部记录。
+      const toolCalls = trace?.toolCalls?.length ? trace.toolCalls
+        : reply?.tool_calls?.length ? summarizeToolCalls(reply.tool_calls) : undefined;
+      await this.recordModel(run, started, trace, { phase: allowed.length ? 'edit' : 'other',
+        ...(toolCalls ? { toolCalls } : {}) });
     }
   }
 
@@ -519,10 +526,11 @@ export class AgentRuntime {
           signal.throwIfAborted();
           checkDraft(workspace, draftId, run.revision, true);
           const before = workspaceDraft(workspace);
-          const parties = await readParties(client, account);
-          const prepared = prepareEdits(before, args, parties, String(args.source), run.previous, args.confirmed === true);
+          const directory = await readDirectory(client, account);
+          const prepared = prepareEdits(before, args, [...directory.customers], String(args.source), run.previous,
+            args.confirmed === true, directory);
           if (!('draft' in prepared) || !prepared.draft) return prepared;
-          const linked = await this.linkCustomers(client, account, prepared.draft, before);
+          const linked = await this.linkCustomers(client, account, prepared.draft, before, directory);
           const { draft } = readSaveDraft(draftId, { ...prepared.draft, revision: run.revision, requestId });
           const revision = run.revision + 1;
           const lines = [...prepared.lines!, ...linked.lines];

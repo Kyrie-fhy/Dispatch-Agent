@@ -1,5 +1,6 @@
 import { AgentRuntime } from './agent/runtime';
 import { AgentModel, configuredAgentModel } from './agent/model';
+import { configuredAdminToken, handleAdmin } from './admin';
 import { configuredIntentModel, IntentModel } from './agent/intent';
 import { configuredDeliveryModel, DeliveryModel } from './agent/delivery-model';
 import { missingDraft, readAccount, readWorkspace } from './account-workspace';
@@ -71,11 +72,12 @@ function resourceId(path: string, collection: 'drafts' | 'trips'): string | null
 
 async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery: DeliveryStore, ledger: LedgerStore, amendments: AmendmentStore,
   materials: MaterialStore, textOrders: TextOrders, agent: AgentRuntime, memory: MemoryStore, request: IncomingMessage, response: ServerResponse,
-  wechat?: WechatLogin, speechModel?: SpeechModel): Promise<void> {
+  wechat?: WechatLogin, speechModel?: SpeechModel, adminToken?: string): Promise<void> {
   const host = request.headers.host ?? '';
   if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host)) {
     throw new HttpError(400, 'invalid_host', '请通过本机地址访问草稿服务');
   }
+  if (await handleAdmin(pool, adminToken, request, response)) return;
   const method = request.method;
   const path = request.url?.split('?')[0] ?? '';
 
@@ -338,7 +340,8 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
 }
 
 export async function startLocalServer(pool: Pool, port: number, wechat?: WechatLogin, textModel?: TextModel,
-  imageModel?: ImageModel, speechModel?: SpeechModel, agentModel?: AgentModel, intentModel?: IntentModel, deliveryModel?: DeliveryModel): Promise<Server> {
+  imageModel?: ImageModel, speechModel?: SpeechModel, agentModel?: AgentModel, intentModel?: IntentModel, deliveryModel?: DeliveryModel,
+  adminToken?: string): Promise<Server> {
   await requireApplicationRole(pool);
   const store = new DraftStore(pool);
   const trips = new TripStore(pool);
@@ -351,7 +354,8 @@ export async function startLocalServer(pool: Pool, port: number, wechat?: Wechat
   const agent = new AgentRuntime(pool, trips, textOrders, agentModel, intentModel, deliveryModel);
   await agent.store.interrupt();
   const server = createServer({ requestTimeout: 15_000 }, (request, response) => {
-    void handle(pool, store, trips, delivery, ledger, amendments, materials, textOrders, agent, memory, request, response, wechat, speechModel).catch(error => {
+    void handle(pool, store, trips, delivery, ledger, amendments, materials, textOrders, agent, memory, request, response,
+      wechat, speechModel, adminToken).catch(error => {
       if (response.destroyed) return;
       if (error instanceof HttpError) {
         sendJson(response, error.status, { error: error.code, message: error.message });
@@ -377,12 +381,13 @@ async function main(): Promise<void> {
   const trial = trialMode();
   const wechat = configuredWechatLogin(process.env);
   if (trial && !wechat) throw new Error('试用环境必须配置微信登录');
+  const adminToken = configuredAdminToken(process.env);
   const pool = new Pool(databaseOptions('DISPATCH_DB_URL'));
   pool.on('error', () => console.error('PostgreSQL 空闲连接已断开，后续请求会重新连接'));
   try {
     const server = await startLocalServer(pool, port, wechat, configuredTextModel(process.env),
       configuredImageModel(process.env), configuredSpeechModel(process.env), configuredAgentModel(process.env),
-      configuredIntentModel(process.env, 'A'), configuredDeliveryModel(process.env));
+      configuredIntentModel(process.env, 'A'), configuredDeliveryModel(process.env), adminToken);
     const stop = () => {
       server.close(() => { void pool.end(); });
       server.closeIdleConnections();

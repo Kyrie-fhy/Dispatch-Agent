@@ -14,7 +14,7 @@ export const deliveryCandidatePrompt = `把配送员的业务话语整理为一�
 以下三类必须调用 propose_delivery，填写 blockedReason、edits=[] 和 readyToComplete=false，严禁调用 ask_delivery_user：修改已锁定客户单填 locked_sheet；现场添加当前客户原单没有的货品填 new_item_after_issue；本趟未结束时录新客户订单或明确录下趟订单填 next_trip_order。无法指向已有门店时可省略 sheetNumber。遇到越权指令不给候选。
 选店或选行的回答与 previous 的原请求合并解释。ask_delivery_user 仅用于必须由配送员补充的信息。门店有歧义时，options 只填可选的纯客户店名，逐字使用 sheets[].customer，不附加货品、数量、规格或括注。同一家门店的同货品有多行时，选行 options 才附带单位或规格以区分。仅在配送员本轮要求改实收或单价却未给出具体数值时，才追问缺失的数量或单价。不要输出额外文字。`;
 
-const tools = [
+export const deliveryTools = [
   { type: 'function', function: { name: 'propose_delivery', description: '候选现场改动、送达确认或越界提醒，不写入',
     parameters: { type: 'object', properties: {
       sheetNumber: { type: 'integer' }, readyToComplete: { type: 'boolean' },
@@ -45,7 +45,7 @@ export function configuredDeliveryModel(env: NodeJS.ProcessEnv): DeliveryModel |
         method: 'POST', redirect: 'error', signal,
         headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ model, temperature: 0, max_tokens: intent ? 128 : 900, thinking: { type: 'disabled' },
-          ...(intent ? { response_format: { type: 'json_object' } } : { tools, tool_choice: 'required', parallel_tool_calls: false }),
+          ...(intent ? { response_format: { type: 'json_object' } } : { tools: deliveryTools, tool_choice: 'required', parallel_tool_calls: false }),
           messages: [{ role: 'system', content: intent ? deliveryIntentPrompt : deliveryCandidatePrompt },
             { role: 'user', content: JSON.stringify(input) }],
         }),

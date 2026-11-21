@@ -4,6 +4,7 @@ import {
   HistoricalSheet, lookupHistoricalPrice, normalizeMemoryText, ProductMention, resolveCustomerMention,
   suggestDraftCustomerMentions, suggestDraftPrices,
 } from '../miniprogram/core/memory';
+import { isObject, money } from '../miniprogram/core/orders';
 import { missingDraft, readAccount, readParties, readWorkspace, workspaceDraft, writeAccount } from './account-workspace';
 import { checkDraft } from './agent/store';
 import { readSaveDraft } from './draft-input';
@@ -38,6 +39,12 @@ type ParsedCustomerChoice = {
   remember?: boolean;
   spoken?: string;
 };
+type ParsedPriceAdoptLine = {
+  draftCustomerId: string;
+  lineId: string;
+  unitPriceCents: number;
+  variant?: { brand: string; spec: string };
+};
 
 function invalidCustomerChoice() {
   return new HttpError(400, 'invalid_customer_choice', '请选择有效的客户处理方式');
@@ -59,6 +66,46 @@ function readCustomerChoice(value: unknown): ParsedCustomerChoice {
   }
   if (body.choice === 'new') return { ...basis, draftCustomerId, choice: 'new' };
   throw invalidCustomerChoice();
+}
+
+function invalidPriceAdopt() {
+  return new HttpError(400, 'invalid_price_adopt', '请选择有效的沿用价格');
+}
+
+function priceSuggestionChanged() {
+  return new HttpError(409, 'price_suggestion_changed', '这一行的上次价有变化，请刷新后再选。');
+}
+
+function priceNotSuggested() {
+  return new HttpError(409, 'price_not_suggested', '这个价格不在历史成交价里，请刷新后再选。');
+}
+
+function readPriceAdoptInput(value: unknown) {
+  const basis = readPreviewInput(value);
+  const linesInput = (value as Record<string, unknown>).lines;
+  if (!Array.isArray(linesInput) || linesInput.length < 1 || linesInput.length > 64) throw invalidPriceAdopt();
+  const seen = new Set<string>();
+  const lines = linesInput.map(raw => {
+    if (!isObject(raw)) throw invalidPriceAdopt();
+    const { draftCustomerId, lineId, unitPriceCents, variant } = raw;
+    if (!validSheetKey(draftCustomerId) || !validSheetKey(lineId)) throw invalidPriceAdopt();
+    if (typeof unitPriceCents !== 'number' || !Number.isSafeInteger(unitPriceCents) || unitPriceCents <= 0) {
+      throw invalidPriceAdopt();
+    }
+    const key = `${draftCustomerId}\u0000${lineId}`;
+    if (seen.has(key)) throw invalidPriceAdopt();
+    seen.add(key);
+    if (variant === undefined) return { draftCustomerId, lineId, unitPriceCents };
+    if (!isObject(variant) || typeof variant.brand !== 'string' || typeof variant.spec !== 'string'
+      || variant.brand.length > 200 || variant.spec.length > 200) throw invalidPriceAdopt();
+    return { draftCustomerId, lineId, unitPriceCents, variant: { brand: variant.brand, spec: variant.spec } };
+  });
+  return { ...basis, lines } as { requestId: string; draftId: string; revision: number; lines: ParsedPriceAdoptLine[] };
+}
+
+function fillEmptyVariant(item: { brand: string; specification: string }, brand: string, spec: string) {
+  if (!item.brand.trim() && brand.trim()) item.brand = brand.trim();
+  if (!item.specification.trim() && spec.trim()) item.specification = spec.trim();
 }
 
 function readAliasCommand(value: unknown) {
@@ -285,6 +332,55 @@ export class MemoryStore {
         VALUES ($1, $2, 'card', $3)`, [accountId, draftId,
         JSON.stringify({ action: 'customer-choice', choice, remembered })]);
       return { revision: nextRevision, remembered, ...(rememberIssue ? { rememberIssue } : {}) };
+    });
+  }
+
+  async adoptDraftPrices(accountId: string, value: unknown): Promise<{ revision: number; adopted: number }> {
+    const { requestId, draftId, revision, lines } = readPriceAdoptInput(value);
+    const command = { action: 'agent-price-adopt', draftId, revision, lines };
+    return writeAccount(this.pool, accountId, requestId, command, async (client, workspace) => {
+      checkDraft(workspace, draftId, revision, true);
+      const running = await client.query(
+        "SELECT 1 FROM dispatch.agent_turns WHERE account_id = $1 AND status = 'running'", [accountId]);
+      if (running.rowCount) throw new HttpError(429, 'agent_busy', '助手正在处理上一条消息，请稍后再选。');
+      const draft = workspaceDraft(workspace);
+      const suggestions = await suggestPrices(client, accountId, draftCustomersForPriceSuggestions(draft.customers));
+      const byLine = new Map(suggestions.map(suggestion =>
+        [`${suggestion.draftCustomerId}\u0000${suggestion.lineId}`, suggestion]));
+      for (const line of lines) {
+        const suggestion = byLine.get(`${line.draftCustomerId}\u0000${line.lineId}`);
+        if (!suggestion || suggestion.status === 'unresolved_customer') throw priceSuggestionChanged();
+        const customer = draft.customers.find(entry => entry.id === line.draftCustomerId);
+        const item = customer?.items.find(entry => entry.id === line.lineId);
+        if (!item) throw priceSuggestionChanged();
+        if (suggestion.status === 'exact_match' || suggestion.status === 'unique_variant_match') {
+          const accepted = suggestion.unitPriceCents === line.unitPriceCents
+            || suggestion.previousDistinctPrice?.unitPriceCents === line.unitPriceCents;
+          if (!accepted || line.variant) throw priceNotSuggested();
+          item.price = money(line.unitPriceCents);
+          if (suggestion.status === 'unique_variant_match') {
+            fillEmptyVariant(item, suggestion.brand, suggestion.spec);
+          }
+        } else if (suggestion.status === 'ambiguous_variants') {
+          const variant = line.variant;
+          const match = variant && suggestion.candidates.find(candidate =>
+            candidate.brand === variant.brand && candidate.spec === variant.spec
+            && candidate.unitPriceCents === line.unitPriceCents);
+          if (!match) throw priceNotSuggested();
+          item.price = money(line.unitPriceCents);
+          fillEmptyVariant(item, match.brand, match.spec);
+        } else {
+          throw priceNotSuggested();
+        }
+      }
+      const { draft: saved } = readSaveDraft(draftId, { ...draft, revision, requestId });
+      const nextRevision = revision + 1;
+      await client.query('UPDATE dispatch.workspaces SET draft_revision = $2, draft_customers = $3 WHERE account_id = $1',
+        [accountId, nextRevision, JSON.stringify(saved.customers)]);
+      await client.query(`INSERT INTO dispatch.agent_events (account_id, draft_id, kind, payload)
+        VALUES ($1, $2, 'card', $3)`, [accountId, draftId,
+        JSON.stringify({ action: 'price-adopt', count: lines.length })]);
+      return { revision: nextRevision, adopted: lines.length };
     });
   }
 

@@ -78,6 +78,19 @@ page {
 }
 .pending-price { color: var(--warning); font-weight: 500; }
 
+.draft-adopt {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16rpx;
+  padding: 0 20rpx 12rpx;
+}
+.draft-adopt .draft-adopt-all { flex: none; min-width: 200rpx; }
+.price-hint { display: flex; flex-direction: column; gap: 10rpx; padding-bottom: 10rpx; }
+.price-options { display: flex; flex-wrap: wrap; gap: 12rpx; }
+.price-option { flex: 0 0 auto; min-width: 160rpx; padding: 10rpx 20rpx; }
+.preview-hint { display: block; padding-bottom: 8rpx; }
+
 .card-actions { display: flex; flex-wrap: wrap; gap: 16rpx; margin-top: 20rpx; }
 .card-btn-primary, .card-btn-secondary, .card-btn-ghost, .option-btn {
   display: flex;

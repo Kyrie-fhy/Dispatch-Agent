@@ -1036,3 +1036,170 @@ test('A3-2 choice and alias controls avoid mini buttons and keep the alias card 
   assert.ok(profileWxml.includes('记住的叫法'));
   assert.ok(agentWxml.includes('!choices.length'));
 });
+
+function priceMemory(draft, prices) {
+  return { draftId: draft.id, revision: draft.revision, confirmed: false, customers: [], mentions: [], prices };
+}
+
+function pricedDraft() {
+  const draft = order();
+  Object.assign(draft.customers[0], { customer: '王记餐饮', partyId: 'party-1' });
+  const base = draft.customers[0].items[0];
+  draft.customers[0].items = [
+    { ...base, id: 'line-a', product: '水饺', price: null },
+    { ...base, id: 'line-b', product: '馄饨', price: null },
+    { ...base, id: 'line-c', product: '汤圆', price: null },
+  ];
+  return draft;
+}
+
+test('A3-2 price hints show latest, earlier and variant prices and only tapped suggestions are adopted', async t => {
+  const wxml = fs.readFileSync(require.resolve('../code/dist/pages/agent/index.wxml'), 'utf8');
+  assert.ok(wxml.includes('全部沿用'));
+  assert.ok(wxml.includes('沿用上次价并重新预览'));
+  const draft = pricedDraft();
+  const customerId = draft.customers[0].id;
+  const prices = [
+    { draftCustomerId: customerId, lineId: 'line-a', customerId: 'party-1', status: 'exact_match',
+      unitPriceCents: 8200, issuedAt: '2026-11-18T12:00:00.000Z', previousDistinctPrice: null },
+    { draftCustomerId: customerId, lineId: 'line-b', customerId: 'party-1', status: 'exact_match',
+      unitPriceCents: 7800, issuedAt: '2026-11-17T12:00:00.000Z',
+      previousDistinctPrice: { unitPriceCents: 8000, issuedAt: '2026-10-30T12:00:00.000Z', tripId: 't-old', sheetId: 's-old' } },
+    { draftCustomerId: customerId, lineId: 'line-c', customerId: 'party-1', status: 'ambiguous_variants',
+      candidates: [
+        { unitPriceCents: 9000, issuedAt: '2026-11-16T12:00:00.000Z', tripId: 't-1', sheetId: 's-1', brand: '甲牌', spec: '500g' },
+        { unitPriceCents: 9500, issuedAt: '2026-11-15T12:00:00.000Z', tripId: 't-2', sheetId: 's-2', brand: '乙牌', spec: '1kg' },
+      ] },
+  ];
+  const { page, event, handle, setTurns } = setup(t, draft);
+  const posts = [];
+  handle(request => {
+    if (request.path === '/agent/memory') { request.ok(priceMemory(draft, prices)); return true; }
+    if (request.path === '/agent/price-adopt') {
+      posts.push(request.data);
+      request.ok({ revision: draft.revision + 1, adopted: request.data.lines.length });
+      return true;
+    }
+    return false;
+  });
+  setTurns([{ id: 'turn-priced', text: '王记餐饮两箱水饺', materialIds: [], revision: draft.revision, status: 'completed',
+    events: [event('change', { lines: ['王记餐饮 水饺 +2 箱'] }),
+      event('end', { status: 'completed', text: '草稿已更新。', revision: draft.revision })] }]);
+  await page.onShow();
+  await page.login();
+  assert.equal(posts.length, 0, '页面加载不得自动沿用');
+  assert.equal(page.data.adoptableCount, 2);
+  assert.match(page.data.priceHints['line-a'].text, /上次 ¥82\.00（11-18）/);
+  assert.match(page.data.priceHints['line-b'].text, /更早 ¥80\.00（10-30）/);
+  assert.equal(page.data.priceHints['line-c'].text, '上次买过几种，选一种');
+  assert.equal(page.data.priceHints['line-c'].options[0].text, '甲牌 500g ¥90.00');
+  assert.deepEqual(page.data.priceHints['line-a'].options, [{ cents: 8200, text: '沿用' }]);
+  assert.equal(page.data.priceHints['line-b'].options[1].cents, 8000);
+
+  await page.adoptPrice(tap({ line: 'line-a', customer: customerId, cents: 8200 }));
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].lines.length, 1);
+  assert.equal(posts[0].lines[0].unitPriceCents, 8200);
+  assert.ok(Number.isInteger(posts[0].lines[0].unitPriceCents));
+  assert.equal(posts[0].lines[0].draftCustomerId, customerId);
+  assert.equal(posts[0].lines[0].lineId, 'line-a');
+  assert.equal(posts[0].draftId, draft.id);
+  assert.equal(posts[0].revision, draft.revision);
+  assert.ok(posts[0].requestId);
+
+  await page.adoptPrice(tap({ line: 'line-b', customer: customerId, cents: 8000 }));
+  assert.equal(posts.at(-1).lines[0].unitPriceCents, 8000);
+  assert.equal(posts.at(-1).lines[0].variant, undefined);
+
+  await page.adoptPrice(tap({ line: 'line-c', customer: customerId, cents: 9500, brand: '乙牌', spec: '1kg' }));
+  assert.deepEqual(posts.at(-1).lines[0].variant, { brand: '乙牌', spec: '1kg' });
+
+  await page.adoptAll();
+  assert.deepEqual(posts.at(-1).lines.map(line => [line.lineId, line.unitPriceCents]),
+    [['line-a', 8200], ['line-b', 7800]]);
+  assert.equal(posts.at(-1).lines.some(line => line.lineId === 'line-c'), false);
+});
+
+test('A3-2 adopt-all-and-preview writes before requesting a preview and stays quiet on failure', async t => {
+  const draft = pricedDraft();
+  const customerId = draft.customers[0].id;
+  const prices = [
+    { draftCustomerId: customerId, lineId: 'line-a', customerId: 'party-1', status: 'exact_match',
+      unitPriceCents: 8200, issuedAt: '2026-11-18T12:00:00.000Z', previousDistinctPrice: null },
+    { draftCustomerId: customerId, lineId: 'line-b', customerId: 'party-1', status: 'exact_match',
+      unitPriceCents: 7800, issuedAt: '2026-11-17T12:00:00.000Z', previousDistinctPrice: null },
+  ];
+  const { page, handle } = setup(t, draft);
+  const toasts = [];
+  const writes = [];
+  const turns = [];
+  let fail = false;
+  let conversations = 0;
+  global.wx.showToast = spec => toasts.push(spec);
+  handle(request => {
+    if (request.path === '/agent/conversation') { conversations++; return false; }
+    if (request.path === '/agent/memory') { request.ok(priceMemory(draft, prices)); return true; }
+    if (request.path === '/agent/price-adopt') {
+      if (fail) request.ok({ error: 'price_not_suggested', message: '这个价格不在历史成交价里，请刷新后再选。' }, 409);
+      else {
+        writes.push(request.data);
+        request.ok({ revision: draft.revision + 1, adopted: request.data.lines.length });
+      }
+      return true;
+    }
+    if (request.path === '/agent/turns') {
+      turns.push(request.data);
+      request.ok({ turnId: 'preview-turn' }, 202);
+      return true;
+    }
+    return false;
+  });
+  await page.onShow();
+  await page.login();
+  await page.adoptAllAndPreview();
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].lines.length, 2);
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0].text, '生成送货单');
+  assert.deepEqual(turns[0].direct, { intent: 'preview' });
+  assert.deepEqual(toasts, [{ title: '已填入单价', icon: 'success' }]);
+
+  page.stopPolling();
+  page.setData({ polling: false, error: '' });
+  fail = true;
+  const beforeConversations = conversations;
+  const beforeTurns = turns.length;
+  await page.adoptAllAndPreview();
+  assert.equal(turns.length, beforeTurns, '写入失败不得发预览请求');
+  assert.ok(conversations > beforeConversations, '冲突后应重新拉取对话');
+  assert.notEqual(page.data.error, '');
+  assert.equal(toasts.length, 1, '失败时不得提示已填入');
+});
+
+test('A3-2 never adopts prices while loading, polling or reloading the conversation', async t => {
+  const draft = pricedDraft();
+  const customerId = draft.customers[0].id;
+  const prices = [{ draftCustomerId: customerId, lineId: 'line-a', customerId: 'party-1', status: 'exact_match',
+    unitPriceCents: 8200, issuedAt: '2026-11-18T12:00:00.000Z', previousDistinctPrice: null }];
+  const { page, event, handle, setTurns } = setup(t, draft);
+  let adopts = 0;
+  handle(request => {
+    if (request.path === '/agent/memory') { request.ok(priceMemory(draft, prices)); return true; }
+    if (request.path === '/agent/price-adopt') { adopts++; request.ok({ revision: draft.revision + 1, adopted: 1 }); return true; }
+    if (request.path === '/agent/turns/running-turn/events') {
+      request.ok({ status: 'completed', events: [event('end', { status: 'completed', text: '好了', revision: draft.revision })] });
+      return true;
+    }
+    return false;
+  });
+  setTurns([{ id: 'running-turn', text: '王记餐饮两箱水饺', materialIds: [], revision: draft.revision, status: 'running',
+    events: [event('plan', { steps: [{ id: 'intent', text: '看懂你的意思' }] })] }]);
+  await page.onShow();
+  await page.login();
+  page.stopPolling();
+  assert.equal(page.data.adoptableCount, 1);
+  await page.poll();
+  assert.equal(adopts, 0);
+  await page.reload();
+  assert.equal(adopts, 0);
+});

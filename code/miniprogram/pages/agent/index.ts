@@ -23,9 +23,15 @@ type ChoiceView = { draftCustomerId: string; spoken: string; remember: boolean;
 type ChoicePayload = { draftCustomerId: string; choice: 'existing'; customerId: string; remember: boolean }
   | { draftCustomerId: string; choice: 'new' }
   | { draftCustomerId: string; choice: 'unlink'; spoken: string };
+type PriceOption = { cents: number; text: string; brand?: string; spec?: string };
+type PriceHint = { draftCustomerId: string; lineId: string; text: string; options: PriceOption[]; adoptable: boolean };
+type PriceAdoptLine = { draftCustomerId: string; lineId: string; unitPriceCents: number;
+  variant?: { brand: string; spec: string } };
 const draftConflicts = ['draft_changed', 'draft_confirmed', 'draft_not_found', 'preview_not_found', 'material_draft_changed'];
 const choiceConflicts = ['draft_changed', 'draft_confirmed', 'draft_not_found', 'agent_busy', 'customer_already_linked',
   'customer_not_linked', 'draft_customer_not_found'];
+const priceConflicts = ['draft_changed', 'draft_confirmed', 'draft_not_found', 'agent_busy',
+  'price_suggestion_changed', 'price_not_suggested'];
 const imageLimit = 4;
 
 // 只用于展示判断，规则与 core/memory 的 normalizeMemoryText 保持一致。
@@ -33,6 +39,37 @@ function sameName(left: string, right: string): boolean {
   const clean = (value: string) => value.replace(/[！-～]/g, character => String.fromCharCode(character.charCodeAt(0) - 0xfee0))
     .trim().replace(/\s+/g, ' ').toLowerCase();
   return clean(left) === clean(right);
+}
+
+function shortDate(issuedAt: string): string {
+  const date = new Date(issuedAt);
+  if (Number.isNaN(date.getTime())) return '';
+  return `${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+function priceHintView(suggestion: DraftPriceSuggestion): PriceHint | null {
+  const base = { draftCustomerId: suggestion.draftCustomerId, lineId: suggestion.lineId };
+  if (suggestion.status === 'exact_match' || suggestion.status === 'unique_variant_match') {
+    const variant = suggestion.status === 'unique_variant_match'
+      ? [suggestion.brand, suggestion.spec].filter(Boolean).join(' ') : '';
+    const options: PriceOption[] = [{ cents: suggestion.unitPriceCents, text: '沿用' }];
+    let text = `上次${variant ? ` ${variant}` : ''} ¥${money(suggestion.unitPriceCents)}（${shortDate(suggestion.issuedAt)}）`;
+    if (suggestion.previousDistinctPrice) {
+      const earlier = suggestion.previousDistinctPrice;
+      text += ` · 更早 ¥${money(earlier.unitPriceCents)}（${shortDate(earlier.issuedAt)}）`;
+      options.push({ cents: earlier.unitPriceCents, text: `用 ¥${money(earlier.unitPriceCents)}` });
+    }
+    return { ...base, text, options, adoptable: true };
+  }
+  if (suggestion.status === 'ambiguous_variants') {
+    return { ...base, text: '上次买过几种，选一种', adoptable: false,
+      options: suggestion.candidates.map(candidate => ({
+        cents: candidate.unitPriceCents,
+        text: `${[candidate.brand, candidate.spec].filter(Boolean).join(' ') || '未写规格'} ¥${money(candidate.unitPriceCents)}`,
+        brand: candidate.brand, spec: candidate.spec,
+      })) };
+  }
+  return null;
 }
 
 const stepIcon: Record<StepState, string> = { pending: '○', running: '', done: '✓', needs_input: '！', failed: '✗', skipped: '–' };
@@ -158,7 +195,7 @@ Page({
     draftSummary: null as ReturnType<typeof draftSummary> | null, draftExpanded: false, issuedCard: false, revokeFailed: false,
     deliverySummary: null as ReturnType<typeof deliverySummaryView> | null, navTitle: '录单助手', focusInput: false, imageLimit,
     choices: [] as ChoiceView[], memoryNames: [] as string[], rememberOff: {} as Record<string, boolean>,
-    memoryFailed: false, notice: '',
+    memoryFailed: false, notice: '', priceHints: {} as Record<string, PriceHint>, adoptableCount: 0,
   },
   draft: null as TripDraft | null,
   turns: [] as AgentTurn[],
@@ -217,7 +254,7 @@ Page({
       error: '', text: '', turns: [], attachments: [], readyImages: [], uploadRows: [], pendingMaterial: '',
       scrollTo: '', draftSummary: null, deliverySummary: null, navTitle: '录单助手', focusInput: false, draftExpanded: false,
       issuedCard: false, voiceRetry: false, inputMode: 'text', revokeFailed: !!this.retiredToken,
-      choices: [], memoryNames: [], rememberOff: {}, memoryFailed: false, notice: '' });
+      choices: [], memoryNames: [], rememberOff: {}, memoryFailed: false, notice: '', priceHints: {}, adoptableCount: 0 });
     applyNavTitle('录单助手');
   },
 
@@ -329,6 +366,14 @@ Page({
             : resolution.status === 'candidate_only' ? '像下面这几家' : '熟客里没有这个叫法' });
     }
     const memoryNames = memory ? memory.customers.map(customer => customer.name) : [];
+    const priceHints: Record<string, PriceHint> = {};
+    let adoptableCount = 0;
+    if (memory) for (const suggestion of memory.prices) {
+      const hint = priceHintView(suggestion);
+      if (!hint) continue;
+      priceHints[hint.lineId] = hint;
+      if (hint.adoptable) adoptableCount += 1;
+    }
     const turns = this.turns.map((turn, index) => view(turn, revision, this.data.confirmed,
       index === this.turns.length - 1, preview?.id === turn.id, this.confirmedPreviewId, this.delivery, this.draft));
     const recent = turns[turns.length - 1];
@@ -340,7 +385,7 @@ Page({
         ? `送货助手（${this.delivery.shops.filter(shop => shop.locked).length}/${this.delivery.shops.length} 已送达）`
         : '送货助手');
     this.setData({ turns, scrollTo: '', issuedCard: turns.some(turn => turn.issued),
-      deliverySummary, draftSummary: draftInfo, navTitle, choices, memoryNames });
+      deliverySummary, draftSummary: draftInfo, navTitle, choices, memoryNames, priceHints, adoptableCount });
     this.setData({ scrollTo: 'latest' });
     applyNavTitle(navTitle);
   },
@@ -549,6 +594,52 @@ Page({
         throw error;
       }
     });
+  },
+
+  adoptPrice(event: WechatMiniprogram.TouchEvent): Promise<boolean> | undefined {
+    const { line, customer, cents, brand, spec } = event.currentTarget.dataset;
+    const hint = this.data.priceHints[String(line ?? '')];
+    const amount = Number(cents);
+    if (!hint || hint.draftCustomerId !== customer) return;
+    const option = hint.options.find(item => item.cents === amount);
+    if (!option) return;
+    const variant = option.brand === undefined && option.spec === undefined ? undefined
+      : { brand: String(brand ?? ''), spec: String(spec ?? '') };
+    return this.adopt([{ draftCustomerId: hint.draftCustomerId, lineId: hint.lineId, unitPriceCents: amount,
+      ...(variant ? { variant } : {}) }]);
+  },
+
+  adoptableLines(): PriceAdoptLine[] {
+    return Object.values(this.data.priceHints).filter(hint => hint.adoptable && hint.options.length)
+      .map(hint => ({ draftCustomerId: hint.draftCustomerId, lineId: hint.lineId,
+        unitPriceCents: hint.options[0].cents }));
+  },
+
+  adoptAll(): Promise<boolean> | undefined {
+    return this.adopt(this.adoptableLines());
+  },
+
+  async adoptAllAndPreview() {
+    const done = await this.adopt(this.adoptableLines());
+    if (done) await this.previewShortcut();
+  },
+
+  async adopt(lines: PriceAdoptLine[]): Promise<boolean> {
+    const draft = this.draft;
+    if (!draft || this.data.busy || this.data.polling || !lines.length) return false;
+    let done = false;
+    await this.run(async () => {
+      try {
+        await this.request('/agent/price-adopt', { draftId: draft.id, revision: draft.revision, lines });
+        await this.reload();
+        if (typeof wx.showToast === 'function') wx.showToast({ title: '已填入单价', icon: 'success' });
+        done = true;
+      } catch (error) {
+        if (error instanceof WorkspaceError && priceConflicts.includes(error.code)) await this.reload();
+        throw error;
+      }
+    });
+    return done;
   },
 
   retry(event: WechatMiniprogram.TouchEvent) {

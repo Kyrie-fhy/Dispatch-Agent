@@ -2979,3 +2979,46 @@ test('A3 exposes draft memory, aliases and unbinding with account isolation', { 
   assert.deepEqual(confirmed.data.mentions, []);
   assert.deepEqual(confirmed.data.prices, []);
 });
+
+test('A3 price adopt over HTTP fills one line, removes its suggestion and stays inside the account', { timeout: 30_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const api = await start(db);
+  const a = await login(api, 'a');
+  const b = await login(api, 'b');
+  const seeded = await seedParty(api, a, '王记餐饮', '80');
+  const customers = [{
+    id: 'price-customer', customer: '王记餐饮', partyId: seeded.partyId,
+    items: [line('price-line', '安井', '箱', '2', null)],
+  }];
+  const draft = await putCustomers(api, a, await read(api, a), randomUUID(), customers);
+  const memory = await api.request(`/v1/agent/memory?draftId=${draft.id}`, { token: a });
+  assert.equal(memory.status, 200, JSON.stringify(memory.data));
+  const [suggestion] = memory.data.prices;
+  assert.equal(suggestion.status, 'exact_match');
+  assert.equal(suggestion.unitPriceCents, 8000);
+
+  const adopted = await api.request('/v1/agent/price-adopt', {
+    method: 'POST', token: a, body: { requestId: randomUUID(), draftId: draft.id, revision: draft.revision,
+      lines: [{ draftCustomerId: 'price-customer', lineId: 'price-line', unitPriceCents: 8000 }] },
+  });
+  assert.equal(adopted.status, 200, JSON.stringify(adopted.data));
+  assert.deepEqual(adopted.data, { revision: draft.revision + 1, adopted: 1 });
+  const saved = await read(api, a);
+  assert.equal(saved.customers[0].items[0].price, '80.00');
+  assert.equal((await api.request(`/v1/agent/memory?draftId=${draft.id}`, { token: a })).data.prices.length, 0);
+
+  const reviewed = await preview(api, a, saved, randomUUID());
+  assert.equal(reviewed.status, 200, JSON.stringify(reviewed.data));
+  assert.equal(reviewed.data.preview.customers[0].items[0].unitPriceCents, 8000);
+  assert.equal(reviewed.data.preview.customers[0].items[0].amountCents, 16000);
+  assert.equal(reviewed.data.preview.totalCents, 16000);
+
+  const bDraft = await read(api, b);
+  const foreign = await api.request('/v1/agent/price-adopt', {
+    method: 'POST', token: b, body: { requestId: randomUUID(), draftId: bDraft.id, revision: bDraft.revision,
+      lines: [{ draftCustomerId: 'price-customer', lineId: 'price-line', unitPriceCents: 8000 }] },
+  });
+  assert.equal(foreign.status, 409);
+  assert.equal(foreign.data.error, 'price_suggestion_changed');
+  assert.equal((await read(api, a)).customers[0].items[0].price, '80.00');
+});

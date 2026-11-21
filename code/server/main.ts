@@ -141,6 +141,10 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
     sendJson(response, 200, await memory.chooseDraftCustomer(account, await readJson(request, response)));
     return;
   }
+  if (method === 'POST' && path === '/v1/agent/price-adopt') {
+    sendJson(response, 200, await memory.adoptDraftPrices(account, await readJson(request, response)));
+    return;
+  }
   if (method === 'GET' && path === '/v1/customer-aliases') {
     sendJson(response, 200, await memory.aliasList(account));
     return;

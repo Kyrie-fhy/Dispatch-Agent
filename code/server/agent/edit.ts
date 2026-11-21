@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { isObject } from '../../miniprogram/core/orders';
+import { CustomerDirectory, normalizeMemoryText, resolveCustomerMention } from '../../miniprogram/core/memory';
 import { hasSpokenNumber, spokenNumbers } from '../../miniprogram/core/spoken-numbers';
 import { textFields } from '../../miniprogram/core/text-order';
 import { emptyCustomer, TripDraft } from '../../miniprogram/core/trips';
@@ -61,19 +62,40 @@ function quantityQuestion(row: ReturnType<typeof targetRows>[number], quantity: 
 
 const unionKeys = ['customerNumber', 'partyNumber', 'partyId'] as const;
 
-function normalizeAddFill(op: Record<string, unknown>, draft: TripDraft): Record<string, unknown> {
+function resolvesToParty(directory: CustomerDirectory, alias: string, customerId: string) {
+  const mention = resolveCustomerMention(directory, alias);
+  return mention.status === 'resolved' && mention.customerId === customerId;
+}
+
+function spokenDraftName(draft: TripDraft, op: Record<string, unknown>, source: string, directory?: CustomerDirectory) {
+  const number = op.customerNumber;
+  if (!Number.isSafeInteger(number) || Number(number) < 1) return '';
+  const row = draft.customers[Number(number) - 1];
+  if (!row) return '';
+  const text = normalizeMemoryText(source);
+  const rowName = row.customer.trim();
+  // 只有原话确实出现了草稿客户名，或该熟客已记住且能唯一解析的叫法，才把数字序号还原成称呼。
+  if (rowName && text.includes(normalizeMemoryText(rowName))) return rowName;
+  const partyId = typeof row.partyId === 'string' ? row.partyId : undefined;
+  if (!partyId || !directory) return '';
+  const alias = directory.aliases.find(entry => entry.customerId === partyId && entry.normalizedAlias
+    && text.includes(entry.normalizedAlias) && resolvesToParty(directory, entry.alias, partyId));
+  return alias?.alias ?? '';
+}
+
+function normalizeAddFill(op: Record<string, unknown>, draft: TripDraft, source: string, directory?: CustomerDirectory) {
   const normalizedOp = { ...op };
   if (normalizedOp.action === 'add') {
     // add 只按客户名称归属；行号 target 与选择客户用的联合键对新增没有意义。
     delete normalizedOp.target;
     const spoken = typeof normalizedOp.customer === 'string' ? normalizedOp.customer.trim() : '';
-    const number = normalizedOp.customerNumber;
-    if (!spoken && Number.isSafeInteger(number) && Number(number) > 0) {
-      // 数字序号只还原成草稿里已有的称呼，真正的归属仍交给认人和合并流程复核，
-      // 不能凭模型给出的序号把新名字直接塞进某位熟客。
-      const row = draft.customers[Number(number) - 1];
-      if (row?.customer.trim()) normalizedOp.customer = row.customer.trim();
+    if (!spoken) {
+      // 数字序号只能还原成原话里确实出现过的草稿客户名或已记叫法，否则留空交人工补客户名，
+      // 绝不能让模型幻觉的序号把新客户静默塞进已有熟客单。
+      const name = spokenDraftName(draft, normalizedOp, source, directory);
+      if (name) normalizedOp.customer = name;
     }
+    if (typeof normalizedOp.customer === 'string' && !normalizedOp.customer.trim()) delete normalizedOp.customer;
   }
   for (const key of unionKeys) delete normalizedOp[key];
   for (const field of textFields) {
@@ -86,10 +108,11 @@ function normalizeAddFill(op: Record<string, unknown>, draft: TripDraft): Record
   return normalizedOp;
 }
 
-export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[], source: string, previous?: PreviousQuestions, confirmed = false) {
+export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[], source: string, previous?: PreviousQuestions,
+  confirmed = false, directory?: CustomerDirectory) {
   if (!isObject(value) || !Array.isArray(value.operations) || !value.operations.length || value.operations.length > 24) invalidTool();
   const operations = value.operations.map((op: unknown) => isObject(op) && (op.action === 'add' || op.action === 'fill')
-    ? normalizeAddFill(op, draft) : op);
+    ? normalizeAddFill(op, draft, source, directory) : op);
   const edits = operations.filter((op: unknown) => isObject(op) && (op.action === 'add' || op.action === 'fill'));
   const next = structuredClone(draft);
   const initial = targetRows(draft);

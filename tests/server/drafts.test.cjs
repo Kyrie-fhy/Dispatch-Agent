@@ -3325,6 +3325,8 @@ test('A3 Harness: 全量记忆场景', { timeout: 1_800_000 }, async t => {
                 draft = await read(api, token);
               }
 
+              const beforeParties = new Set(draft.customers.flatMap(customer =>
+                typeof customer.partyId === 'string' ? [customer.partyId] : []));
               const submitted = await agentPost(api, token, 'turns', agentInput(draft, turn.text));
               assert.equal(submitted.status, 202, JSON.stringify(submitted.data));
               const result = await waitForAgent(api, token, submitted.data.turnId);
@@ -3349,10 +3351,10 @@ test('A3 Harness: 全量记忆场景', { timeout: 1_800_000 }, async t => {
                     detail: { spoken: link.spoken, canonicalName: link.canonicalName, customerId: link.customerId } });
                 }
               }
-              // 任何静默绑定都必须落在本场景预设熟客上，防止模型幻觉出的客户编号被并入草稿。
-              const presetParties = new Set(parties.values());
+              // 只放行回合前已绑定的熟客与本题允许的关联；其他非空 partyId 均为静默错绑。
+              const allowedBindings = new Set([...beforeParties, ...allowedParties]);
               for (const customer of after.customers) {
-                if (typeof customer.partyId === 'string' && !presetParties.has(customer.partyId)) {
+                if (typeof customer.partyId === 'string' && !allowedBindings.has(customer.partyId)) {
                   redLines.push({ scenario: scenario.id, sample, text: turn.text, kind: 'wrong_customer',
                     detail: { customer: customer.customer, partyId: customer.partyId } });
                 }

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { Pool, type PoolClient } from 'pg';
 import type { CustomerLink, PlanStep, Question, StepState } from '../../miniprogram/core/agent';
 import { isObject, nullablePrice } from '../../miniprogram/core/orders';
-import { resolveCustomerMention } from '../../miniprogram/core/memory';
+import { resolveCustomerMention, type CustomerDirectory } from '../../miniprogram/core/memory';
 import { spokenNumbers } from '../../miniprogram/core/spoken-numbers';
 import { textOrderQuestions } from '../../miniprogram/core/text-order';
 import { previewTrip, resolveCustomerChoices, type TripDraft } from '../../miniprogram/core/trips';
@@ -309,7 +309,8 @@ export class AgentRuntime {
     }
   }
 
-  private async linkCustomers(client: PoolClient, account: string, draft: TripDraft, start: TripDraft) {
+  private async linkCustomers(client: PoolClient, account: string, draft: TripDraft, start: TripDraft,
+    directory?: CustomerDirectory) {
     const before = new Map(start.customers.map(customer => [customer.id, customer]));
     const changed = draft.customers.filter(customer => {
       const original = before.get(customer.id);
@@ -319,10 +320,10 @@ export class AgentRuntime {
     const lines: string[] = [];
     const links: CustomerLink[] = [];
     if (!changed.length) return { lines, links };
-    const directory = await readDirectory(client, account);
+    const resolved = directory ?? await readDirectory(client, account);
     for (const customer of changed) {
       const spoken = customer.customer.trim();
-      const mention = resolveCustomerMention(directory, spoken);
+      const mention = resolveCustomerMention(resolved, spoken);
       if (mention.status !== 'resolved') {
         lines.push(`${spoken}：待选店`);
         continue;
@@ -525,10 +526,11 @@ export class AgentRuntime {
           signal.throwIfAborted();
           checkDraft(workspace, draftId, run.revision, true);
           const before = workspaceDraft(workspace);
-          const parties = await readParties(client, account);
-          const prepared = prepareEdits(before, args, parties, String(args.source), run.previous, args.confirmed === true);
+          const directory = await readDirectory(client, account);
+          const prepared = prepareEdits(before, args, [...directory.customers], String(args.source), run.previous,
+            args.confirmed === true, directory);
           if (!('draft' in prepared) || !prepared.draft) return prepared;
-          const linked = await this.linkCustomers(client, account, prepared.draft, before);
+          const linked = await this.linkCustomers(client, account, prepared.draft, before, directory);
           const { draft } = readSaveDraft(draftId, { ...prepared.draft, revision: run.revision, requestId });
           const revision = run.revision + 1;
           const lines = [...prepared.lines!, ...linked.lines];

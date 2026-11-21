@@ -847,15 +847,7 @@ test('price adopt validates every line before touching the draft', { timeout: 20
     { code: 'draft_changed' });
 });
 
-test('agent add by customerNumber extends the linked draft customer without a blind bind', { timeout: 20_000 }, async t => {
-  const stores = await isolatedDatabase(t);
-  const accountId = await login(stores, 'a');
-  const { sheets } = await issue(stores, accountId, [freshCustomer('a', '王记餐饮')]);
-  const wang = sheets[0].partyId;
-  const draft = await save(stores, accountId,
-    [customer('picked', '王记餐饮', wang, [line('picked-line', '水饺', '80')])]);
-
-  // 2026-11-21 真实评测抓到的最小失败样本：add 只给了 customerNumber，没有 customer。
+async function runCapturedCustomerNumberTurn(stores, accountId, draft, text) {
   const captured = { action: 'add', customerNumber: 1, product: '春卷', brand: '', specification: '',
     quantity: '1', unit: '箱' };
   const agentModel = async () => ({ role: 'assistant', content: null, tool_calls: [{
@@ -865,19 +857,30 @@ test('agent add by customerNumber extends the linked draft customer without a bl
   const intentModel = async () => ({ draft: true, preview: false, query: false, answering: false });
   const runtime = new AgentRuntime(stores.pool, stores.trips, new TextOrders(stores.pool), agentModel, intentModel);
   const { turnId } = await runtime.submit(accountId, readTurnInput({
-    requestId: randomUUID(), draftId: draft.id, revision: draft.revision, text: '老王再加一箱春卷',
+    requestId: randomUUID(), draftId: draft.id, revision: draft.revision, text,
   }), async () => {});
-
   let turn;
   for (let attempt = 0; attempt < 200; attempt++) {
     turn = (await runtime.store.conversation(accountId)).turns.find(candidate => candidate.id === turnId);
     if (turn && turn.status !== 'running') break;
     await new Promise(resolve => setTimeout(resolve, 25));
   }
-  assert.equal(turn?.status, 'completed');
-
   const models = (await stores.db.query(`SELECT payload FROM dispatch.agent_events
     WHERE account_id = $1 AND turn_id = $2 AND kind = 'model' ORDER BY seq`, [accountId, turnId])).rows;
+  return { turn, models };
+}
+
+test('agent add by customerNumber merges a remembered alias into the linked draft customer', { timeout: 20_000 }, async t => {
+  const stores = await isolatedDatabase(t);
+  const accountId = await login(stores, 'a');
+  const { sheets } = await issue(stores, accountId, [freshCustomer('a', '王记餐饮')]);
+  const wang = sheets[0].partyId;
+  await stores.memory.bindCustomerAlias(accountId, { ...command(), customerId: wang, alias: '老王' });
+  const draft = await save(stores, accountId,
+    [customer('picked', '王记餐饮', wang, [line('picked-line', '水饺', '80')])]);
+
+  const { turn, models } = await runCapturedCustomerNumberTurn(stores, accountId, draft, '老王再加一箱春卷');
+  assert.equal(turn?.status, 'completed');
   assert.ok(models.some(row => (row.payload.toolCalls ?? []).some(call => call.arguments.includes('"customerNumber":1'))),
     '内部 model 事件应留存原始工具参数');
 
@@ -888,5 +891,34 @@ test('agent add by customerNumber extends the linked draft customer without a bl
   assert.equal(customerAfter.customer, '王记餐饮');
   assert.equal(customerAfter.partyId, wang);
   assert.deepEqual(customerAfter.items.map(item => [item.product, item.quantity]), [['水饺', '2'], ['春卷', '1']]);
+  const links = turn.events.find(event => event.kind === 'customer_links')?.payload.links ?? [];
+  assert.deepEqual(links.map(link => [link.spoken, link.customerId, Boolean(link.merged)]), [['老王', wang, true]]);
   assert.deepEqual((await stores.memory.agentMemory(accountId, draft.id)).mentions, []);
+});
+
+test('agent add with an unmatched customerNumber never borrows the linked draft customer', { timeout: 20_000 }, async t => {
+  const stores = await isolatedDatabase(t);
+  const accountId = await login(stores, 'a');
+  const { sheets } = await issue(stores, accountId, [freshCustomer('a', '王记餐饮')]);
+  const wang = sheets[0].partyId;
+  await stores.memory.bindCustomerAlias(accountId, { ...command(), customerId: wang, alias: '老王' });
+  const draft = await save(stores, accountId,
+    [customer('picked', '王记餐饮', wang, [line('picked-line', '水饺', '80')])]);
+
+  // 原话是全新客户「阿强」，模型却幻觉 customerNumber: 1；只能留空待人工补客户名。
+  const { turn } = await runCapturedCustomerNumberTurn(stores, accountId, draft, '阿强要一箱春卷');
+  assert.equal(turn?.status, 'completed');
+
+  const workspace = await stores.trips.workspace(accountId);
+  assert.equal(workspace.draft.revision, draft.revision + 1);
+  assert.equal(workspace.draft.customers.length, 2);
+  const [linked, unnamed] = workspace.draft.customers;
+  assert.equal(linked.customer, '王记餐饮');
+  assert.equal(linked.partyId, wang);
+  assert.deepEqual(linked.items.map(item => [item.product, item.quantity]), [['水饺', '2']]);
+  assert.equal(unnamed.customer, '');
+  assert.equal(unnamed.partyId, undefined);
+  assert.deepEqual(unnamed.items.map(item => [item.product, item.quantity]), [['春卷', '1']]);
+  const questions = turn.events.find(event => event.kind === 'questions')?.payload.questions ?? [];
+  assert.ok(questions.some(question => question.text.includes('请填写客户名称')), JSON.stringify(questions));
 });

@@ -20,7 +20,9 @@ type AgentMemory = { draftId: string; revision: number; confirmed: boolean; cust
   mentions: { draftCustomerId: string; resolution: CustomerMention }[]; prices: DraftPriceSuggestion[] };
 type ChoiceView = { draftCustomerId: string; spoken: string; remember: boolean;
   candidates: { id: string; name: string }[]; hint: string };
-type ChoicePayload = { draftCustomerId: string; choice: 'existing'; customerId: string; remember: boolean }
+type CustomerMerge = 'append' | 'keep_existing';
+type ChoiceResult = { revision: number; remembered: boolean | null; rememberIssue?: string };
+type ChoicePayload = { draftCustomerId: string; choice: 'existing'; customerId: string; remember: boolean; merge?: CustomerMerge }
   | { draftCustomerId: string; choice: 'new' }
   | { draftCustomerId: string; choice: 'unlink'; spoken: string };
 type PriceOption = { cents: number; text: string; brand?: string; spec?: string };
@@ -574,6 +576,38 @@ Page({
     return this.run(() => this.reload());
   },
 
+  async reloadAfterConflict(error: unknown, codes: string[]) {
+    if (!(error instanceof WorkspaceError) || !codes.includes(error.code)) return;
+    try {
+      await this.reload();
+    } catch (refreshError) {
+      if (refreshError instanceof WorkspaceError && refreshError.status === 401) throw refreshError;
+    }
+  },
+
+  async saveCustomerChoice(draft: TripDraft, payload: ChoicePayload): Promise<ChoiceResult | undefined> {
+    const generation = this.generation;
+    const send = (choice: ChoicePayload) => this.request<ChoiceResult>(
+      '/agent/customer-choice', { draftId: draft.id, revision: draft.revision, ...choice });
+    try {
+      return await send(payload);
+    } catch (error) {
+      if (!(error instanceof WorkspaceError) || error.code !== 'customer_merge_review' ||
+        payload.choice !== 'existing' || payload.merge || typeof wx.showActionSheet !== 'function') throw error;
+      const merge = await new Promise<CustomerMerge | undefined>((resolve, reject) => wx.showActionSheet({
+        alertText: error.message,
+        itemList: ['追加新增明细', '同款保留原明细'],
+        success: ({ tapIndex }) => resolve(tapIndex === 0 ? 'append' : tapIndex === 1 ? 'keep_existing' : undefined),
+        fail: ({ errMsg }) => {
+          if (errMsg.includes('cancel')) resolve(undefined);
+          else reject(error);
+        },
+      }));
+      if (merge && generation === this.generation) return send({ ...payload, merge });
+      return undefined;
+    }
+  },
+
   choose(payload: ChoicePayload): Promise<void> | undefined {
     const draft = this.draft;
     if (!draft || this.data.busy || this.data.polling) return;
@@ -581,8 +615,8 @@ Page({
     this.setData({ notice: '' });
     return this.run(async () => {
       try {
-        const result = await this.request<{ revision: number; remembered: boolean | null; rememberIssue?: string }>(
-          '/agent/customer-choice', { draftId: draft.id, revision: draft.revision, ...payload });
+        const result = await this.saveCustomerChoice(draft, payload);
+        if (!result) return;
         await this.reload();
         if (result.remembered === true) {
           if (typeof wx.showToast === 'function') wx.showToast({ title: '已记住叫法', icon: 'success' });
@@ -590,7 +624,7 @@ Page({
           this.setData({ notice: `已选好店。${spoken ? `「${spoken}」` : '这个叫法'}和另一家的正式店名一样，没有记住这个叫法。` });
         }
       } catch (error) {
-        if (error instanceof WorkspaceError && choiceConflicts.includes(error.code)) await this.reload();
+        await this.reloadAfterConflict(error, choiceConflicts);
         throw error;
       }
     });
@@ -635,7 +669,7 @@ Page({
         if (typeof wx.showToast === 'function') wx.showToast({ title: '已填入单价', icon: 'success' });
         done = true;
       } catch (error) {
-        if (error instanceof WorkspaceError && priceConflicts.includes(error.code)) await this.reload();
+        await this.reloadAfterConflict(error, priceConflicts);
         throw error;
       }
     });

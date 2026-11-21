@@ -2784,6 +2784,16 @@ function agentFixture(actions) {
   };
 }
 
+async function uploadAgentImage(api, token, draft) {
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+lRJ0AAAAASUVORK5CYII=', 'base64');
+  const material = await api.request('/v1/materials', { method: 'POST', token, body: materialInput(draft, png, randomUUID()) });
+  assert.equal(material.status, 201);
+  const materialId = material.data.material.id;
+  const uploaded = await api.request(`/v1/materials/${materialId}/chunks`, { method: 'PUT', token, chunk: png, offset: 0 });
+  assert.equal(uploaded.status, 200);
+  return materialId;
+}
+
 test('A3 auto-links a remembered alias during a turn and undo restores the whole step', { timeout: 30_000 }, async t => {
   const db = await isolatedDatabase(t);
   const model = agentFixture({ '老王两箱水饺': a1.edit(a1.add('老王', '水饺', '2')) });
@@ -2807,17 +2817,21 @@ test('A3 auto-links a remembered alias during a turn and undo restores the whole
   assert.equal(linked.customers[0].customer, '王记餐饮');
   assert.equal(linked.customers[0].partyId, seeded.partyId);
   assert.equal(linked.customers[0].items[0].price, null);
+  assert.equal(linked.revision, before.revision + 1);
 
   const undone = await agentPost(api, token, `turns/${submitted.data.turnId}/undo`, { requestId: randomUUID() });
   assert.equal(undone.status, 200);
   const restored = await read(api, token);
   assert.deepEqual(restored.customers, before.customers);
-  assert.equal(restored.revision, before.revision + 3);
+  assert.equal(restored.revision, before.revision + 2);
 });
 
 test('A3 keeps an unknown spoken name pending until the courier chooses and remembers it', { timeout: 30_000 }, async t => {
   const db = await isolatedDatabase(t);
-  const model = agentFixture({ '阿强一箱汤圆': a1.edit(a1.add('阿强', '汤圆', '1')) });
+  const model = agentFixture({
+    '阿强一箱汤圆': a1.edit(a1.add('阿强', '汤圆', '1')),
+    '阿强一箱馄饨': a1.edit(a1.add('阿强', '馄饨', '1')),
+  });
   const api = await start(db, undefined, undefined, undefined, undefined, model);
   const token = await login(api, 'a');
   const seeded = await seedParty(api, token, '王记餐饮');
@@ -2849,7 +2863,7 @@ test('A3 keeps an unknown spoken name pending until the courier chooses and reme
   assert.equal(chosen.customers[0].customer, '王记餐饮');
   assert.equal(chosen.customers[0].partyId, seeded.partyId);
 
-  const second = await agentPost(api, token, 'turns', agentInput(chosen, '阿强一箱汤圆'));
+  const second = await agentPost(api, token, 'turns', agentInput(chosen, '阿强一箱馄饨'));
   assert.equal(second.status, 202);
   const secondTurn = await waitForAgent(api, token, second.data.turnId);
   assert.equal(secondTurn.status, 'completed');
@@ -2857,12 +2871,13 @@ test('A3 keeps an unknown spoken name pending until the courier chooses and reme
   assert.equal(rewritten.customers.length, 1);
   assert.equal(rewritten.customers[0].customer, '王记餐饮');
   assert.equal(rewritten.customers[0].partyId, seeded.partyId);
-  assert.deepEqual(rewritten.customers[0].items.map(item => item.quantity), ['1', '1']);
+  assert.deepEqual(rewritten.customers[0].items.map(item => item.product), ['汤圆', '馄饨']);
+  assert.equal(rewritten.customers[0].items[0].id, chosen.customers[0].items[0].id);
   const merged = secondTurn.events.find(event => event.kind === 'customer_links').payload.links;
   assert.equal(merged.length, 1);
   assert.equal(merged[0].matchedBy, 'alias');
   assert.equal(merged[0].merged, true);
-  // 并入同一家时指向被并入的原客户单，页面「不是他」才能落到草稿里仍存在的那家。
+  // 归并事件指向归并后仍在草稿里的客户单。
   assert.equal(merged[0].draftCustomerId, pending.customers[0].id);
   assert.match(secondTurn.events.filter(event => event.kind === 'change').flatMap(event => event.payload.lines).join(' '), /并入同一家/);
 });
@@ -2906,29 +2921,119 @@ test('A3 does not re-link a customer after the courier says it is not him', { ti
 
 test('A3 keeps an explicitly new customer new when the turn fills its name', { timeout: 30_000 }, async t => {
   const db = await isolatedDatabase(t);
-  const model = async messages => {
-    const { text } = JSON.parse(messages[1].content);
-    assert.equal(text, '阿强饭店一箱汤圆');
-    return makeToolReply(a1.edit({ action: 'fill', target: 1, customer: '阿强饭店' }));
-  };
+  const names = ['阿强饭店', '老王', '王记餐饮'];
+  const model = agentFixture(Object.fromEntries(names.map(customer =>
+    [`${customer}一箱水饺`, a1.edit({ action: 'fill', target: 1, customer })])));
   const api = await start(db, undefined, undefined, undefined, undefined, model);
   const token = await login(api, 'a');
-  await seedParty(api, token, '王记餐饮');
+  const seeded = await seedParty(api, token, '王记餐饮');
+  await bindAlias(db, 'a', seeded.partyId, '老王');
 
-  // 配送员已选择「新建客户」；随后清空名称，再由助手回合补上店名。
-  const pending = await putCustomers(api, token, await read(api, token), randomUUID(), [{
-    id: 'new-shop', customer: '', partyId: null, items: [line('new-line', '安井', '箱', '1', '20')],
-  }]);
-  assert.equal(pending.customers[0].partyId, null);
-  const submitted = await agentPost(api, token, 'turns', agentInput(pending, '阿强饭店一箱汤圆'));
+  for (const name of names) {
+    const initial = await putCustomers(api, token, await read(api, token), randomUUID(), [{
+      id: 'new-shop', customer: '临时店名', items: [line('new-line', '安井', '箱', '1', '20')],
+    }]);
+    const chosen = await agentPost(api, token, 'customer-choice', {
+      requestId: randomUUID(), draftId: initial.id, revision: initial.revision, draftCustomerId: 'new-shop', choice: 'new',
+    });
+    assert.equal(chosen.status, 200);
+    const marked = await read(api, token);
+    const pending = await putCustomers(api, token, marked, randomUUID(), [{ ...marked.customers[0], customer: '' }]);
+    assert.equal(pending.customers[0].partyId, null);
+
+    const submitted = await agentPost(api, token, 'turns', agentInput(pending, `${name}一箱水饺`));
+    assert.equal(submitted.status, 202);
+    const turn = await waitForAgent(api, token, submitted.data.turnId);
+    assert.equal(turn.status, 'completed');
+    assert.equal(turn.events.some(event => event.kind === 'questions' || event.kind === 'customer_links'), false);
+    const after = await read(api, token);
+    assert.equal(after.customers[0].customer, name);
+    assert.equal(after.customers[0].partyId, null);
+  }
+});
+
+test('A3 asks before merging the same item named in the image and its transcript', { timeout: 30_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const text = '图片里的老王 安井500g水饺2箱，另有1箱馄饨';
+  const imageModel = async () => ({ operations: [fixtureLine('王记餐饮', '安井', '箱', '2')] });
+  const model = agentFixture({ [text]: a1.edit(
+    a1.add('老王', '水饺', '2', { brand: '安井', specification: '500g' }), a1.add('老王', '馄饨', '1')) });
+  const api = await start(db, undefined, undefined, imageModel, undefined, model);
+  const token = await login(api, 'a');
+  const seeded = await seedParty(api, token, '王记餐饮');
+  await bindAlias(db, 'a', seeded.partyId, '老王');
+  const draft = await read(api, token);
+  const materialId = await uploadAgentImage(api, token, draft);
+
+  const submitted = await agentPost(api, token, 'turns', { ...agentInput(draft, text), materialIds: [materialId] });
   assert.equal(submitted.status, 202);
   const turn = await waitForAgent(api, token, submitted.data.turnId);
   assert.equal(turn.status, 'completed');
-  assert.equal(turn.events.some(event => event.kind === 'questions'), false);
-  assert.equal(turn.events.some(event => event.kind === 'customer_links'), false);
-  const after = await read(api, token);
-  assert.equal(after.customers[0].customer, '阿强饭店');
-  assert.equal(after.customers[0].partyId, null);
+  assert.match(turn.events.filter(event => event.kind === 'change').flatMap(event => event.payload.lines).join(' '), /有相似明细/);
+  const pending = await read(api, token);
+  const [existing, incoming] = pending.customers;
+  assert.equal(existing.partyId, seeded.partyId);
+  assert.equal(incoming.partyId, undefined);
+  assert.equal((await preview(api, token, pending, randomUUID())).status, 400);
+  const choice = { requestId: randomUUID(), draftId: draft.id, revision: pending.revision,
+    draftCustomerId: incoming.id, choice: 'existing', customerId: seeded.partyId };
+  const conflict = await agentPost(api, token, 'customer-choice', choice);
+  assert.equal(conflict.status, 409);
+  assert.equal(conflict.data.error, 'customer_merge_review');
+  assert.deepEqual(await read(api, token), pending);
+
+  const kept = await agentPost(api, token, 'customer-choice', { ...choice, merge: 'keep_existing' });
+  assert.equal(kept.status, 200);
+  const resulting = await read(api, token);
+  assert.deepEqual(resulting.customers, [{ ...existing, items: [...existing.items, incoming.items[1]] }]);
+  const reviewed = await preview(api, token, resulting, randomUUID());
+  assert.equal(reviewed.status, 200);
+  const formal = await confirm(api, token, reviewed.data.preview.previewId, randomUUID());
+  assert.equal(formal.status, 200);
+  const trip = await api.request(`/v1/trips/${draft.id}`, { token });
+  assert.equal(trip.status, 200);
+  assert.deepEqual(trip.data.picking.map(row => [row.product, row.quantity]), [['水饺', 2], ['馄饨', 1]]);
+});
+
+test('A3 rolls back text edits and image imports if a customer link cannot be recorded', { timeout: 30_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const imageModel = async () => ({ operations: [fixtureLine('老王', '安井', '箱', '2')] });
+  const model = agentFixture({ '老王两箱水饺': a1.edit(a1.add('老王', '水饺', '2')) });
+  const api = await start(db, undefined, undefined, imageModel, undefined, model);
+  const token = await login(api, 'a');
+  const seeded = await seedParty(api, token, '王记餐饮');
+  await bindAlias(db, 'a', seeded.partyId, '老王');
+  await db.admin.query(`
+    CREATE FUNCTION dispatch.fail_customer_links() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN RAISE EXCEPTION 'customer link write failed'; END
+    $$;
+    CREATE TRIGGER fail_customer_links BEFORE INSERT ON dispatch.agent_events
+      FOR EACH ROW WHEN (NEW.kind = 'customer_links') EXECUTE FUNCTION dispatch.fail_customer_links()
+  `);
+  const before = await read(api, token);
+  const materialId = await uploadAgentImage(api, token, before);
+  for (const input of [agentInput(before, '老王两箱水饺'), agentInput(before, '', [materialId])]) {
+    const submitted = await agentPost(api, token, 'turns', input);
+    assert.equal(submitted.status, 202);
+    const turn = await waitForAgent(api, token, submitted.data.turnId);
+    assert.equal(turn.status, 'failed');
+    assert.equal(turn.events.some(event => event.kind === 'change' || event.kind === 'customer_links'), false);
+    assert.equal(turn.events.at(-1).payload.revision, before.revision);
+    assert.deepEqual(await read(api, token), before);
+  }
+  assert.equal((await preview(api, token, before, randomUUID())).status, 400);
+  const material = await api.request(`/v1/materials/${materialId}`, { token });
+  assert.equal(material.data.material.organized, false);
+
+  await db.admin.query('DROP TRIGGER fail_customer_links ON dispatch.agent_events');
+  const retried = await agentPost(api, token, 'turns', agentInput(before, '', [materialId]));
+  assert.equal(retried.status, 202);
+  const recovered = await waitForAgent(api, token, retried.data.turnId);
+  assert.equal(recovered.status, 'completed');
+  const saved = await read(api, token);
+  assert.equal(saved.revision, before.revision + 1);
+  assert.equal(saved.customers[0].partyId, seeded.partyId);
+  assert.equal(saved.customers[0].items.length, 1);
 });
 
 test('A3 treats a new name as a new customer when the account has no known customers', { timeout: 30_000 }, async t => {

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { Pool } from 'pg';
+import { Pool, type PoolClient } from 'pg';
 import type { CustomerLink, PlanStep, Question, StepState } from '../../miniprogram/core/agent';
 import { isObject, nullablePrice } from '../../miniprogram/core/orders';
 import { resolveCustomerMention } from '../../miniprogram/core/memory';
@@ -9,7 +9,7 @@ import { previewTrip, resolveCustomerChoices, type TripDraft } from '../../minip
 import { readAccount, readParties, readWorkspace, workspaceDraft, writeAccount } from '../account-workspace';
 import { readSaveDraft } from '../draft-input';
 import { HttpError } from '../http-error';
-import { readDirectory } from '../memory';
+import { overlappingItems, readDirectory } from '../memory';
 import type { ModelTrace } from '../text-model';
 import { isPlaceholder, normalized, readImageOrder, readable, targetRows, TextOrders } from '../text-orders';
 import { TripStore } from '../trips';
@@ -22,7 +22,8 @@ import type { DeliveryModel } from './delivery-model';
 
 type RecognizedImage = Awaited<ReturnType<TextOrders['recognizeImage']>>;
 type Run = { key: TurnKey; input: Input; revision: number; signal: AbortSignal; previous?: PreviousQuestions;
-  checkSession: () => Promise<unknown>; readRevision?: number; used: number; lines: string[]; questions: Question[] };
+  checkSession: () => Promise<unknown>; readRevision?: number; used: number; lines: string[]; questions: Question[];
+  customerLinks: CustomerLink[] };
 
 const emptyIntent: Intent = { draft: false, query: false, preview: false, answering: false };
 const draftTools = ['edit_draft', 'ask_user'] as const;
@@ -106,7 +107,7 @@ export class AgentRuntime {
         const key = { id: result.turnId, account, draftId: input.draftId };
         setImmediate(() => {
           void this.run({ key, input, revision: input.revision, signal: AbortSignal.timeout(60_000),
-            checkSession, used: 0, lines: [], questions: [] })
+            checkSession, used: 0, lines: [], questions: [], customerLinks: [] })
             .catch(() => console.error('录单助手无法写入回合状态'))
             .finally(() => this.running.delete(account));
         });
@@ -232,9 +233,8 @@ export class AgentRuntime {
       let questionSource: string | undefined;
       if (intent.draft || input.materialIds.length) {
         await begin('check');
-        const links = await this.linkCustomers(run, context.draft);
-        if (links.length) {
-          const recognized = new Set(links.flatMap(link => [link.spoken, link.canonicalName]));
+        if (run.customerLinks.length) {
+          const recognized = new Set(run.customerLinks.flatMap(link => [link.spoken, link.canonicalName]));
           run.questions = run.questions.filter(question =>
             !(recognized.has(question.customer) && question.options.includes('新建客户')));
         }
@@ -309,60 +309,50 @@ export class AgentRuntime {
     }
   }
 
-  private async linkCustomers(run: Run, start: TripDraft): Promise<CustomerLink[]> {
-    const { account, draftId } = run.key;
+  private async linkCustomers(client: PoolClient, account: string, draft: TripDraft, start: TripDraft) {
     const before = new Map(start.customers.map(customer => [customer.id, customer]));
-    const requestId = randomUUID();
-    const result = await writeAccount(this.pool, account, requestId,
-      { action: 'agent-link-customers', turnId: run.key.id, revision: run.revision }, async (client, workspace) => {
-        checkDraft(workspace, draftId, run.revision, true);
-        const directory = await readDirectory(client, account);
-        if (!directory.customers.length) return { changed: false as const };
-        const draft = workspaceDraft(workspace);
-        const lines: string[] = [];
-        const links: CustomerLink[] = [];
-        for (const customer of [...draft.customers]) {
-          const spoken = customer.customer.trim();
-          if (!spoken || typeof customer.partyId === 'string') continue;
-          const original = before.get(customer.id);
-          if (original && original.customer === customer.customer && original.partyId === customer.partyId) continue;
-          const mention = resolveCustomerMention(directory, customer.customer);
-          if (mention.status === 'resolved') {
-            const sibling = draft.customers.find(entry => entry !== customer && entry.partyId === mention.customerId);
-            if (sibling) {
-              sibling.items.push(...customer.items);
-              draft.customers = draft.customers.filter(entry => entry !== customer);
-              lines.push(`${spoken} → ${mention.canonicalName}（并入同一家）`);
-            } else {
-              customer.customer = mention.canonicalName;
-              customer.partyId = mention.customerId;
-              lines.push(mention.matchedBy === 'alias'
-                ? `${spoken} → ${mention.canonicalName}（记住的叫法）`
-                : `${mention.canonicalName}：认出熟客`);
-            }
-            links.push({ draftCustomerId: sibling ? sibling.id : customer.id, spoken, customerId: mention.customerId,
-              canonicalName: mention.canonicalName, matchedBy: mention.matchedBy, merged: Boolean(sibling) });
-          } else if (customer.partyId === null) {
-            // 回合开始前就是 null 的，是配送员亲手选的「新建客户」；改名后不要退回待选店。
-            if (before.get(customer.id)?.partyId !== null) {
-              delete customer.partyId;
-              lines.push(`${spoken}：待选店`);
-            }
-          }
-        }
-        if (!lines.length) return { changed: false as const };
-        const { draft: saved } = readSaveDraft(draftId, { ...draft, revision: run.revision, requestId });
-        const revision = run.revision + 1;
-        await client.query('UPDATE dispatch.workspaces SET draft_revision = $2, draft_customers = $3 WHERE account_id = $1',
-          [account, revision, JSON.stringify(saved.customers)]);
-        await saveChange(client, run.key, revision, lines, run.signal);
-        if (links.length) await event(client, run.key, 'customer_links', { links });
-        return { changed: true as const, revision, lines, links };
-      });
-    if (!result.changed) return [];
-    run.revision = result.revision;
-    run.lines.push(...result.lines);
-    return result.links;
+    const changed = draft.customers.filter(customer => {
+      const original = before.get(customer.id);
+      return customer.partyId === undefined && customer.customer.trim()
+        && (original?.customer !== customer.customer || original.partyId !== undefined);
+    });
+    const lines: string[] = [];
+    const links: CustomerLink[] = [];
+    if (!changed.length) return { lines, links };
+    const directory = await readDirectory(client, account);
+    for (const customer of changed) {
+      const spoken = customer.customer.trim();
+      const mention = resolveCustomerMention(directory, spoken);
+      if (mention.status !== 'resolved') {
+        lines.push(`${spoken}：待选店`);
+        continue;
+      }
+      const sibling = draft.customers.find(entry => entry !== customer && entry.partyId === mention.customerId);
+      if (sibling && overlappingItems(sibling, customer).length) {
+        lines.push(`${spoken} → ${mention.canonicalName}：有相似明细，待核对合并`);
+        continue;
+      }
+      if (sibling) {
+        sibling.items.push(...customer.items);
+        draft.customers = draft.customers.filter(entry => entry !== customer);
+        lines.push(`${spoken} → ${mention.canonicalName}（并入同一家）`);
+      } else {
+        customer.customer = mention.canonicalName;
+        customer.partyId = mention.customerId;
+        lines.push(mention.matchedBy === 'alias'
+          ? `${spoken} → ${mention.canonicalName}（记住的叫法）`
+          : `${mention.canonicalName}：认出熟客`);
+      }
+      links.push({ draftCustomerId: sibling?.id ?? customer.id, spoken, customerId: mention.customerId,
+        canonicalName: mention.canonicalName, matchedBy: mention.matchedBy, merged: Boolean(sibling) });
+    }
+    return { lines, links };
+  }
+
+  private async saveDraftChange(client: PoolClient, run: Run, revision: number, lines: string[], links: CustomerLink[], digest?: string) {
+    await saveChange(client, run.key, revision, lines, run.signal, digest);
+    if (links.length) await event(client, run.key, 'customer_links', { links });
+    run.signal.throwIfAborted();
   }
 
   private async selectCustomer(run: Run, draft: Awaited<ReturnType<AgentRuntime['readDraft']>>, answer: string) {
@@ -528,17 +518,21 @@ export class AgentRuntime {
         { action: 'agent-edit', turnId: key.id, revision: run.revision }, async (client, workspace) => {
           signal.throwIfAborted();
           checkDraft(workspace, draftId, run.revision, true);
+          const before = workspaceDraft(workspace);
           const parties = await readParties(client, account);
-          const prepared = prepareEdits(workspaceDraft(workspace), args, parties, String(args.source), run.previous, args.confirmed === true);
+          const prepared = prepareEdits(before, args, parties, String(args.source), run.previous, args.confirmed === true);
           if (!('draft' in prepared) || !prepared.draft) return prepared;
+          const linked = await this.linkCustomers(client, account, prepared.draft, before);
           const { draft } = readSaveDraft(draftId, { ...prepared.draft, revision: run.revision, requestId });
           const revision = run.revision + 1;
+          const lines = [...prepared.lines!, ...linked.lines];
           await client.query('UPDATE dispatch.workspaces SET draft_revision = $2, draft_customers = $3 WHERE account_id = $1',
             [account, revision, JSON.stringify(draft.customers)]);
-          await saveChange(client, key, revision, prepared.lines!, signal);
-          return { added: prepared.added, lines: prepared.lines, revision };
+          await this.saveDraftChange(client, run, revision, lines, linked.links);
+          return { added: prepared.added, lines, revision, links: linked.links };
         });
       if ('revision' in result && result.revision !== undefined) run.revision = result.revision;
+      if ('links' in result && result.links) run.customerLinks.push(...result.links);
       return result;
     }
     const materialId = args.materialId;
@@ -547,13 +541,19 @@ export class AgentRuntime {
     const lineCount = (draft: typeof before) => targetRows(draft).filter(({ item }) => !isPlaceholder(item)).length;
     try {
       const image = readImageOrder({ draftId, revision: run.revision, materialId, requestId: randomUUID() });
+      let linked = { lines: [] as string[], links: [] as CustomerLink[] };
       const result = await withDeadline(this.orders.importImage(account, image, run.checkSession, {
         signal, trace: () => {}, recognized,
-        saved: (client, draft, digest) => saveChange(client, key, draft.revision,
-          [`图片新增 ${lineCount(draft) - lineCount(before)} 行`], signal, digest),
+        prepare: async (client, draft, previous) => {
+          linked = await this.linkCustomers(client, account, draft, previous);
+          return draft;
+        },
+        saved: (client, draft, digest) => this.saveDraftChange(client, run, draft.revision,
+          [`图片新增 ${lineCount(draft) - lineCount(before)} 行`, ...linked.lines], linked.links, digest),
       }), signal);
       if ('issues' in result) return result;
       run.revision = result.draft.revision;
+      run.customerLinks.push(...linked.links);
       return { added: lineCount(result.draft) - lineCount(before) };
     } catch (error) {
       if (error instanceof HttpError && ['duplicate_order_image', 'unsupported_order_image'].includes(error.code)) {

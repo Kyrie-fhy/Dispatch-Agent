@@ -465,6 +465,27 @@ test('customer choice rebinds a remembered name when the courier explicitly pick
   assert.equal((await stores.memory.resolveCustomerMention(accountId, '老王')).customerId, wang);
 });
 
+test('customer choice rebinds a stale single-character alias matching the chosen canonical name', { timeout: 20_000 }, async t => {
+  const stores = await isolatedDatabase(t);
+  const accountId = await login(stores, 'a');
+  const { sheets: [old] } = await issue(stores, accountId, [freshCustomer('old', '甲店')]);
+  await stores.memory.bindCustomerAlias(accountId, { ...command(), customerId: old.partyId, alias: 'Ａ' });
+  const { sheets: [target] } = await issue(stores, accountId, [freshCustomer('target', 'A')]);
+  assert.equal((await stores.memory.resolveCustomerMention(accountId, 'Ａ')).status, 'ambiguous');
+  const draft = await save(stores, accountId, [customer('picked', ' Ａ ', undefined, [line('picked-line', '水饺', '80')])]);
+  const result = await stores.memory.chooseDraftCustomer(accountId, {
+    ...command(), draftId: draft.id, revision: draft.revision, draftCustomerId: 'picked',
+    choice: 'existing', customerId: target.partyId, remember: true,
+  });
+  assert.deepEqual(result, { revision: draft.revision + 1, remembered: true });
+  assert.deepEqual(await stores.memory.listCustomerAliases(accountId), [
+    { customerId: target.partyId, alias: 'Ａ', normalizedAlias: 'a' },
+  ]);
+  const resolved = await stores.memory.resolveCustomerMention(accountId, ' Ａ ');
+  assert.equal(resolved.status, 'resolved');
+  assert.equal(resolved.customerId, target.partyId);
+});
+
 test('customer choice keeps the draft link when the spoken name conflicts with another canonical name', { timeout: 20_000 }, async t => {
   const stores = await isolatedDatabase(t);
   const accountId = await login(stores, 'a');
@@ -525,6 +546,32 @@ test('customer choice merges the selected draft customer into the existing sheet
   assert.equal(workspace.draft.customers.length, 1);
   assert.equal(workspace.draft.customers[0].id, 'linked');
   assert.deepEqual(workspace.draft.customers[0].items.map(item => item.id), ['linked-line', 'spoken-line']);
+});
+
+test('customer choice appends overlapping items only after an explicit decision', { timeout: 20_000 }, async t => {
+  const stores = await isolatedDatabase(t);
+  const accountId = await login(stores, 'a');
+  const { sheets: [sheet] } = await issue(stores, accountId, [freshCustomer('seed', '王记餐饮')]);
+  const draft = await save(stores, accountId, [
+    customer('linked', '王记餐饮', sheet.partyId, [line('original', '水饺', '80')]),
+    customer('spoken', '老王', undefined, [line('duplicate', '水饺', null), line('other', '馄饨', null)]),
+  ]);
+  const input = { ...command(), draftId: draft.id, revision: draft.revision,
+    draftCustomerId: 'spoken', choice: 'existing', customerId: sheet.partyId, remember: true };
+  await assert.rejects(stores.memory.chooseDraftCustomer(accountId, input), { code: 'customer_merge_review' });
+  assert.deepEqual((await stores.trips.workspace(accountId)).draft, draft);
+  assert.deepEqual(await stores.memory.listCustomerAliases(accountId), []);
+
+  const append = { ...input, merge: 'append' };
+  const result = await stores.memory.chooseDraftCustomer(accountId, append);
+  assert.equal(result.remembered, true);
+  assert.deepEqual(await stores.memory.chooseDraftCustomer(accountId, append), result);
+  await assert.rejects(stores.memory.chooseDraftCustomer(accountId, { ...append, merge: 'keep_existing' }),
+    { code: 'request_conflict' });
+  const { draft: saved } = await stores.trips.workspace(accountId);
+  assert.equal(saved.revision, draft.revision + 1);
+  assert.equal(saved.customers.length, 1);
+  assert.deepEqual(saved.customers[0].items.map(item => item.id), ['original', 'duplicate', 'other']);
 });
 
 test('customer choice rejects stale drafts, confirmed drafts, busy agents and foreign parties', { timeout: 20_000 }, async t => {

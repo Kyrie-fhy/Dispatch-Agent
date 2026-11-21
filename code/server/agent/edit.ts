@@ -108,7 +108,7 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
       }
     }
     const contextSource = priorText ? `${source} ${priorText}` : source;
-    const merged = mergeOrder(next, { operations: edits }, names, contextSource);
+    const merged = mergeOrder(next, { operations: edits }, names, contextSource, true);
     if (!merged.draft) return { issues: merged.issues };
     next.customers = merged.draft.customers;
   }

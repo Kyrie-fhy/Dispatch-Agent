@@ -10,6 +10,8 @@ import { checkDraft } from './agent/store';
 import { readSaveDraft } from './draft-input';
 import { HttpError } from './http-error';
 import { readCommand, readId, readPreviewInput, uuidPattern, validSheetKey } from './request-input';
+import { sameOrSimilarProduct } from './text-orders';
+import type { CustomerDraft } from '../miniprogram/core/trips';
 
 export interface AliasCommand {
   requestId: string;
@@ -38,6 +40,7 @@ type ParsedCustomerChoice = {
   customerId?: string;
   remember?: boolean;
   spoken?: string;
+  merge?: 'append' | 'keep_existing';
 };
 type ParsedPriceAdoptLine = {
   draftCustomerId: string;
@@ -54,11 +57,14 @@ function readCustomerChoice(value: unknown): ParsedCustomerChoice {
   const basis = readPreviewInput(value);
   const body = value as Record<string, unknown>;
   const draftCustomerId = body.draftCustomerId;
+  const merge = body.merge;
   if (!validSheetKey(draftCustomerId)) throw invalidCustomerChoice();
   if (body.choice === 'existing') {
+    if (merge !== undefined && merge !== 'append' && merge !== 'keep_existing') throw invalidCustomerChoice();
     return { ...basis, draftCustomerId, choice: 'existing', customerId: readId(body.customerId, '客户编号'),
-      remember: body.remember === true };
+      remember: body.remember === true, merge };
   }
+  if (merge !== undefined) throw invalidCustomerChoice();
   if (body.choice === 'unlink') {
     const spoken = body.spoken;
     if (typeof spoken !== 'string' || spoken.length > 200 || !spoken.trim()) throw invalidCustomerChoice();
@@ -132,6 +138,10 @@ export async function readDirectory(client: PoolClient, accountId: string): Prom
   return { customers, aliases };
 }
 
+export function overlappingItems(existing: CustomerDraft, incoming: CustomerDraft) {
+  return incoming.items.filter(candidate => existing.items.some(item => sameOrSimilarProduct(item, candidate)));
+}
+
 type AliasWrite = {
   alias: string;
   normalizedAlias: string;
@@ -140,15 +150,20 @@ type AliasWrite = {
   allowCanonicalConflict: boolean;
 };
 
+async function findAlias(client: PoolClient, accountId: string, normalizedAlias: string) {
+  const { rows: [existing] } = await client.query<CustomerAlias>(`
+    SELECT customer_id AS "customerId", alias, normalized_alias AS "normalizedAlias"
+    FROM dispatch.customer_aliases WHERE account_id = $1 AND normalized_alias = $2
+  `, [accountId, normalizedAlias]);
+  return existing;
+}
+
 async function writeAlias(client: PoolClient, accountId: string, input: AliasWrite,
   customers: readonly { id: string; name: string }[]): Promise<CustomerAlias> {
   const { alias, normalizedAlias, customerId, allowRebind, allowCanonicalConflict } = input;
   // Conflict detection stays entirely in JS and runs before any INSERT/UPDATE so callers can
   // ignore customer_name_conflict without leaving the transaction aborted.
-  const { rows: [existing] } = await client.query<CustomerAlias>(`
-    SELECT customer_id AS "customerId", alias, normalized_alias AS "normalizedAlias"
-    FROM dispatch.customer_aliases WHERE account_id = $1 AND normalized_alias = $2
-  `, [accountId, normalizedAlias]);
+  const existing = await findAlias(client, accountId, normalizedAlias);
   if (existing?.customerId === customerId) return existing;
   if (existing && !allowRebind) {
     throw new HttpError(409, 'customer_alias_conflict', '该简称已关联其他客户，请确认是否换绑');
@@ -273,7 +288,7 @@ export class MemoryStore {
     const input = readCustomerChoice(value);
     const { requestId, draftId, revision, draftCustomerId, choice } = input;
     const command = { action: 'agent-customer-choice', draftId, revision, draftCustomerId, choice,
-      customerId: input.customerId, remember: input.remember, spoken: input.spoken };
+      customerId: input.customerId, remember: input.remember, spoken: input.spoken, merge: input.merge };
     return writeAccount(this.pool, accountId, requestId, command, async (client, workspace) => {
       checkDraft(workspace, draftId, revision, true);
       const running = await client.query(
@@ -294,17 +309,29 @@ export class MemoryStore {
         if (!party) throw new HttpError(404, 'customer_not_found', '未找到本账号的客户');
         const spoken = customer.customer.trim();
         const sibling = draft.customers.find(entry => entry !== customer && entry.partyId === party.id);
+        const overlap = sibling ? overlappingItems(sibling, customer) : [];
+        if (overlap.length && !input.merge) {
+          const names = [...new Set(overlap.map(item => item.product.trim()))].slice(0, 3).join('、');
+          throw new HttpError(409, 'customer_merge_review', `「${party.name}」已有同款或相似明细（${names}），请选择如何合并。`);
+        }
+        if (!overlap.length && input.merge) {
+          throw new HttpError(409, 'draft_changed', '待合并的明细已变化，请核对草稿后重新选择。');
+        }
         if (sibling) {
-          sibling.items.push(...customer.items);
+          const items = input.merge === 'keep_existing' ? customer.items.filter(item => !overlap.includes(item)) : customer.items;
+          sibling.items.push(...items);
           draft.customers = draft.customers.filter(entry => entry !== customer);
         } else {
           customer.customer = party.name;
           customer.partyId = party.id;
         }
-        if (input.remember === true && normalizeMemoryText(spoken) !== normalizeMemoryText(party.name)) {
+        const normalizedAlias = normalizeMemoryText(spoken);
+        const canonical = normalizedAlias === normalizeMemoryText(party.name);
+        const staleAlias = input.remember && canonical ? await findAlias(client, accountId, normalizedAlias) : undefined;
+        if (input.remember && normalizedAlias && (!canonical || (staleAlias && staleAlias.customerId !== party.id))) {
           try {
             await writeAlias(client, accountId, {
-              alias: spoken, normalizedAlias: normalizeMemoryText(spoken), customerId: party.id,
+              alias: spoken, normalizedAlias, customerId: party.id,
               allowRebind: true, allowCanonicalConflict: false,
             }, customers);
             remembered = true;
@@ -330,7 +357,7 @@ export class MemoryStore {
         [accountId, nextRevision, JSON.stringify(saved.customers)]);
       await client.query(`INSERT INTO dispatch.agent_events (account_id, draft_id, kind, payload)
         VALUES ($1, $2, 'card', $3)`, [accountId, draftId,
-        JSON.stringify({ action: 'customer-choice', choice, remembered })]);
+        JSON.stringify({ action: 'customer-choice', choice, remembered, merge: input.merge })]);
       return { revision: nextRevision, remembered, ...(rememberIssue ? { rememberIssue } : {}) };
     });
   }

@@ -890,6 +890,10 @@ test('A3-2 reports a name conflict without an error and reloads after a draft co
   const { page, requests, event, handle, setTurns } = setup(t, draft);
   let mode = 'name_conflict';
   handle(request => {
+    if (request.path === '/agent/conversation' && mode === 'reload_failed') {
+      request.fail();
+      return true;
+    }
     if (request.path === '/agent/memory') {
       request.ok({ draftId: draft.id, revision: draft.revision, confirmed: false,
         customers: [{ id: 'p-strong', name: '强记面馆' }], prices: [],
@@ -898,7 +902,7 @@ test('A3-2 reports a name conflict without an error and reloads after a draft co
       return true;
     }
     if (request.path === '/agent/customer-choice') {
-      if (mode === 'draft_changed') request.ok({ error: 'draft_changed', message: '草稿已变化，请重新选择' }, 409);
+      if (mode !== 'name_conflict') request.ok({ error: 'draft_changed', message: '草稿已变化，请重新选择' }, 409);
       else request.ok({ revision: draft.revision + 1, remembered: false, rememberIssue: 'name_conflict' });
       return true;
     }
@@ -917,7 +921,61 @@ test('A3-2 reports a name conflict without an error and reloads after a draft co
   mode = 'draft_changed';
   await page.chooseCustomer(tap({ customer: customerId, party: 'p-strong' }));
   assert.ok(requests.filter(request => request.path === '/agent/conversation').length > before);
-  assert.notEqual(page.data.error, '');
+  assert.equal(page.data.error, '草稿已变化，请重新选择');
+
+  mode = 'reload_failed';
+  await page.chooseCustomer(tap({ customer: customerId, party: 'p-strong' }));
+  assert.equal(page.data.error, '草稿已变化，请重新选择');
+});
+
+test('A3-2 requires an explicit merge decision after choosing a shop with similar items', async t => {
+  const draft = order();
+  delete draft.customers[0].partyId;
+  const draftCustomerId = draft.customers[0].id;
+  const { page, handle } = setup(t, draft);
+  const party = { id: 'party-1', name: '王记餐饮' };
+  const writes = [];
+  const toasts = [];
+  let tapIndex;
+  global.wx.showToast = toast => toasts.push(toast);
+  global.wx.showActionSheet = options => {
+    assert.match(options.alertText, /同款或相似明细/);
+    assert.deepEqual(options.itemList, ['追加新增明细', '同款保留原明细']);
+    if (tapIndex === undefined) options.fail({ errMsg: 'showActionSheet:fail cancel' });
+    else options.success({ tapIndex });
+  };
+  handle(request => {
+    if (request.path === '/agent/memory') {
+      request.ok({ draftId: draft.id, revision: draft.revision, confirmed: false, customers: [party], prices: [],
+        mentions: [{ draftCustomerId, resolution: { status: 'resolved', customerId: party.id, canonicalName: party.name } }] });
+      return true;
+    }
+    if (request.path === '/agent/customer-choice') {
+      writes.push(request.data);
+      if (request.data.merge) request.ok({ revision: draft.revision + 1, remembered: true });
+      else request.ok({ error: 'customer_merge_review', message: '有同款或相似明细，请选择如何合并。' }, 409);
+      return true;
+    }
+    return false;
+  });
+  await page.onShow();
+  await page.login();
+  const event = tap({ customer: draftCustomerId, party: party.id });
+  assert.equal(writes.length, 0);
+  await page.chooseCustomer(event);
+  assert.equal(writes.length, 1);
+  assert.equal(toasts.length, 0);
+
+  for (const [index, merge] of ['append', 'keep_existing'].entries()) {
+    tapIndex = index;
+    await page.chooseCustomer(event);
+    const [initial, decision] = writes.slice(-2);
+    assert.equal(initial.merge, undefined);
+    assert.equal(decision.merge, merge);
+    assert.equal(decision.revision, initial.revision);
+    assert.notEqual(decision.requestId, initial.requestId);
+  }
+  assert.equal(toasts.length, 2);
 });
 
 test('A3-2 keeps rendering the conversation when draft memory cannot be read', async t => {
@@ -1134,10 +1192,15 @@ test('A3-2 adopt-all-and-preview writes before requesting a preview and stays qu
   const writes = [];
   const turns = [];
   let fail = false;
+  let failReload = false;
   let conversations = 0;
   global.wx.showToast = spec => toasts.push(spec);
   handle(request => {
-    if (request.path === '/agent/conversation') { conversations++; return false; }
+    if (request.path === '/agent/conversation') {
+      conversations++;
+      if (failReload) { request.fail(); return true; }
+      return false;
+    }
     if (request.path === '/agent/memory') { request.ok(priceMemory(draft, prices)); return true; }
     if (request.path === '/agent/price-adopt') {
       if (fail) request.ok({ error: 'price_not_suggested', message: '这个价格不在历史成交价里，请刷新后再选。' }, 409);
@@ -1172,8 +1235,14 @@ test('A3-2 adopt-all-and-preview writes before requesting a preview and stays qu
   await page.adoptAllAndPreview();
   assert.equal(turns.length, beforeTurns, '写入失败不得发预览请求');
   assert.ok(conversations > beforeConversations, '冲突后应重新拉取对话');
-  assert.notEqual(page.data.error, '');
+  assert.match(page.data.error, /不在历史成交价里/);
   assert.equal(toasts.length, 1, '失败时不得提示已填入');
+
+  failReload = true;
+  await page.adoptAllAndPreview();
+  assert.match(page.data.error, /不在历史成交价里/);
+  assert.equal(turns.length, beforeTurns);
+  assert.equal(toasts.length, 1);
 });
 
 test('A3-2 never adopts prices while loading, polling or reloading the conversation', async t => {

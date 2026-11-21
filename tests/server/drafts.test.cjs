@@ -13,8 +13,8 @@ const { startLocalServer } = require('../../code/server-dist/server/main');
 const { configuredWechatLogin } = require('../../code/server-dist/server/wechat-login');
 const { configuredImageModel, configuredTextModel, imagePromptVersion, textPromptVersion } = require('../../code/server-dist/server/text-model');
 const { configuredSpeechModel } = require('../../code/server-dist/server/voice');
-const { configuredAgentModel } = require('../../code/server-dist/server/agent/model');
-const { configuredIntentModel } = require('../../code/server-dist/server/agent/intent');
+const { configuredAgentModel, agentPromptVersion } = require('../../code/server-dist/server/agent/model');
+const { configuredIntentModel, intentPromptVersion } = require('../../code/server-dist/server/agent/intent');
 const { configuredDeliveryModel, deliveryPromptVersion } = require('../../code/server-dist/server/agent/delivery-model');
 const { HttpError } = require('../../code/server-dist/server/http-error');
 const s6 = require('../fixtures/s6-text-cases.cjs');
@@ -2763,12 +2763,12 @@ async function seedParty(api, token, name, price = '80') {
   return { partyId: formal.data.sheets[0].partyId, draft: next.data.draft };
 }
 
-async function bindAlias(db, subject, customerId, alias) {
+async function bindAlias(db, subject, customerId, alias, extra = {}) {
   const { rows: [account] } = await db.admin.query(
     'SELECT id FROM dispatch.accounts WHERE identity_subject = $1', [subject]);
   const pool = db.pool();
   try {
-    await new MemoryStore(pool).bindCustomerAlias(account.id, { requestId: randomUUID(), customerId, alias });
+    await new MemoryStore(pool).bindCustomerAlias(account.id, { requestId: randomUUID(), customerId, alias, ...extra });
   } finally {
     await pool.end();
   }
@@ -3153,4 +3153,256 @@ test('A3 price adopt over HTTP fills one line, removes its suggestion and stays 
   assert.equal(foreign.status, 409);
   assert.equal(foreign.data.error, 'price_suggestion_changed');
   assert.equal((await read(api, a)).customers[0].items[0].price, '80.00');
+});
+
+const a3 = require('../fixtures/a3-memory-cases.cjs');
+const a3Live = process.env.DISPATCH_A3_EVAL_LIVE === '1';
+
+function a3Median(values) {
+  const sorted = values.filter(Number.isFinite).sort((left, right) => left - right);
+  return sorted.length ? (sorted[Math.floor((sorted.length - 1) / 2)] + sorted[Math.floor(sorted.length / 2)]) / 2 : null;
+}
+
+function a3Price(item) {
+  return item.price === null || item.price === undefined || item.price === '' ? null : Number(item.price);
+}
+
+async function issueMemorySale(api, token, { partyId, customer, item }) {
+  const draft = await read(api, token);
+  const saved = await putCustomers(api, token, draft, randomUUID(), [{
+    id: `a3-sheet-${randomUUID()}`, customer, partyId: partyId ?? null,
+    items: [{ id: `a3-line-${randomUUID()}`, ...item }],
+  }]);
+  const reviewed = await preview(api, token, saved, randomUUID());
+  assert.equal(reviewed.status, 200, JSON.stringify(reviewed.data));
+  const formal = await confirm(api, token, reviewed.data.preview.previewId, randomUUID());
+  assert.equal(formal.status, 200, JSON.stringify(formal.data));
+  const next = await tripCommand(api, token, 'next-draft', { draftId: saved.id, requestId: randomUUID() });
+  assert.equal(next.status, 200, JSON.stringify(next.data));
+  return formal.data.sheets[0].partyId;
+}
+
+async function seedMemoryScenario(api, db, token, scenario) {
+  const parties = new Map();
+  for (const preset of scenario.customers ?? []) {
+    let partyId;
+    for (const item of preset.history ?? []) {
+      partyId = await issueMemorySale(api, token, { partyId, customer: preset.name, item });
+    }
+    assert.ok(partyId, `${scenario.id} 缺少熟客历史`);
+    parties.set(preset.name, partyId);
+    for (const entry of preset.aliases ?? []) {
+      const binding = typeof entry === 'string' ? { alias: entry } : entry;
+      await bindAlias(db, 'a', partyId, binding.alias,
+        binding.allowCanonicalConflict ? { allowCanonicalConflict: true } : {});
+    }
+  }
+  const presetDraft = (scenario.draft ?? []).map(customer => ({
+    id: `a3-sheet-${randomUUID()}`, customer: customer.customer,
+    partyId: customer.party ? parties.get(customer.party) : null,
+    items: customer.items.map(item => ({
+      id: `a3-line-${randomUUID()}`, brand: '', specification: '', unit: '箱', quantity: '2', price: null, ...item,
+    })),
+  }));
+  if (presetDraft.length) {
+    const draft = await read(api, token);
+    await putCustomers(api, token, draft, randomUUID(), presetDraft);
+  }
+  return parties;
+}
+
+function checkMemoryTurn(result, after, memory, turn, parties) {
+  const expected = turn.expect;
+  const links = result.events.find(event => event.kind === 'customer_links')?.payload.links ?? [];
+  assert.equal(links.length, expected.links.length, `关联数不符：${JSON.stringify(links)}`);
+  for (const target of expected.links) {
+    const link = links.find(candidate => candidate.customerId === parties.get(target.canonicalName));
+    assert.ok(link, `未关联到 ${target.canonicalName}：${JSON.stringify(links)}`);
+    assert.equal(link.canonicalName, target.canonicalName);
+    assert.equal(link.matchedBy, target.matchedBy);
+    assert.equal(Boolean(link.merged), Boolean(target.merged));
+  }
+
+  const customers = after.customers.map(customer => ({
+    name: customer.customer,
+    party: customer.partyId === undefined ? 'pending' : customer.partyId === null ? 'new' : 'linked',
+    items: customer.items.map(item => ({
+      product: item.product, price: a3Price(item), quantity: item.quantity, unit: item.unit,
+    })),
+  }));
+  assert.deepEqual(customers, expected.customers);
+
+  const questions = result.events.some(event => event.kind === 'questions');
+  assert.equal(questions, expected.questions);
+
+  const names = new Map(after.customers.map(customer => [customer.id, customer.customer]));
+  const mentions = (memory.mentions ?? []).map(mention => ({
+    name: names.get(mention.draftCustomerId) ?? mention.draftCustomerId,
+    status: mention.resolution.status,
+    candidates: (mention.resolution.candidates ?? []).map(candidate => candidate.canonicalName).sort(),
+  })).sort((left, right) => left.name.localeCompare(right.name, 'zh-Hans-CN'));
+  assert.deepEqual(mentions, [...expected.mentions].sort((left, right) => left.name.localeCompare(right.name, 'zh-Hans-CN')));
+
+  if (expected.suggestion !== undefined) {
+    const item = after.customers.flatMap(customer => customer.items)
+      .find(candidate => candidate.product === expected.suggestion?.product);
+    const suggestion = item ? (memory.prices ?? []).find(entry => entry.lineId === item.id) : undefined;
+    if (expected.suggestion === null) assert.equal(suggestion, undefined);
+    else {
+      assert.ok(suggestion, `缺少 ${expected.suggestion.product} 的价格建议：${JSON.stringify(memory.prices)}`);
+      assert.equal(suggestion.status, expected.suggestion.status);
+      if (expected.suggestion.unitPriceCents !== undefined) {
+        assert.equal(suggestion.unitPriceCents, expected.suggestion.unitPriceCents);
+      }
+      if (expected.suggestion.previousDistinctPrice !== undefined) {
+        assert.equal(suggestion.previousDistinctPrice?.unitPriceCents, expected.suggestion.previousDistinctPrice);
+      }
+      if (expected.suggestion.candidates) {
+        const candidates = (suggestion.candidates ?? [])
+          .map(({ brand, spec, unitPriceCents }) => [brand, spec, unitPriceCents])
+          .sort((left, right) => left[0].localeCompare(right[0], 'zh-Hans-CN'));
+        assert.deepEqual(candidates, expected.suggestion.candidates);
+      }
+    }
+  }
+
+  if (expected.change) {
+    const changed = result.events.filter(event => event.kind === 'change').flatMap(event => event.payload.lines).join(' ');
+    assert.match(changed, expected.change);
+  }
+}
+
+test('A3 Harness: 全量记忆场景', { timeout: 1_800_000 }, async t => {
+  const liveModel = a3Live ? configuredAgentModel(process.env) : null;
+  const liveIntent = a3Live ? configuredIntentModel(process.env, 'A') : null;
+  if (a3Live) assert.ok(liveModel && liveIntent, '请在当前进程配置 DISPATCH_TEXT_MODEL_KEY；未执行真实模型评测。');
+  const rows = [];
+  const trials = [];
+  const redLines = [];
+
+  for (const scenario of a3.cases) {
+    for (let sample = 1; sample <= (a3Live ? 3 : 1); sample++) {
+      await t.test(`A3 Harness: ${scenario.id} #${sample}`, async sampleTest => {
+        let fixture;
+        const agentModel = a3Live ? liveModel : async () => {
+          assert.ok(fixture, '缺少本轮固定模型输出');
+          return makeToolReply(fixture);
+        };
+        const intentModel = a3Live ? liveIntent : async () => ({ draft: true, query: false, preview: false, answering: false });
+        let api;
+        let draft;
+        const failures = [];
+        try {
+          const db = await isolatedDatabase(sampleTest);
+          api = await start(db, undefined, undefined, undefined, undefined, agentModel, intentModel);
+          const token = await login(api, 'a');
+          const parties = await seedMemoryScenario(api, db, token, scenario);
+          draft = await read(api, token);
+          for (const turn of scenario.turns) {
+            fixture = turn.fixture;
+            const row = { scenario: scenario.id, sample, text: turn.text, ok: false, mode: a3Live ? 'live' : 'fixture',
+              elapsedMs: null, calls: 0 };
+            rows.push(row);
+            try {
+              if (turn.choice) {
+                const pending = draft.customers.find(customer => customer.customer === turn.choice.spoken);
+                assert.ok(pending, `缺少待选客户 ${turn.choice.spoken}`);
+                const chosen = await agentPost(api, token, 'customer-choice', {
+                  requestId: randomUUID(), draftId: draft.id, revision: draft.revision,
+                  draftCustomerId: pending.id, choice: 'existing',
+                  customerId: parties.get(turn.choice.customer), remember: turn.choice.remember,
+                });
+                assert.equal(chosen.status, 200, JSON.stringify(chosen.data));
+                assert.equal(chosen.data.remembered, true, JSON.stringify(chosen.data));
+                const aliases = (await api.request('/v1/customer-aliases', { token })).data.aliases;
+                assert.ok(aliases.some(alias => alias.alias === turn.choice.spoken &&
+                  alias.customerId === parties.get(turn.choice.customer)), JSON.stringify(aliases));
+                draft = await read(api, token);
+              }
+
+              const submitted = await agentPost(api, token, 'turns', agentInput(draft, turn.text));
+              assert.equal(submitted.status, 202, JSON.stringify(submitted.data));
+              const result = await waitForAgent(api, token, submitted.data.turnId);
+              const stored = (await db.admin.query(`SELECT kind, payload FROM dispatch.agent_events
+                WHERE turn_id = $1 ORDER BY seq`, [submitted.data.turnId])).rows;
+              const models = stored.filter(event => event.kind === 'model').map(event => event.payload);
+              row.calls = models.length;
+              row.models = models;
+              row.status = result.status;
+              row.elapsedMs = result.events.find(event => event.kind === 'end')?.payload.elapsedMs ?? result.wallMs;
+              assert.equal(result.status, 'completed', result.events.find(event => event.kind === 'end')?.payload.text);
+
+              const after = await read(api, token);
+              const memoryResponse = await api.request(`/v1/agent/memory?draftId=${after.id}`, { token });
+              assert.equal(memoryResponse.status, 200, JSON.stringify(memoryResponse.data));
+
+              const links = result.events.find(event => event.kind === 'customer_links')?.payload.links ?? [];
+              const allowedParties = new Set((turn.expect.links ?? []).map(link => parties.get(link.canonicalName)));
+              for (const link of links) {
+                if (!allowedParties.has(link.customerId)) {
+                  redLines.push({ scenario: scenario.id, sample, text: turn.text, kind: 'wrong_customer',
+                    detail: { spoken: link.spoken, canonicalName: link.canonicalName, customerId: link.customerId } });
+                }
+              }
+              const spokenPrices = (turn.spokenPrices ?? []).map(Number);
+              for (const item of after.customers.flatMap(customer => customer.items)) {
+                const price = a3Price(item);
+                if (price !== null && !spokenPrices.includes(price)) {
+                  redLines.push({ scenario: scenario.id, sample, text: turn.text, kind: 'wrong_price',
+                    detail: { product: item.product, price, spokenPrices } });
+                }
+              }
+
+              checkMemoryTurn(result, after, memoryResponse.data, turn, parties);
+              row.after = after.customers.map(customer => ({
+                name: customer.customer,
+                partyId: customer.partyId ?? null,
+                items: customer.items.map(item => [item.product, item.price]),
+              }));
+              draft = after;
+              row.ok = true;
+            } catch (error) {
+              row.reason = error.message;
+              failures.push(`${turn.text}：${error.message}`);
+              try { draft = await read(api, token); } catch { /* 保持上一份草稿 */ }
+            }
+            sampleTest.diagnostic(JSON.stringify(row));
+          }
+        } catch (error) {
+          rows.push({ scenario: scenario.id, sample, text: 'setup', ok: false, mode: a3Live ? 'live' : 'fixture',
+            reason: error.message });
+          failures.push(`setup：${error.message}`);
+        } finally {
+          await api?.stop().catch(() => {});
+        }
+        trials.push(failures.length === 0);
+        if (!a3Live) assert.deepEqual(failures, []);
+      });
+    }
+  }
+
+  const summary = {
+    mode: a3Live ? 'live' : 'fixture',
+    model: [...new Set(rows.flatMap(row => row.models ?? []).map(model => model.model))],
+    promptVersion: agentPromptVersion,
+    intentPromptVersion,
+    scenarios: trials.length,
+    passed: trials.filter(Boolean).length,
+    turns: rows.length,
+    passedTurns: rows.filter(row => row.ok).length,
+    redLines: redLines.length,
+    redLineDetails: redLines,
+    medianMs: a3Median(rows.map(row => row.elapsedMs)),
+    medianCalls: a3Median(rows.map(row => row.calls)),
+    failures: rows.filter(row => !row.ok).map(({ scenario, sample, text, reason }) => ({ scenario, sample, text, reason })),
+  };
+  t.diagnostic(`A3 SUMMARY ${JSON.stringify(summary)}`);
+  assert.equal(trials.length, a3.cases.length * (a3Live ? 3 : 1));
+  assert.equal(summary.redLines, 0, `红线：${JSON.stringify(summary.redLineDetails)}`);
+  if (a3Live) {
+    assert.ok(summary.passed / summary.scenarios >= 0.9, 'A3 场景通过率低于 90%');
+    assert.ok(summary.medianMs !== null && summary.medianMs <= 2500, 'A3 回合耗时中位数高于 2.5s');
+  } else {
+    assert.deepEqual(summary.failures, []);
+  }
 });

@@ -63,6 +63,10 @@ function setup(t, initialDraft) {
       if (path === '/agent/conversation') return entry.ok({ draft: structuredClone(draft), draftConfirmed: confirmed, confirmedPreviewId, turns: structuredClone(turns), delivery: structuredClone(delivery) });
       if (path === '/materials') return entry.ok({ materials: [] });
       if (path === '/workspace') return entry.ok({ draft: structuredClone(draft), parties: [], draftConfirmed: confirmed, currentTrip: null });
+      if (path === '/agent/memory') return entry.ok({ draftId: entry.query.get('draftId'), revision: draft.revision,
+        confirmed, customers: [], mentions: [], prices: [] });
+      if (path === '/customer-aliases') return entry.ok({ aliases: [] });
+      if (path === '/customer-aliases/unbind') return entry.ok({ removed: null });
       assert.fail(`Unhandled request ${entry.method} ${path}`);
     },
     navigateTo: ({ url }) => navigation.push(url),
@@ -813,4 +817,458 @@ test('Agent starts the next trip from delivery cards with a guard for unfinished
   assert.equal(page.data.confirmed, false);
   assert.equal(page.data.turns.length, 0);
   assert.equal(page.data.navTitle, '录单助手');
+});
+
+test('A3-2 shows the pending customer choice card and posts the courier selection with remember', async t => {
+  const draft = order();
+  Object.assign(draft.customers[0], { customer: '阿强' });
+  delete draft.customers[0].partyId;
+  const customerId = draft.customers[0].id;
+  const memory = () => ({ draftId: draft.id, revision: draft.revision, confirmed: false,
+    customers: [{ id: 'p-strong', name: '强记面馆' }, { id: 'p-wang', name: '王记餐饮' }],
+    mentions: [{ draftCustomerId: customerId, resolution: { status: 'candidate_only', customerId: null,
+      candidates: [{ customerId: 'p-strong', canonicalName: '强记面馆' }] } }],
+    prices: [] });
+  const { page, event, handle, setTurns } = setup(t, draft);
+  const selections = [];
+  handle(request => {
+    if (request.path === '/agent/memory') { request.ok(memory()); return true; }
+    if (request.path === '/agent/customer-choice') {
+      selections.push(request.data);
+      request.ok({ revision: draft.revision + 1, remembered: null });
+      return true;
+    }
+    return false;
+  });
+  await page.onShow();
+  await page.login();
+  assert.equal(page.data.turns.length, 0);
+  assert.equal(page.data.choices.length, 1, '起始卡也要显示选店卡');
+
+  setTurns([{ id: 'turn-pending', text: '阿强一箱汤圆', materialIds: [], revision: draft.revision, status: 'completed',
+    events: [event('change', { lines: ['阿强：待选店'] }),
+      event('end', { status: 'completed', text: '草稿已更新。', revision: draft.revision })] }]);
+  await page.onShow();
+  assert.equal(page.data.choices.length, 1);
+  assert.equal(page.data.choices[0].spoken, '阿强');
+  assert.equal(page.data.choices[0].remember, true);
+  assert.equal(page.data.choices[0].hint, '像下面这几家');
+  assert.deepEqual(page.data.choices[0].candidates, [{ id: 'p-strong', name: '强记面馆' }]);
+  assert.deepEqual(page.data.memoryNames, ['强记面馆', '王记餐饮']);
+  assert.equal(page.data.turns[0].showChoices, true);
+
+  await page.chooseCustomer(tap({ customer: customerId, party: 'p-strong' }));
+  const first = selections.at(-1);
+  assert.equal(first.choice, 'existing');
+  assert.equal(first.customerId, 'p-strong');
+  assert.equal(first.remember, true);
+  assert.equal(first.draftCustomerId, customerId);
+  assert.equal(first.draftId, draft.id);
+  assert.equal(first.revision, draft.revision);
+  assert.ok(first.requestId);
+
+  page.toggleRemember(tap({ customer: customerId }));
+  assert.equal(page.data.choices[0].remember, false);
+  await page.chooseCustomer(tap({ customer: customerId, party: 'p-strong' }));
+  assert.equal(selections.at(-1).remember, false);
+
+  page.toggleRemember(tap({ customer: customerId }));
+  assert.equal(page.data.choices[0].remember, true);
+  await page.pickCustomer({ ...tap({ customer: customerId }), detail: { value: '1' } });
+  assert.equal(selections.at(-1).customerId, 'p-wang');
+  assert.equal(selections.at(-1).remember, true);
+
+  await page.newCustomer(tap({ customer: customerId }));
+  assert.equal(selections.at(-1).choice, 'new');
+});
+
+test('A3-2 reports a name conflict without an error and reloads after a draft conflict', async t => {
+  const draft = order();
+  Object.assign(draft.customers[0], { customer: '阿强' });
+  delete draft.customers[0].partyId;
+  const customerId = draft.customers[0].id;
+  const { page, requests, event, handle, setTurns } = setup(t, draft);
+  let mode = 'name_conflict';
+  handle(request => {
+    if (request.path === '/agent/conversation' && mode === 'reload_failed') {
+      request.fail();
+      return true;
+    }
+    if (request.path === '/agent/memory') {
+      request.ok({ draftId: draft.id, revision: draft.revision, confirmed: false,
+        customers: [{ id: 'p-strong', name: '强记面馆' }], prices: [],
+        mentions: [{ draftCustomerId: customerId, resolution: { status: 'candidate_only', customerId: null,
+          candidates: [{ customerId: 'p-strong', canonicalName: '强记面馆' }] } }] });
+      return true;
+    }
+    if (request.path === '/agent/customer-choice') {
+      if (mode !== 'name_conflict') request.ok({ error: 'draft_changed', message: '草稿已变化，请重新选择' }, 409);
+      else request.ok({ revision: draft.revision + 1, remembered: false, rememberIssue: 'name_conflict' });
+      return true;
+    }
+    return false;
+  });
+  setTurns([{ id: 'turn-pending', text: '阿强一箱汤圆', materialIds: [], revision: draft.revision, status: 'completed',
+    events: [event('change', { lines: ['阿强：待选店'] }),
+      event('end', { status: 'completed', text: '草稿已更新。', revision: draft.revision })] }]);
+  await page.onShow();
+  await page.login();
+  await page.chooseCustomer(tap({ customer: customerId, party: 'p-strong' }));
+  assert.match(page.data.notice, /没有记住/);
+  assert.equal(page.data.error, '');
+
+  const before = requests.filter(request => request.path === '/agent/conversation').length;
+  mode = 'draft_changed';
+  await page.chooseCustomer(tap({ customer: customerId, party: 'p-strong' }));
+  assert.ok(requests.filter(request => request.path === '/agent/conversation').length > before);
+  assert.equal(page.data.error, '草稿已变化，请重新选择');
+
+  mode = 'reload_failed';
+  await page.chooseCustomer(tap({ customer: customerId, party: 'p-strong' }));
+  assert.equal(page.data.error, '草稿已变化，请重新选择');
+});
+
+test('A3-2 requires an explicit merge decision after choosing a shop with similar items', async t => {
+  const draft = order();
+  delete draft.customers[0].partyId;
+  const draftCustomerId = draft.customers[0].id;
+  const { page, handle } = setup(t, draft);
+  const party = { id: 'party-1', name: '王记餐饮' };
+  const writes = [];
+  const toasts = [];
+  let tapIndex;
+  global.wx.showToast = toast => toasts.push(toast);
+  global.wx.showActionSheet = options => {
+    assert.match(options.alertText, /同款或相似明细/);
+    assert.deepEqual(options.itemList, ['追加新增明细', '同款保留原明细']);
+    if (tapIndex === undefined) options.fail({ errMsg: 'showActionSheet:fail cancel' });
+    else options.success({ tapIndex });
+  };
+  handle(request => {
+    if (request.path === '/agent/memory') {
+      request.ok({ draftId: draft.id, revision: draft.revision, confirmed: false, customers: [party], prices: [],
+        mentions: [{ draftCustomerId, resolution: { status: 'resolved', customerId: party.id, canonicalName: party.name } }] });
+      return true;
+    }
+    if (request.path === '/agent/customer-choice') {
+      writes.push(request.data);
+      if (request.data.merge) request.ok({ revision: draft.revision + 1, remembered: true });
+      else request.ok({ error: 'customer_merge_review', message: '有同款或相似明细，请选择如何合并。' }, 409);
+      return true;
+    }
+    return false;
+  });
+  await page.onShow();
+  await page.login();
+  const event = tap({ customer: draftCustomerId, party: party.id });
+  assert.equal(writes.length, 0);
+  await page.chooseCustomer(event);
+  assert.equal(writes.length, 1);
+  assert.equal(toasts.length, 0);
+
+  for (const [index, merge] of ['append', 'keep_existing'].entries()) {
+    tapIndex = index;
+    await page.chooseCustomer(event);
+    const [initial, decision] = writes.slice(-2);
+    assert.equal(initial.merge, undefined);
+    assert.equal(decision.merge, merge);
+    assert.equal(decision.revision, initial.revision);
+    assert.notEqual(decision.requestId, initial.requestId);
+  }
+  assert.equal(toasts.length, 2);
+});
+
+test('A3-2 keeps rendering the conversation when draft memory cannot be read', async t => {
+  const draft = order();
+  const { page, event, handle, setTurns } = setup(t, draft);
+  setTurns([{ id: 'turn-1', text: '水饺两箱', materialIds: [], revision: draft.revision, status: 'completed',
+    events: [event('change', { lines: ['老王 水饺 +2 箱'] }),
+      event('end', { status: 'completed', text: '草稿已更新。', revision: draft.revision })] }]);
+  handle(request => {
+    if (request.path === '/agent/memory') { request.fail(); return true; }
+    return false;
+  });
+  await page.onShow();
+  await page.login();
+  assert.equal(page.data.memoryFailed, true);
+  assert.equal(page.data.turns.length, 1);
+  assert.equal(page.data.turns[0].reply, '');
+  assert.equal(page.data.error, '');
+  assert.deepEqual(page.data.choices, []);
+  await page.reload();
+});
+
+test('A3-2 offers not-him only for links still pointing at a draft customer', async t => {
+  const draft = order();
+  Object.assign(draft.customers[0], { customer: '王记餐饮', partyId: 'party-1' });
+  const customerId = draft.customers[0].id;
+  const { page, event, handle, setDraft, setTurns } = setup(t, draft);
+  const link = { draftCustomerId: customerId, spoken: '老王', customerId: 'party-1', canonicalName: '王记餐饮',
+    matchedBy: 'alias', merged: false };
+  const turn = { id: 'turn-link', text: '老王两箱水饺', materialIds: [], revision: draft.revision, status: 'completed',
+    events: [event('change', { lines: ['老王 → 王记餐饮（记住的叫法）'] }),
+      event('customer_links', { links: [link,
+        { ...link, draftCustomerId: 'merged-away', merged: true }] }),
+      event('end', { status: 'completed', text: '草稿已更新。', revision: draft.revision })] };
+  setTurns([turn]);
+  let payload;
+  handle(request => {
+    if (request.path === '/agent/customer-choice') {
+      payload = request.data;
+      request.ok({ revision: draft.revision + 1, remembered: null });
+      return true;
+    }
+    return false;
+  });
+  await page.onShow();
+  await page.login();
+  assert.equal(page.data.turns[0].links.length, 1);
+  assert.equal(page.data.turns[0].links[0].label, '老王 → 王记餐饮');
+  await page.notHim(tap({ turn: turn.id, customer: customerId }));
+  assert.equal(payload.choice, 'unlink');
+  assert.equal(payload.spoken, '老王');
+  assert.equal(payload.draftCustomerId, customerId);
+  assert.equal(payload.draftId, draft.id);
+  assert.equal(payload.revision, draft.revision);
+
+  const canonical = { ...draft, customers: [{ ...draft.customers[0], customer: '王记餐饮' }] };
+  setDraft(canonical);
+  setTurns([{ ...turn, id: 'turn-canonical', events: [event('change', { lines: ['王记餐饮：认出熟客'] }),
+    event('customer_links', { links: [{ ...link, spoken: '王记餐饮', matchedBy: 'canonical' }] }),
+    event('end', { status: 'completed', text: '草稿已更新。', revision: canonical.revision })] }]);
+  await page.onShow();
+  assert.equal(page.data.turns[0].links[0].label, '王记餐饮：认出熟客');
+});
+
+test('Profile lists remembered aliases and keeps them when the alias reload fails', async t => {
+  const draft = order();
+  const { pageFor, requests, handle } = setup(t, draft);
+  const profile = pageFor('profile');
+  const alias = { alias: '老王', normalizedAlias: '老王', customerId: 'party-1', canonicalName: '王记餐饮' };
+  let aliasLoads = 0;
+  handle(request => {
+    if (request.path === '/workspace') {
+      request.ok({ draft, parties: [{ id: 'party-1', name: '王记餐饮' }], draftConfirmed: false, currentTrip: null });
+      return true;
+    }
+    if (request.path === '/customer-aliases') {
+      aliasLoads += 1;
+      if (aliasLoads === 1) request.ok({ aliases: [alias] });
+      else request.fail();
+      return true;
+    }
+    if (request.path === '/customer-aliases/unbind') {
+      assert.equal(request.data.alias, '老王');
+      assert.ok(request.data.requestId);
+      request.ok({ removed: alias });
+      return true;
+    }
+    return false;
+  });
+  await profile.onShow();
+  await profile.login();
+  assert.equal(profile.data.aliases.length, 1);
+  assert.deepEqual(profile.data.aliases[0], { alias: '老王', canonicalName: '王记餐饮' });
+  assert.equal(profile.data.aliasError, '');
+
+  let modal;
+  global.wx.showModal = spec => { modal = spec; };
+  profile.unbindAlias(tap({ alias: '老王', name: '王记餐饮' }));
+  assert.match(modal.content, /老王/);
+  assert.match(modal.content, /王记餐饮/);
+  assert.ok(modal.confirmText.length <= 4);
+  assert.equal(requests.filter(request => request.path === '/customer-aliases/unbind').length, 0);
+
+  delete global.wx.showModal;
+  await profile.unbindAlias(tap({ alias: '老王', name: '王记餐饮' }));
+  assert.equal(requests.filter(request => request.path === '/customer-aliases/unbind').length, 1);
+  assert.equal(profile.data.aliases.length, 1);
+  assert.notEqual(profile.data.aliasError, '');
+});
+
+test('A3-2 choice and alias controls avoid mini buttons and keep the alias card title', () => {
+  const agentWxml = fs.readFileSync(require.resolve('../code/dist/pages/agent/index.wxml'), 'utf8');
+  const profileWxml = fs.readFileSync(require.resolve('../code/dist/pages/profile/index.wxml'), 'utf8');
+  assert.equal(agentWxml.includes('size="mini"'), false);
+  assert.equal(profileWxml.includes('size="mini"'), false);
+  assert.ok(profileWxml.includes('记住的叫法'));
+  assert.ok(agentWxml.includes('!choices.length'));
+});
+
+function priceMemory(draft, prices) {
+  return { draftId: draft.id, revision: draft.revision, confirmed: false, customers: [], mentions: [], prices };
+}
+
+function pricedDraft() {
+  const draft = order();
+  Object.assign(draft.customers[0], { customer: '王记餐饮', partyId: 'party-1' });
+  const base = draft.customers[0].items[0];
+  draft.customers[0].items = [
+    { ...base, id: 'line-a', product: '水饺', price: null },
+    { ...base, id: 'line-b', product: '馄饨', price: null },
+    { ...base, id: 'line-c', product: '汤圆', price: null },
+  ];
+  return draft;
+}
+
+test('A3-2 price hints show latest, earlier and variant prices and only tapped suggestions are adopted', async t => {
+  const wxml = fs.readFileSync(require.resolve('../code/dist/pages/agent/index.wxml'), 'utf8');
+  assert.ok(wxml.includes('全部沿用'));
+  assert.ok(wxml.includes('沿用上次价并重新预览'));
+  const draft = pricedDraft();
+  const customerId = draft.customers[0].id;
+  const prices = [
+    { draftCustomerId: customerId, lineId: 'line-a', customerId: 'party-1', status: 'exact_match',
+      unitPriceCents: 8200, issuedAt: '2026-11-18T12:00:00.000Z', previousDistinctPrice: null },
+    { draftCustomerId: customerId, lineId: 'line-b', customerId: 'party-1', status: 'exact_match',
+      unitPriceCents: 7800, issuedAt: '2026-11-17T12:00:00.000Z',
+      previousDistinctPrice: { unitPriceCents: 8000, issuedAt: '2026-10-30T12:00:00.000Z', tripId: 't-old', sheetId: 's-old' } },
+    { draftCustomerId: customerId, lineId: 'line-c', customerId: 'party-1', status: 'ambiguous_variants',
+      candidates: [
+        { unitPriceCents: 9000, issuedAt: '2026-11-16T12:00:00.000Z', tripId: 't-1', sheetId: 's-1', brand: '甲牌', spec: '500g' },
+        { unitPriceCents: 9500, issuedAt: '2026-11-15T12:00:00.000Z', tripId: 't-2', sheetId: 's-2', brand: '乙牌', spec: '1kg' },
+      ] },
+  ];
+  const { page, event, handle, setTurns } = setup(t, draft);
+  const posts = [];
+  handle(request => {
+    if (request.path === '/agent/memory') { request.ok(priceMemory(draft, prices)); return true; }
+    if (request.path === '/agent/price-adopt') {
+      posts.push(request.data);
+      request.ok({ revision: draft.revision + 1, adopted: request.data.lines.length });
+      return true;
+    }
+    return false;
+  });
+  setTurns([{ id: 'turn-priced', text: '王记餐饮两箱水饺', materialIds: [], revision: draft.revision, status: 'completed',
+    events: [event('change', { lines: ['王记餐饮 水饺 +2 箱'] }),
+      event('end', { status: 'completed', text: '草稿已更新。', revision: draft.revision })] }]);
+  await page.onShow();
+  await page.login();
+  assert.equal(posts.length, 0, '页面加载不得自动沿用');
+  assert.equal(page.data.adoptableCount, 2);
+  assert.match(page.data.priceHints['line-a'].text, /上次 ¥82\.00（11-18）/);
+  assert.match(page.data.priceHints['line-b'].text, /更早 ¥80\.00（10-30）/);
+  assert.equal(page.data.priceHints['line-c'].text, '上次买过几种，选一种');
+  assert.equal(page.data.priceHints['line-c'].options[0].text, '甲牌 500g ¥90.00');
+  assert.deepEqual(page.data.priceHints['line-a'].options, [{ cents: 8200, text: '沿用' }]);
+  assert.equal(page.data.priceHints['line-b'].options[1].cents, 8000);
+
+  await page.adoptPrice(tap({ line: 'line-a', customer: customerId, cents: 8200 }));
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].lines.length, 1);
+  assert.equal(posts[0].lines[0].unitPriceCents, 8200);
+  assert.ok(Number.isInteger(posts[0].lines[0].unitPriceCents));
+  assert.equal(posts[0].lines[0].draftCustomerId, customerId);
+  assert.equal(posts[0].lines[0].lineId, 'line-a');
+  assert.equal(posts[0].draftId, draft.id);
+  assert.equal(posts[0].revision, draft.revision);
+  assert.ok(posts[0].requestId);
+
+  await page.adoptPrice(tap({ line: 'line-b', customer: customerId, cents: 8000 }));
+  assert.equal(posts.at(-1).lines[0].unitPriceCents, 8000);
+  assert.equal(posts.at(-1).lines[0].variant, undefined);
+
+  await page.adoptPrice(tap({ line: 'line-c', customer: customerId, cents: 9500, brand: '乙牌', spec: '1kg' }));
+  assert.deepEqual(posts.at(-1).lines[0].variant, { brand: '乙牌', spec: '1kg' });
+
+  await page.adoptAll();
+  assert.deepEqual(posts.at(-1).lines.map(line => [line.lineId, line.unitPriceCents]),
+    [['line-a', 8200], ['line-b', 7800]]);
+  assert.equal(posts.at(-1).lines.some(line => line.lineId === 'line-c'), false);
+});
+
+test('A3-2 adopt-all-and-preview writes before requesting a preview and stays quiet on failure', async t => {
+  const draft = pricedDraft();
+  const customerId = draft.customers[0].id;
+  const prices = [
+    { draftCustomerId: customerId, lineId: 'line-a', customerId: 'party-1', status: 'exact_match',
+      unitPriceCents: 8200, issuedAt: '2026-11-18T12:00:00.000Z', previousDistinctPrice: null },
+    { draftCustomerId: customerId, lineId: 'line-b', customerId: 'party-1', status: 'exact_match',
+      unitPriceCents: 7800, issuedAt: '2026-11-17T12:00:00.000Z', previousDistinctPrice: null },
+  ];
+  const { page, handle } = setup(t, draft);
+  const toasts = [];
+  const writes = [];
+  const turns = [];
+  let fail = false;
+  let failReload = false;
+  let conversations = 0;
+  global.wx.showToast = spec => toasts.push(spec);
+  handle(request => {
+    if (request.path === '/agent/conversation') {
+      conversations++;
+      if (failReload) { request.fail(); return true; }
+      return false;
+    }
+    if (request.path === '/agent/memory') { request.ok(priceMemory(draft, prices)); return true; }
+    if (request.path === '/agent/price-adopt') {
+      if (fail) request.ok({ error: 'price_not_suggested', message: '这个价格不在历史成交价里，请刷新后再选。' }, 409);
+      else {
+        writes.push(request.data);
+        request.ok({ revision: draft.revision + 1, adopted: request.data.lines.length });
+      }
+      return true;
+    }
+    if (request.path === '/agent/turns') {
+      turns.push(request.data);
+      request.ok({ turnId: 'preview-turn' }, 202);
+      return true;
+    }
+    return false;
+  });
+  await page.onShow();
+  await page.login();
+  await page.adoptAllAndPreview();
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].lines.length, 2);
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0].text, '生成送货单');
+  assert.deepEqual(turns[0].direct, { intent: 'preview' });
+  assert.deepEqual(toasts, [{ title: '已填入单价', icon: 'success' }]);
+
+  page.stopPolling();
+  page.setData({ polling: false, error: '' });
+  fail = true;
+  const beforeConversations = conversations;
+  const beforeTurns = turns.length;
+  await page.adoptAllAndPreview();
+  assert.equal(turns.length, beforeTurns, '写入失败不得发预览请求');
+  assert.ok(conversations > beforeConversations, '冲突后应重新拉取对话');
+  assert.match(page.data.error, /不在历史成交价里/);
+  assert.equal(toasts.length, 1, '失败时不得提示已填入');
+
+  failReload = true;
+  await page.adoptAllAndPreview();
+  assert.match(page.data.error, /不在历史成交价里/);
+  assert.equal(turns.length, beforeTurns);
+  assert.equal(toasts.length, 1);
+});
+
+test('A3-2 never adopts prices while loading, polling or reloading the conversation', async t => {
+  const draft = pricedDraft();
+  const customerId = draft.customers[0].id;
+  const prices = [{ draftCustomerId: customerId, lineId: 'line-a', customerId: 'party-1', status: 'exact_match',
+    unitPriceCents: 8200, issuedAt: '2026-11-18T12:00:00.000Z', previousDistinctPrice: null }];
+  const { page, event, handle, setTurns } = setup(t, draft);
+  let adopts = 0;
+  handle(request => {
+    if (request.path === '/agent/memory') { request.ok(priceMemory(draft, prices)); return true; }
+    if (request.path === '/agent/price-adopt') { adopts++; request.ok({ revision: draft.revision + 1, adopted: 1 }); return true; }
+    if (request.path === '/agent/turns/running-turn/events') {
+      request.ok({ status: 'completed', events: [event('end', { status: 'completed', text: '好了', revision: draft.revision })] });
+      return true;
+    }
+    return false;
+  });
+  setTurns([{ id: 'running-turn', text: '王记餐饮两箱水饺', materialIds: [], revision: draft.revision, status: 'running',
+    events: [event('plan', { steps: [{ id: 'intent', text: '看懂你的意思' }] })] }]);
+  await page.onShow();
+  await page.login();
+  page.stopPolling();
+  assert.equal(page.data.adoptableCount, 1);
+  await page.poll();
+  assert.equal(adopts, 0);
+  await page.reload();
+  assert.equal(adopts, 0);
 });

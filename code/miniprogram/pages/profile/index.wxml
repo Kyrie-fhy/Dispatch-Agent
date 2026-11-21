@@ -28,6 +28,20 @@
       </view>
     </view>
 
+    <view class="card aliases-card">
+      <view class="card-title">记住的叫法</view>
+      <view wx:if="{{aliases.length}}" class="alias-list">
+        <view wx:for="{{aliases}}" wx:key="alias" class="alias-row">
+          <text class="alias-text">{{item.alias}} → {{item.canonicalName}}</text>
+          <button class="btn-danger-ghost alias-btn" data-alias="{{item.alias}}" data-name="{{item.canonicalName}}"
+            bindtap="unbindAlias" disabled="{{busy}}">解绑</button>
+        </view>
+      </view>
+      <text wx:if="{{aliasError}}" class="hint">{{aliasError}}</text>
+      <text wx:elif="{{aliasesLoaded && !aliases.length}}" class="hint">还没有记住的叫法。录单选店时勾选「记住这个叫法」即可。</text>
+      <text wx:elif="{{!aliasesLoaded}}" class="hint">正在同步…</text>
+    </view>
+
     <view class="action-group">
       <button wx:if="{{canEditForm}}" class="btn-secondary" bindtap="openWorkspace" disabled="{{busy}}">打开表单手动改草稿</button>
       <button class="btn-danger-ghost" bindtap="logout" disabled="{{busy}}">退出登录</button>

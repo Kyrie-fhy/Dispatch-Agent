@@ -55,6 +55,16 @@ export function isPlaceholder(item: ItemInput) {
   return (!item.unit || item.unit === '箱') && textFields.every(field => field === 'unit' || !item[field]?.trim());
 }
 
+export function sameOrSimilarProduct(item: ItemInput, candidate: Partial<Fields>) {
+  const product = normalized(candidate.product ?? '');
+  if (!product || normalized(item.product) !== product) return false;
+  return productFields.every(field => {
+    const existing = normalized(item[field] ?? '');
+    const incoming = normalized(candidate[field] ?? '');
+    return !existing || !incoming || existing === incoming;
+  });
+}
+
 export function safeFields(op: Record<string, unknown>, invalidModel: () => never) {
   const fields: Partial<Fields> = {};
   for (const key of textFields) {
@@ -69,8 +79,12 @@ export function safeFields(op: Record<string, unknown>, invalidModel: () => neve
   return fields;
 }
 
-function prepareOrder(draft: TripDraft, output: unknown, partyNames: Set<string>, text?: string): TripDraft {
+function prepareOrder(draft: TripDraft, output: unknown, partyNames: Set<string>, text?: string, agent = false): TripDraft {
   const image = text === undefined;
+  const partyChoice = (owner: CustomerDraft, name: string) => {
+    if (agent) return owner.partyId === null || (name && !partyNames.size) ? null : undefined;
+    return !name || partyNames.has(normalized(name)) ? undefined : null;
+  };
   function invalidModel(): never {
     throw image
       ? new HttpError(502, 'invalid_image_result', '图片整理结果无法读取。图片已保留，可以重试或手动填写。')
@@ -126,7 +140,7 @@ function prepareOrder(draft: TripDraft, output: unknown, partyNames: Set<string>
           needsReview('草稿已有同名客户，请手动核对明细归属。');
         }
         row.customer.customer = customer;
-        row.customer.partyId = partyNames.has(normalized(customer)) ? undefined : null;
+        row.customer.partyId = partyChoice(row.customer, customer);
       }
       for (const field of textFields) {
         const incoming = fields[field];
@@ -152,11 +166,10 @@ function prepareOrder(draft: TripDraft, output: unknown, partyNames: Set<string>
           next.customers.push(owner);
         }
         owner.customer = customer;
-        owner.partyId = !customer || partyNames.has(normalized(customer)) ? undefined : null;
+        owner.partyId = partyChoice(owner, customer);
       }
       if (image && !customer) unnamedImageCustomer = owner;
-      if (product && owner.items.some(item => normalized(item.product) === normalized(product) &&
-          productFields.every(field => !item[field]?.trim() || !fields[field] || normalized(item[field]) === normalized(fields[field] ?? '')))) {
+      if (owner.items.some(item => sameOrSimilarProduct(item, fields))) {
         needsReview('草稿里有同款或相似货品，请补充规格和单位，或直接修改现有明细。');
       }
       const blank = owner.items.findIndex(isPlaceholder);
@@ -173,8 +186,8 @@ function prepareOrder(draft: TripDraft, output: unknown, partyNames: Set<string>
 
 class OrderReview extends Error {}
 
-export function mergeOrder(draft: TripDraft, output: unknown, partyNames: Set<string>, text?: string) {
-  try { return { draft: prepareOrder(draft, output, partyNames, text), issues: [] }; }
+export function mergeOrder(draft: TripDraft, output: unknown, partyNames: Set<string>, text?: string, agent = false) {
+  try { return { draft: prepareOrder(draft, output, partyNames, text, agent), issues: [] }; }
   catch (error) {
     if (!(error instanceof OrderReview)) throw error;
     return { draft: null, issues: [{ code: text === undefined ? 'image_needs_review' : 'text_needs_review', message: error.message }] };
@@ -184,6 +197,7 @@ export function mergeOrder(draft: TripDraft, output: unknown, partyNames: Set<st
 type ApplyHooks = {
   signal: AbortSignal;
   trace: (trace: ModelTrace) => void;
+  prepare: (client: PoolClient, draft: TripDraft, before: TripDraft) => Promise<TripDraft>;
   saved: (client: PoolClient, draft: TripDraft, digest: string) => Promise<void>;
   recognized?: { digest: string; output: unknown };
 };
@@ -271,15 +285,16 @@ export class TextOrders {
         }
         output = await this.model({ text: input.text, current });
       }
-      const merged = mergeOrder(snapshot.draft, output, snapshot.partyNames, image ? undefined : input.text);
+      const merged = mergeOrder(snapshot.draft, output, snapshot.partyNames, image ? undefined : input.text, Boolean(hooks));
       if (!merged.draft) return { issues: merged.issues };
-      const { draft } = merged;
+      const candidate = merged.draft;
       hooks?.signal.throwIfAborted();
       await checkSession();
       return await writeAccount(this.pool, account, input.requestId, command, async (client, latest) => {
         hooks?.signal.throwIfAborted();
         checkBasis(latest, input);
         if (textDigest) await checkDuplicate(client, account, input.draftId, textDigest);
+        const draft = hooks ? await hooks.prepare(client, candidate, workspaceDraft(latest)) : candidate;
         await client.query('UPDATE dispatch.workspaces SET draft_revision = $2, draft_customers = $3 WHERE account_id = $1',
           [account, draft.revision, JSON.stringify(draft.customers)]);
         if (picture) {

@@ -78,6 +78,19 @@ page {
 }
 .pending-price { color: var(--warning); font-weight: 500; }
 
+.draft-adopt {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16rpx;
+  padding: 0 20rpx 12rpx;
+}
+.draft-adopt .draft-adopt-all { flex: none; min-width: 200rpx; }
+.price-hint { display: flex; flex-direction: column; gap: 10rpx; padding-bottom: 10rpx; }
+.price-options { display: flex; flex-wrap: wrap; gap: 12rpx; }
+.price-option { flex: 0 0 auto; min-width: 160rpx; padding: 10rpx 20rpx; }
+.preview-hint { display: block; padding-bottom: 8rpx; }
+
 .card-actions { display: flex; flex-wrap: wrap; gap: 16rpx; margin-top: 20rpx; }
 .card-btn-primary, .card-btn-secondary, .card-btn-ghost, .option-btn {
   display: flex;
@@ -138,6 +151,57 @@ page {
 .question-item + .question-item { margin-top: 12rpx; }
 .actions { display: flex; flex-wrap: wrap; gap: 16rpx; margin-top: 16rpx; }
 
+.choice-list { display: flex; flex-direction: column; gap: 20rpx; margin-top: 16rpx; }
+.choice-item {
+  display: flex;
+  flex-direction: column;
+  gap: 12rpx;
+  padding: 18rpx;
+  background: var(--surface-sunken);
+  border: 1rpx solid var(--hairline);
+  border-radius: var(--radius-md);
+}
+.choice-item .actions { margin-top: 0; }
+.choice-item .card-btn-ghost { flex: none; width: 100%; }
+.choice-select {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  height: 80rpx;
+  padding: 0 24rpx;
+  background: var(--surface);
+  border: 1rpx solid var(--hairline-strong);
+  border-radius: var(--radius-md);
+  color: var(--ink-2);
+  font-size: 30rpx;
+  font-weight: 500;
+}
+.choice-select:active { background: var(--surface-sunken); }
+.choice-remember { display: flex; align-items: center; gap: 16rpx; min-height: 80rpx; padding: 4rpx 0; }
+.choice-check {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 40rpx;
+  height: 40rpx;
+  box-sizing: border-box;
+  border: 2rpx solid var(--hairline-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--on-primary);
+  font-size: 26rpx;
+  font-weight: 700;
+  line-height: 1;
+}
+.choice-check.checked { background: var(--primary); border-color: var(--primary); }
+.choice-remember-text { flex: 1; min-width: 0; color: var(--ink-2); font-size: 30rpx; line-height: 1.45; }
+
+.link-row { display: flex; align-items: center; gap: 16rpx; }
+.link-label { flex: 1; min-width: 0; padding-top: 6rpx; overflow-wrap: anywhere; }
+.link-row .link-btn { flex: none; min-width: 180rpx; margin-top: 6rpx; }
+
 .preview-line, .file { display: flex; gap: 14rpx; align-items: baseline; }
 .preview-line { justify-content: space-between; padding-top: 8rpx; }
 .preview-line > text:first-child { flex: 1; min-width: 0; overflow-wrap: anywhere; }
@@ -165,6 +229,7 @@ page {
   border-top: 1rpx solid var(--hairline);
 }
 .error { display: block; color: var(--danger); margin-bottom: 9rpx; }
+.notice { display: block; color: var(--ink-2); font-size: 30rpx; line-height: 1.5; margin-bottom: 9rpx; }
 .file-list { max-height: 180rpx; overflow-y: auto; margin-bottom: 8rpx; }
 .file { justify-content: space-between; margin-bottom: 8rpx; }
 .file-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 24rpx; }

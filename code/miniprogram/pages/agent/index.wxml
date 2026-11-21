@@ -1,3 +1,26 @@
+<template name="customer-choices">
+  <view wx:if="{{choices.length}}" class="choice-list">
+    <view wx:for="{{choices}}" wx:for-item="choice" wx:key="draftCustomerId" class="choice-item">
+      <text class="card-title">「{{choice.spoken}}」是哪家？</text>
+      <text class="muted">{{choice.hint}}</text>
+      <view wx:if="{{choice.candidates.length}}" class="actions">
+        <button wx:for="{{choice.candidates}}" wx:for-item="candidate" wx:key="id" class="option-btn" disabled="{{busy || polling}}"
+          data-customer="{{choice.draftCustomerId}}" data-party="{{candidate.id}}" bindtap="chooseCustomer">{{candidate.name}}</button>
+      </view>
+      <picker wx:if="{{memoryNames.length}}" mode="selector" range="{{memoryNames}}" disabled="{{busy || polling}}"
+        data-customer="{{choice.draftCustomerId}}" bindchange="pickCustomer">
+        <view class="choice-select">从全部熟客里选</view>
+      </picker>
+      <button class="card-btn-ghost choice-new" disabled="{{busy || polling}}" data-customer="{{choice.draftCustomerId}}"
+        bindtap="newCustomer">新建客户「{{choice.spoken}}」</button>
+      <view class="choice-remember" data-customer="{{choice.draftCustomerId}}" bindtap="toggleRemember">
+        <view class="choice-check {{choice.remember ? 'checked' : ''}}">{{choice.remember ? '✓' : ''}}</view>
+        <text class="choice-remember-text">记住「{{choice.spoken}}」这个叫法，下次直接认</text>
+      </view>
+    </view>
+  </view>
+</template>
+
 <view class="agent">
   <view wx:if="{{!signedIn}}" class="card guest-card">
     <text class="title">录单助手</text>
@@ -18,18 +41,39 @@
                 <text class="draft-inline-label">{{draftSummary.label}}</text>
                 <text class="draft-inline-toggle">{{draftExpanded ? '收起 ▴' : '展开明细 ▾'}}</text>
               </view>
+              <view wx:if="{{adoptableCount}}" class="draft-adopt">
+                <text class="muted num">{{adoptableCount}} 行缺价可沿用上次价</text>
+                <button wx:if="{{adoptableCount >= 2}}" class="card-btn-ghost draft-adopt-all" disabled="{{busy || polling}}"
+                  bindtap="adoptAll">全部沿用</button>
+              </view>
               <scroll-view wx:if="{{draftExpanded}}" scroll-y class="draft-inline-body">
                 <view wx:for="{{draftSummary.customers}}" wx:for-item="customer" wx:key="id" class="detail">
                   <text class="card-title">{{customer.name}}</text>
-                  <view wx:for="{{customer.lines}}" wx:for-item="line" wx:key="id" class="preview-line">
-                    <text class="num">{{line.product}} {{line.quantity}} {{line.unit}}</text>
-                    <text class="num {{line.pending ? 'pending-price' : ''}}">{{line.price}}</text>
+                  <view wx:for="{{customer.lines}}" wx:for-item="line" wx:key="id" class="draft-line">
+                    <view class="preview-line">
+                      <text class="num">{{line.product}} {{line.quantity}} {{line.unit}}</text>
+                      <text class="num {{line.pending ? 'pending-price' : ''}}">{{line.price}}</text>
+                    </view>
+                    <view wx:if="{{priceHints[line.id]}}" class="price-hint">
+                      <text class="muted">{{priceHints[line.id].text}}</text>
+                      <view class="price-options">
+                        <button wx:for="{{priceHints[line.id].options}}" wx:for-item="option" wx:key="text" class="option-btn price-option"
+                          disabled="{{busy || polling}}" data-line="{{line.id}}" data-customer="{{priceHints[line.id].draftCustomerId}}"
+                          data-cents="{{option.cents}}" data-brand="{{option.brand}}" data-spec="{{option.spec}}"
+                          bindtap="adoptPrice">{{option.text}}</button>
+                      </view>
+                    </view>
                   </view>
                 </view>
               </scroll-view>
             </view>
+            <template is="customer-choices" data="{{choices: choices, memoryNames: memoryNames, busy: busy, polling: polling}}" />
+            <view wx:if="{{memoryFailed && !choices.length}}" class="detail">
+              <text class="muted">选店信息没加载出来</text>
+              <button class="card-btn-ghost" disabled="{{busy}}" bindtap="reloadMemory">重新加载</button>
+            </view>
             <view class="card-actions">
-              <block wx:if="{{draftSummary && draftSummary.hasLines}}">
+              <block wx:if="{{draftSummary && draftSummary.hasLines && !choices.length}}">
                 <button class="card-btn-primary" bindtap="previewShortcut" disabled="{{busy || polling || !draftsAvailable}}">生成送货单</button>
                 <button class="card-btn-secondary" bindtap="openWorkspace" disabled="{{busy}}">手动改</button>
               </block>
@@ -63,7 +107,7 @@
           </view>
           <view class="avatar mine">我</view>
         </view>
-        <view class="assistant-row" wx:if="{{turn.checklist.length || turn.reply || turn.changes.length || turn.questions.length || turn.preview || turn.delivery || turn.canRetry || turn.showDraftActions || turn.showDeliveryFooter}}">
+        <view class="assistant-row" wx:if="{{turn.checklist.length || turn.reply || turn.changes.length || turn.links.length || turn.questions.length || turn.preview || turn.delivery || turn.canRetry || turn.showDraftActions || turn.showDeliveryFooter}}">
           <view class="avatar helper">助</view>
           <view class="assistant-content">
             <text class="assistant-name">{{confirmed ? '送货助手' : '录单助手'}}</text>
@@ -82,6 +126,13 @@
                 <button wx:if="{{turn.showStandaloneUndo}}" class="card-btn-ghost" disabled="{{busy || polling}}"
                   data-id="{{turn.id}}" bindtap="undo">撤销这一步</button>
               </view>
+              <view wx:if="{{turn.links.length}}" class="detail">
+                <view wx:for="{{turn.links}}" wx:for-item="link" wx:key="draftCustomerId" class="link-row">
+                  <text class="link-label">{{link.label}}</text>
+                  <button class="card-btn-ghost link-btn" disabled="{{busy || polling}}"
+                    data-turn="{{turn.id}}" data-customer="{{link.draftCustomerId}}" bindtap="notHim">不是他</button>
+                </view>
+              </view>
               <view wx:if="{{turn.questions.length}}" class="question detail">
                 <view wx:for="{{turn.questions}}" wx:for-item="question" wx:key="text" class="question-item">
                   <text>{{question.customer ? question.customer + ' · ' : ''}}{{question.text}}</text>
@@ -91,14 +142,24 @@
                   </view>
                 </view>
               </view>
+              <view wx:if="{{turn.showChoices && choices.length && !polling}}">
+                <template is="customer-choices" data="{{choices: choices, memoryNames: memoryNames, busy: busy, polling: polling}}" />
+              </view>
+              <view wx:if="{{turn.showChoices && memoryFailed && !choices.length}}" class="detail">
+                <text class="muted">选店信息没加载出来</text>
+                <button class="card-btn-ghost" disabled="{{busy}}" bindtap="reloadMemory">重新加载</button>
+              </view>
               <view wx:if="{{turn.preview}}" class="detail">
                 <text class="card-title">送货单预览</text>
                 <text class="amount num">{{turn.preview.totalLabel}}</text>
                 <view wx:for="{{turn.preview.customers}}" wx:for-item="customer" wx:key="id" class="detail">
                   <text class="card-title">{{customer.customer}}</text>
-                  <view wx:for="{{customer.items}}" wx:for-item="line" wx:key="id" class="preview-line">
-                    <text class="num">{{line.productLabel}} · {{line.quantity}} {{line.unit}}</text>
-                    <text class="num {{line.amountLabel === '待补价' ? 'pending-price' : ''}}">{{line.amountLabel}}</text>
+                  <view wx:for="{{customer.items}}" wx:for-item="line" wx:key="id" class="preview-block">
+                    <view class="preview-line">
+                      <text class="num">{{line.productLabel}} · {{line.quantity}} {{line.unit}}</text>
+                      <text class="num {{line.amountLabel === '待补价' ? 'pending-price' : ''}}">{{line.amountLabel}}</text>
+                    </view>
+                    <text wx:if="{{line.amountLabel === '待补价' && priceHints[line.id]}}" class="muted preview-hint">{{priceHints[line.id].text}}</text>
                   </view>
                 </view>
               </view>
@@ -127,12 +188,28 @@
                   <text class="draft-inline-label">{{draftSummary.label}}</text>
                   <text class="draft-inline-toggle">{{draftExpanded ? '收起 ▴' : '展开明细 ▾'}}</text>
                 </view>
+                <view wx:if="{{adoptableCount}}" class="draft-adopt">
+                  <text class="muted num">{{adoptableCount}} 行缺价可沿用上次价</text>
+                  <button wx:if="{{adoptableCount >= 2}}" class="card-btn-ghost draft-adopt-all" disabled="{{busy || polling}}"
+                    bindtap="adoptAll">全部沿用</button>
+                </view>
                 <scroll-view wx:if="{{draftExpanded}}" scroll-y class="draft-inline-body">
                   <view wx:for="{{draftSummary.customers}}" wx:for-item="customer" wx:key="id" class="detail">
                     <text class="card-title">{{customer.name}}</text>
-                    <view wx:for="{{customer.lines}}" wx:for-item="line" wx:key="id" class="preview-line">
-                      <text class="num">{{line.product}} {{line.quantity}} {{line.unit}}</text>
-                      <text class="num {{line.pending ? 'pending-price' : ''}}">{{line.price}}</text>
+                    <view wx:for="{{customer.lines}}" wx:for-item="line" wx:key="id" class="draft-line">
+                      <view class="preview-line">
+                        <text class="num">{{line.product}} {{line.quantity}} {{line.unit}}</text>
+                        <text class="num {{line.pending ? 'pending-price' : ''}}">{{line.price}}</text>
+                      </view>
+                      <view wx:if="{{priceHints[line.id]}}" class="price-hint">
+                        <text class="muted">{{priceHints[line.id].text}}</text>
+                        <view class="price-options">
+                          <button wx:for="{{priceHints[line.id].options}}" wx:for-item="option" wx:key="text" class="option-btn price-option"
+                            disabled="{{busy || polling}}" data-line="{{line.id}}" data-customer="{{priceHints[line.id].draftCustomerId}}"
+                            data-cents="{{option.cents}}" data-brand="{{option.brand}}" data-spec="{{option.spec}}"
+                            bindtap="adoptPrice">{{option.text}}</button>
+                        </view>
+                      </view>
                     </view>
                   </view>
                 </scroll-view>
@@ -142,13 +219,15 @@
               </view>
               <view wx:if="{{turn.showDraftActions || (turn.preview && turn.preview.active) || turn.showDeliveryFooter || turn.canRetry}}" class="card-actions">
                 <block wx:if="{{turn.showDraftActions}}">
-                  <button wx:if="{{!turn.hasPendingQuestions && draftSummary && draftSummary.hasLines}}" class="card-btn-primary"
+                  <button wx:if="{{!turn.hasPendingQuestions && draftSummary && draftSummary.hasLines && !choices.length}}" class="card-btn-primary"
                     bindtap="previewShortcut" disabled="{{busy || polling || !draftsAvailable}}">生成送货单</button>
                   <button class="card-btn-secondary" bindtap="openWorkspace" disabled="{{busy}}">手动改</button>
                   <button wx:if="{{turn.canUndo}}" class="card-btn-ghost" disabled="{{busy || polling}}"
                     data-id="{{turn.id}}" bindtap="undo">撤销这一步</button>
                 </block>
                 <block wx:if="{{turn.preview && turn.preview.active}}">
+                  <button wx:if="{{adoptableCount >= 1}}" class="card-btn-secondary" disabled="{{busy || polling}}"
+                    bindtap="adoptAllAndPreview">沿用上次价并重新预览</button>
                   <button class="card-btn-primary" disabled="{{busy || polling}}" data-id="{{turn.preview.id}}" bindtap="confirm">确认出单</button>
                   <button class="card-btn-secondary" disabled="{{busy || polling}}" data-turn="{{turn.id}}" bindtap="continueEditing">继续修改</button>
                   <button class="card-btn-ghost" bindtap="openWorkspace" disabled="{{busy}}">手动改</button>
@@ -182,6 +261,7 @@
       <view id="latest" />
     </scroll-view>
     <view class="composer">
+      <text wx:if="{{notice}}" class="notice">{{notice}}</text>
       <text wx:if="{{error}}" class="error">{{error}}</text>
       <view wx:if="{{!confirmed && (uploadRows.length || readyImages.length)}}" class="file-list">
         <view wx:for="{{readyImages}}" wx:key="id" class="file">

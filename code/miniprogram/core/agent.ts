@@ -14,6 +14,8 @@ export type DeliveryProposal = {
 export type DeliveryCardState = 'saved' | 'completed' | 'cancelled';
 export type DeliveryProgress = { tripId: string; version: number; statusRevision: number;
   shops: { sheetId: string; customer: string; locked: boolean; totalCents: number; pendingPrices: number }[] };
+export type CustomerLink = { draftCustomerId: string; spoken: string; customerId: string; canonicalName: string;
+  matchedBy: 'canonical' | 'alias'; merged: boolean };
 export type AgentEvent =
   | { seq: number; kind: 'progress'; payload: { text: string; done: boolean; step: number } }
   | { seq: number; kind: 'plan'; payload: { steps: PlanStep[] } }
@@ -24,6 +26,7 @@ export type AgentEvent =
   | { seq: number; kind: 'undo'; payload: { revision: number } }
   | { seq: number; kind: 'delivery_proposal'; payload: DeliveryProposal }
   | { seq: number; kind: 'delivery_applied'; payload: { status: DeliveryCardState } }
+  | { seq: number; kind: 'customer_links'; payload: { links: CustomerLink[] } }
   | { seq: number; kind: 'end'; payload: { status: AgentStatus; text: string; revision: number; elapsedMs?: number } };
 
 export interface AgentTurn {

@@ -2,7 +2,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { IncomingMessage, ServerResponse } from 'node:http';
 import { Pool, PoolClient } from 'pg';
 import { DeliveryEdits, deliveryLines, deliverySummary } from '../miniprogram/core/delivery-execution';
-import { lineAmount, nullablePrice, unitPrice } from '../miniprogram/core/orders';
+import { nullablePrice, validTextPrice, yuanToCents } from '../miniprogram/core/orders';
 import { latest, TripVersion } from '../miniprogram/core/trips';
 import { readAccount, readParties, readWorkspace, workspaceDraft } from './account-workspace';
 import { transaction } from './database';
@@ -28,11 +28,12 @@ type ScopeStats = {
 };
 type DocumentLine = {
   id: string; product: string; brand: string; specification: string; unit: string; originalQuantity: string;
-  receivedQuantity: number; unitPriceCents: number | null; price: string | null; amountCents: number | null; status: string;
+  receivedQuantity: number | null; unitPriceCents: number | null; price: string | null; amountCents: number | null; status: string;
+  blank?: boolean; invalidPrice?: string;
 };
 type DocumentCustomer = {
   sheetId: string; customer: string; partyId: string | null; reviewed: boolean; deliveryCompleted: boolean; locked: boolean;
-  orderCents: number | null; dueCents: number; pendingPrices: number; lines: DocumentLine[];
+  orderCents: number | null; orderPendingPrices: number; dueCents: number; pendingPrices: number; lines: DocumentLine[];
 };
 
 export function configuredAdminToken(env: NodeJS.ProcessEnv): string | undefined {
@@ -236,7 +237,9 @@ async function readScope(pool: Pool, trips: TripStore, accountId: string, scopeI
           sheetId: customer.id, customer: customer.customer, partyId: sheet?.partyId ?? customer.partyId ?? null,
           reviewed: sheet?.reviewed ?? false, deliveryCompleted: sheet?.deliveryCompleted ?? false,
           locked: Boolean(sheet?.reviewed || sheet?.deliveryCompleted),
-          orderCents: customer.totalCents, dueCents: summary.totalCents, pendingPrices: summary.pendingPrices,
+          orderCents: customer.totalCents,
+          orderPendingPrices: customer.items.filter(item => item.amountCents === null).length,
+          dueCents: summary.totalCents, pendingPrices: summary.pendingPrices,
           lines: lines.map(line => ({
             id: line.id, product: line.product, brand: line.brand, specification: line.specification, unit: line.unit,
             originalQuantity: line.originalQuantity, receivedQuantity: line.receivedQuantity,
@@ -257,24 +260,35 @@ async function readScope(pool: Pool, trips: TripStore, accountId: string, scopeI
       const customers: DocumentCustomer[] = draft.customers.map(customer => {
         let dueCents = 0;
         let pendingPrices = 0;
-        const lines = customer.items.map(item => {
+        const lines: DocumentLine[] = customer.items.map(item => {
           const price = nullablePrice(item.price);
           let cents: number | null = null;
-          if (price !== null) cents = unitPrice(price);
-          const quantity = Number(item.quantity);
-          const amountCents = lineAmount(Number.isSafeInteger(quantity) ? quantity : 0, cents);
-          if (amountCents === null) pendingPrices++;
-          else dueCents += amountCents;
+          let invalidPrice: string | undefined;
+          if (price !== null) {
+            if (validTextPrice(price)) cents = yuanToCents(price);
+            else invalidPrice = price;
+          }
+          const emptyRow = !item.product.trim() && !item.brand.trim() && !item.specification.trim()
+            && !item.quantity.trim() && price === null;
+          const quantityText = item.quantity.trim();
+          const qty = /^[1-9]\d*$/.test(quantityText) && Number.isSafeInteger(Number(quantityText))
+            ? Number(quantityText) : null;
+          let amountCents: number | null = null;
+          if (!emptyRow) {
+            if (qty !== null && cents !== null && Number.isSafeInteger(qty * cents)) amountCents = qty * cents;
+            if (amountCents === null) pendingPrices++;
+            else dueCents += amountCents;
+          }
           return {
             id: item.id, product: item.product, brand: item.brand, specification: item.specification, unit: item.unit,
-            originalQuantity: item.quantity, receivedQuantity: Number.isSafeInteger(quantity) ? quantity : 0,
-            unitPriceCents: cents, price, amountCents, status: 'draft',
+            originalQuantity: item.quantity, receivedQuantity: null, unitPriceCents: cents, price, amountCents, status: 'draft',
+            blank: emptyRow, ...(invalidPrice ? { invalidPrice } : {}),
           };
         });
         return {
           sheetId: customer.id, customer: customer.customer, partyId: customer.partyId ?? null,
           reviewed: false, deliveryCompleted: false, locked: false,
-          orderCents: null, dueCents, pendingPrices, lines,
+          orderCents: null, orderPendingPrices: 0, dueCents, pendingPrices, lines,
         };
       });
       document = {
@@ -641,7 +655,16 @@ const adminPage = `<!doctype html>
     });
   };
   var pending = '<span class="pending">待补价</span>';
-  var money = function (cents) { return cents === null || cents === undefined ? pending : '¥' + (cents / 100).toFixed(2); };
+  var missingPrice = function (cents, pendingCount) {
+    return cents === null || cents === undefined || (cents === 0 && pendingCount > 0);
+  };
+  var moneyText = function (cents, pendingCount) {
+    return missingPrice(cents, pendingCount) ? '待补价' : '¥' + (cents / 100).toFixed(2);
+  };
+  var moneyHtml = function (cents, pendingCount) {
+    return missingPrice(cents, pendingCount) ? pending : esc('¥' + (cents / 100).toFixed(2));
+  };
+  var dash = '<span class="muted">—</span>';
   var statusLabel = { completed: '已完成', running: '处理中', failed: '失败', interrupted: '中断', done: '完成',
     pending: '待送', delivered: '已送达', unrecorded: '未记录', draft: '草稿', skipped: '跳过', needs_input: '待补充', runningStep: '处理中' };
   var setStatus = function (text, error) {
@@ -669,8 +692,19 @@ const adminPage = `<!doctype html>
     el('login').classList.remove('hidden');
     el('login-token').focus();
   };
+  var clearMaterialUrls = function () {
+    Object.keys(state.materialSources).forEach(function (key) {
+      var url = state.materialSources[key];
+      if (url) URL.revokeObjectURL(url);
+    });
+    state.materialSources = {};
+    el('lightbox').classList.add('hidden');
+    el('lightbox-img').removeAttribute('src');
+  };
   var logout = function (expired) {
+    clearMaterialUrls();
     state.token = '';
+    state.accountId = '';
     state.accounts = [];
     state.overview = null;
     state.scope = null;
@@ -785,11 +819,12 @@ const adminPage = `<!doctype html>
       parts.push('正式趟 · 第 <b>' + esc(document.version) + '</b> 版');
       parts.push('配送修订 <b>' + esc(document.statusRevision) + '</b>');
       parts.push('出单 <b>' + esc(document.issuedAt ? new Date(document.issuedAt).toLocaleString() : '—') + '</b>');
-      parts.push('应收 <b>' + esc(money(document.dueCents)) + '</b>');
+      parts.push('应收 <b>' + moneyHtml(document.dueCents, document.pendingPrices) + '</b>');
     } else {
       parts.push('当前草稿 · 修订 <b>' + esc(document.revision) + '</b>');
       parts.push(document.draftConfirmed ? '<b>已出单</b>' : '未出单');
-      parts.push('预计 <b>' + esc(money(document.dueCents)) + '</b>');
+      parts.push('预计 <b>' + (document.dueCents === 0 && document.pendingPrices === 0
+        ? dash : moneyHtml(document.dueCents, document.pendingPrices)) + '</b>');
     }
     parts.push(document.pendingPrices ? '<b>' + esc(document.pendingPrices) + '</b> 处待补价' : '无待补价');
     parts.push('门店 <b>' + esc(document.customers.length) + '</b>');
@@ -807,16 +842,30 @@ const adminPage = `<!doctype html>
     document.customers.forEach(function (customer) {
       var locked = customer.locked ? '<span class="badge ok">已锁定</span>' : '<span class="badge info">可修改</span>';
       html += '<div class="card"><div class="card-head"><h3>' + esc(customer.customer || '（未命名客户）') + '</h3><div>' + locked + '</div></div>';
-      html += '<div class="muted" style="font-size:12px;margin-bottom:6px">原订 ' + esc(money(customer.orderCents)) +
-        ' · 预计应收 ' + esc(money(customer.dueCents)) + (customer.pendingPrices ? ' · ' + customer.pendingPrices + ' 处待补价' : '') + '</div>';
+      var pendingLabel = customer.pendingPrices ? ' · ' + customer.pendingPrices + ' 处待补价' : '';
+      if (document.type === 'trip') {
+        html += '<div class="muted" style="font-size:12px;margin-bottom:6px">原订 ' +
+          moneyHtml(customer.orderCents, customer.orderPendingPrices) + ' · 预计应收 ' +
+          moneyHtml(customer.dueCents, customer.pendingPrices) + pendingLabel + '</div>';
+      } else {
+        var blankCustomer = !customer.lines.length || customer.lines.every(function (line) { return line.blank; });
+        html += '<div class="muted" style="font-size:12px;margin-bottom:6px">预计合计 ' +
+          (blankCustomer ? dash : moneyHtml(customer.dueCents, customer.pendingPrices)) + pendingLabel + '</div>';
+      }
       html += '<table><thead><tr><th>货品</th><th class="num">原订</th><th class="num">实收</th><th class="num">单价</th><th class="num">小计</th><th>状态</th></tr></thead><tbody>';
       customer.lines.forEach(function (line) {
         var name = [line.brand, line.product, line.specification].filter(Boolean).join(' / ') || '（空行）';
+        var original = line.blank ? dash : esc(line.originalQuantity || '—') + ' ' + esc(line.unit || '');
+        var received = line.receivedQuantity === null ? dash : esc(line.receivedQuantity) + ' ' + esc(line.unit || '');
+        var unit = line.blank ? dash : line.invalidPrice !== undefined
+          ? '<span class="badge bad">异常: ' + esc(line.invalidPrice) + '</span>'
+          : moneyHtml(line.unitPriceCents, 0);
+        var amount = line.blank ? dash : moneyHtml(line.amountCents, 0);
         html += '<tr><td>' + esc(name) + '<div class="line-sub mono">' + esc(line.id) + '</div></td>' +
-          '<td class="num">' + esc(line.originalQuantity || '—') + ' ' + esc(line.unit || '') + '</td>' +
-          '<td class="num">' + esc(line.receivedQuantity) + ' ' + esc(line.unit || '') + '</td>' +
-          '<td class="num">' + money(line.unitPriceCents) + '</td>' +
-          '<td class="num">' + money(line.amountCents) + '</td>' +
+          '<td class="num">' + original + '</td>' +
+          '<td class="num">' + received + '</td>' +
+          '<td class="num">' + unit + '</td>' +
+          '<td class="num">' + amount + '</td>' +
           '<td>' + lineStatus(line.status) + '</td></tr>';
       });
       html += '</tbody></table></div>';
@@ -831,7 +880,7 @@ const adminPage = `<!doctype html>
       document.customers.forEach(function (customer) {
         customer.lines.forEach(function (line) {
           if (!line.product) return;
-          var key = [line.brand, line.product, line.specification, line.unit].join('\u0000');
+          var key = [line.brand, line.product, line.specification, line.unit].join('\\u0000');
           if (!grouped[key]) grouped[key] = { brand: line.brand, product: line.product, specification: line.specification,
             unit: line.unit, quantity: 0 };
           grouped[key].quantity += Number(line.originalQuantity) || 0;
@@ -892,7 +941,7 @@ const adminPage = `<!doctype html>
         ' · 待补价：' + payload.pendingPriceNames.join('、') : '');
     if (event.kind === 'delivery_applied') return '核对卡状态：' + (payload.status || '');
     if (event.kind === 'preview') return '预览 ' + ((payload.preview && payload.preview.previewId) || '') + ' · 应收 ' +
-      money(payload.preview && payload.preview.totalCents);
+      moneyText(payload.preview && payload.preview.totalCents, payload.preview && payload.preview.pendingPrices);
     if (event.kind === 'undo') return '撤销到修订 ' + payload.revision;
     if (event.kind === 'end') return '结束：' + (statusLabel[payload.status] || payload.status) + ' · 修订 ' + payload.revision +
       (payload.elapsedMs !== undefined ? ' · ' + payload.elapsedMs + ' ms' : '') + (payload.errorCode ? ' · ' + payload.errorCode : '');
@@ -973,20 +1022,26 @@ const adminPage = `<!doctype html>
   };
   var loadThumbs = function () {
     var nodes = document.querySelectorAll('[data-thumb]');
+    var accountId = state.accountId;
     Array.prototype.forEach.call(nodes, function (node) {
       var id = node.getAttribute('data-thumb');
-      if (state.materialSources[id]) {
-        injectThumb(node, state.materialSources[id]);
+      var key = accountId + ':' + id;
+      if (state.materialSources[key]) {
+        injectThumb(node, state.materialSources[key]);
         return;
       }
-      fetch('/admin/api/accounts/' + state.accountId + '/materials/' + id + '/content', {
+      fetch('/admin/api/accounts/' + accountId + '/materials/' + id + '/content', {
         headers: { Authorization: 'Bearer ' + state.token }, cache: 'no-store'
       }).then(function (response) {
         if (!response.ok) throw new Error('图片 ' + response.status);
         return response.blob();
       }).then(function (blob) {
         var url = URL.createObjectURL(blob);
-        state.materialSources[id] = url;
+        if (!state.token || accountId !== state.accountId) {
+          URL.revokeObjectURL(url);
+          return;
+        }
+        state.materialSources[key] = url;
         injectThumb(node, url);
       }).catch(function (error) {
         node.textContent = '图片加载失败：' + error.message;
@@ -1052,7 +1107,7 @@ const adminPage = `<!doctype html>
   var copyPrompt = function (index) {
     var entry = state.prompts[index];
     if (!entry) return;
-    var text = entry.prompts.map(function (prompt) { return '【' + prompt.label + '】\n' + prompt.text; }).join('\n\n');
+    var text = entry.prompts.map(function (prompt) { return '【' + prompt.label + '】\\n' + prompt.text; }).join('\\n\\n');
     var done = function () { setStatus('已复制「' + entry.title + '」全文。'); };
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(text).then(done, function () { setStatus('复制失败，请手动选择文本。', true); });
@@ -1088,6 +1143,7 @@ const adminPage = `<!doctype html>
     else if (state.accountId) loadAccounts();
   });
   el('account-select').addEventListener('change', function (event) {
+    clearMaterialUrls();
     state.accountId = event.target.value;
     currentScopeValue = '';
     loadOverview().catch(function (error) { setStatus(error.message, true); });

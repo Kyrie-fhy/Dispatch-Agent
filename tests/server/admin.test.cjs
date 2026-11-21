@@ -3,6 +3,7 @@ const { createHash, randomBytes, randomUUID } = require('node:crypto');
 const { readFile } = require('node:fs/promises');
 const { resolve } = require('node:path');
 const { test } = require('node:test');
+const vm = require('node:vm');
 const { Pool } = require('pg');
 const { migrate } = require('../../code/server-dist/server/migrate');
 const { requireApplicationRole } = require('../../code/server-dist/server/database');
@@ -223,6 +224,97 @@ test('admin routes are closed by default and protect read-only APIs with a token
     const prompts = await api.request('/admin/api/prompts', { authorization: adminAuth(token) });
     assert.equal(prompts.status, 200);
     assert.equal(prompts.data.prompts.length, 7);
+  } finally {
+    await api.stop();
+  }
+});
+
+test('admin scopes tolerate unfinished draft values and keep full missing prices honest', { timeout: 30_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const token = 'admin-dirty-draft-token-0123456789';
+  const api = await start(db, { adminToken: token });
+  try {
+    const tokenA = await login(api, 'a');
+    const draftA = await read(api, tokenA);
+    const blankId = randomUUID();
+    const invalidId = randomUUID();
+    const missingId = randomUUID();
+    const saveA = await api.request(`/v1/drafts/${draftA.id}`, { method: 'PUT', token: tokenA, body: {
+      requestId: randomUUID(), revision: draftA.revision,
+      customers: [{ id: randomUUID(), customer: '草稿客户', items: [
+        { id: blankId, product: '', brand: '', specification: '', unit: '箱', quantity: '', price: null },
+        { id: invalidId, product: '水饺', brand: '安井', specification: '500g', unit: '箱', quantity: '2', price: '82.' },
+        { id: missingId, product: '春卷', brand: '安井', specification: '500g', unit: '袋', quantity: '3', price: null },
+      ] }],
+    } });
+    assert.equal(saveA.status, 200, JSON.stringify(saveA.data));
+
+    const tokenB = await login(api, 'b');
+    const draftB = await read(api, tokenB);
+    const saveB = await api.request(`/v1/drafts/${draftB.id}`, { method: 'PUT', token: tokenB, body: {
+      requestId: randomUUID(), revision: draftB.revision,
+      customers: [{ id: randomUUID(), customer: '全缺价客户', partyId: null, items: [
+        { id: randomUUID(), product: '汤圆', brand: '安井', specification: '500g', unit: '箱', quantity: '2', price: null },
+      ] }],
+    } });
+    assert.equal(saveB.status, 200, JSON.stringify(saveB.data));
+    const unpriced = saveB.data.draft;
+    const preview = await api.request('/v1/trips/preview', { method: 'POST', token: tokenB,
+      body: { draftId: unpriced.id, revision: unpriced.revision, requestId: randomUUID() } });
+    assert.equal(preview.status, 200, JSON.stringify(preview.data));
+    const confirmed = await api.request('/v1/trips/confirm', { method: 'POST', token: tokenB,
+      body: { previewId: preview.data.preview.previewId, requestId: randomUUID() } });
+    assert.equal(confirmed.status, 200, JSON.stringify(confirmed.data));
+
+    const { rows: [accountA] } = await db.owner.query(
+      "SELECT id FROM dispatch.accounts WHERE identity_provider = 'development' AND identity_subject = 'a'");
+    const { rows: [accountB] } = await db.owner.query(
+      "SELECT id FROM dispatch.accounts WHERE identity_provider = 'development' AND identity_subject = 'b'");
+    const before = await writeSnapshot(db);
+    const auth = adminAuth(token);
+
+    const draftScope = await api.request(`/admin/api/accounts/${accountA.id}/scopes/${draftA.id}`, { authorization: auth });
+    assert.equal(draftScope.status, 200, JSON.stringify(draftScope.data));
+    assert.equal(draftScope.data.document.type, 'draft');
+    assert.equal(draftScope.data.document.dueCents, 0);
+    assert.equal(draftScope.data.document.pendingPrices, 2);
+    const lines = draftScope.data.document.customers[0].lines;
+    const blank = lines.find(line => line.id === blankId);
+    assert.equal(blank.blank, true);
+    assert.equal(blank.amountCents, null);
+    assert.equal(blank.receivedQuantity, null);
+    const invalid = lines.find(line => line.id === invalidId);
+    assert.equal(invalid.invalidPrice, '82.');
+    assert.equal(invalid.unitPriceCents, null);
+    assert.equal(invalid.amountCents, null);
+    const missing = lines.find(line => line.id === missingId);
+    assert.equal(missing.invalidPrice, undefined);
+    assert.equal(missing.unitPriceCents, null);
+    assert.equal(missing.amountCents, null);
+
+    const tripScope = await api.request(`/admin/api/accounts/${accountB.id}/scopes/${confirmed.data.trip.id}`,
+      { authorization: auth });
+    assert.equal(tripScope.status, 200, JSON.stringify(tripScope.data));
+    assert.equal(tripScope.data.document.dueCents, 0);
+    assert.equal(tripScope.data.document.pendingPrices, 1);
+    assert.equal(tripScope.data.document.customers[0].orderCents, 0);
+    assert.equal(tripScope.data.document.customers[0].orderPendingPrices, 1);
+    assert.equal(tripScope.data.document.customers[0].lines[0].unitPriceCents, null);
+    assert.equal(tripScope.data.document.customers[0].lines[0].amountCents, null);
+
+    const page = await api.request('/admin');
+    assert.equal(page.status, 200);
+    assert.equal(typeof page.data, 'string');
+    assert.equal(page.data.includes('esc(money'), false);
+    assert.equal(page.data.includes("accountId + ':' + id"), true);
+    assert.equal(page.data.includes('URL.revokeObjectURL'), true);
+    assert.ok((page.data.match(/clearMaterialUrls\(\)/g) || []).length >= 2);
+    const start = page.data.indexOf('<script>') + 8;
+    const end = page.data.lastIndexOf('</script>');
+    assert.ok(start > 7 && end > start);
+    new vm.Script(page.data.slice(start, end));
+
+    assert.deepEqual(await writeSnapshot(db), before);
   } finally {
     await api.stop();
   }

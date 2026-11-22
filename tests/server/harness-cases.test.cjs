@@ -224,9 +224,6 @@ function fixtureFor(caseFile) {
   const fallbackIntent = caseFile.mode === 'delivery'
     ? { adjust: true, query: false, answering: false, lookup: 'none', shop: '' }
     : { draft: true, preview: false, query: false, answering: false };
-  const intent = fixture.intent
-    ?? (caseFile.mode === 'delivery' ? observed.deliveryIntent : models.find(model => model.phase === 'intent')?.intents)
-    ?? fallbackIntent;
   const tools = Array.isArray(observed.tools) ? observed.tools : [];
   const turns = fixture.turns ?? tools.flatMap(tool => {
     if (tool.name === 'edit_draft' && tool.arguments && Array.isArray(tool.arguments.operations)) {
@@ -237,6 +234,12 @@ function fixtureFor(caseFile) {
     }
     return [];
   });
+  const observedIntent = caseFile.mode === 'delivery'
+    ? observed.deliveryIntent : models.find(model => model.phase === 'intent')?.intents;
+  const previewOnly = caseFile.mode !== 'delivery' && !observedIntent
+    && tools.some(tool => tool.name === 'preview_trip') && !turns.length;
+  const intent = fixture.intent ?? observedIntent
+    ?? (previewOnly ? { draft: false, preview: true, query: false, answering: false } : fallbackIntent);
   const candidateTool = tools.find(tool => tool.name === 'propose_delivery' || tool.name === 'ask_delivery_user');
   const candidate = fixture.candidate ?? (candidateTool ? { tool: candidateTool.name, args: candidateTool.arguments } : undefined);
   return { intent, turns, candidate, image: fixture.image };
@@ -307,7 +310,7 @@ async function saveCustomers(api, token, draft, customers) {
 }
 
 async function seedPrevious(db, accountId, draftId, revision, previous, mode) {
-  if (!previous) return;
+  if (!previous) return null;
   const priorId = randomUUID();
   const questions = Array.isArray(previous.questions) ? previous.questions : [];
   await db.owner.query(`INSERT INTO dispatch.agent_turns
@@ -326,6 +329,7 @@ async function seedPrevious(db, accountId, draftId, revision, previous, mode) {
     await db.owner.query(`INSERT INTO dispatch.agent_events (account_id, draft_id, turn_id, kind, payload)
       VALUES ($1, $2, $3, 'edit_confirmation', $4)`, [accountId, draftId, priorId, JSON.stringify(previous.confirmation)]);
   }
+  return priorId;
 }
 
 async function seedParties(db, accountId, parties) {
@@ -387,8 +391,8 @@ async function seedEntry(api, db, token, accountId, caseFile) {
     await saveCustomers(api, token, draft, restoreCustomers(environment.beforeCustomers, partyIds));
   }
   draft = await read(api, token);
-  await seedPrevious(db, accountId, draft.id, draft.revision, caseFile.task?.previous, 'entry');
-  return { partyIds, draft: await read(api, token), before: await snapshot(db) };
+  const priorTurnId = await seedPrevious(db, accountId, draft.id, draft.revision, caseFile.task?.previous, 'entry');
+  return { partyIds, draft: await read(api, token), before: await snapshot(db), priorTurnId };
 }
 
 async function seedDelivery(api, db, token, accountId, caseFile) {
@@ -417,8 +421,8 @@ async function seedDelivery(api, db, token, accountId, caseFile) {
       WHERE account_id = $1 AND trip_id = $2 AND id = $3`, [accountId, saved.id, sheetId]);
   }
   draft = await read(api, token);
-  await seedPrevious(db, accountId, saved.id, draft.revision, caseFile.task?.previous, 'delivery');
-  return { partyIds, draft: await read(api, token), before: await snapshot(db) };
+  const priorTurnId = await seedPrevious(db, accountId, saved.id, draft.revision, caseFile.task?.previous, 'delivery');
+  return { partyIds, draft: await read(api, token), before: await snapshot(db), priorTurnId };
 }
 
 async function snapshot(db) {
@@ -445,7 +449,9 @@ function gradeCase(caseFile, mode, partyIds, before, after, storedEvents, finalD
   if (mode === 'entry') {
     const beforeItems = new Map((caseFile.environment?.beforeCustomers || [])
       .flatMap(customer => customer.items || []).map(item => [item.id, priceKey(item.price)]));
-    const allowedPrices = new Set((caseFile.grader?.redLines?.allowedPrices || []).map(priceKey).filter(Boolean));
+    const allowedPrices = new Set([...(caseFile.grader?.redLines?.allowedPrices || []),
+      ...(caseFile.grader?.expect?.customers || []).flatMap(customer => customer.items || []).map(item => item.price),
+    ].map(priceKey).filter(Boolean));
     for (const customer of finalDraft.customers || []) {
       for (const item of customer.items || []) {
         const price = priceKey(item.price);
@@ -475,7 +481,9 @@ function gradeCase(caseFile, mode, partyIds, before, after, storedEvents, finalD
   } else {
     const linePrices = new Map((caseFile.environment?.tripCustomers || [])
       .flatMap(customer => customer.items || []).map(item => [item.id, priceKey(item.price)]));
-    const allowedPrices = new Set((caseFile.grader?.redLines?.allowedPrices || []).map(priceKey).filter(Boolean));
+    const allowedPrices = new Set([...(caseFile.grader?.redLines?.allowedPrices || []),
+      ...(caseFile.grader?.expect?.proposal?.edits || []).map(edit => edit.price),
+    ].map(priceKey).filter(Boolean));
     const proposal = lastEvent(storedEvents, 'delivery_proposal');
     for (const edit of proposal?.edits || []) {
       const price = priceKey(edit.price);
@@ -543,8 +551,13 @@ async function runCase(caseFile, sample, live) {
     const draft = seeded.draft;
     const materialIds = caseFile.task?.hasImages ? [await uploadImage(api, token, draft)] : [];
     const current = await read(api, token);
-    const submitted = await api.request('/v1/agent/turns', { method: 'POST', token,
-      body: agentInput(current, caseFile.task?.text || '', materialIds) });
+    const body = agentInput(current, caseFile.task?.text || '', materialIds);
+    if (caseFile.task?.direct === 'preview') {
+      body.direct = { intent: 'preview' };
+    } else if (caseFile.task?.direct === 'draft' && seeded.priorTurnId) {
+      body.direct = { intent: 'draft', turnId: seeded.priorTurnId, answer: caseFile.task?.text || '' };
+    }
+    const submitted = await api.request('/v1/agent/turns', { method: 'POST', token, body });
     assert.equal(submitted.status, 202, JSON.stringify(submitted.data));
     const result = await waitForAgent(api, token, submitted.data.turnId);
     const stored = (await db.owner.query(`SELECT kind, payload FROM dispatch.agent_events

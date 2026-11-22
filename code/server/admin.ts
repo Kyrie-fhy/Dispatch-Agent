@@ -3,6 +3,7 @@ import { IncomingMessage, ServerResponse } from 'node:http';
 import { Pool, PoolClient } from 'pg';
 import { DeliveryEdits, deliveryLines, deliverySummary } from '../miniprogram/core/delivery-execution';
 import { isObject, nullablePrice, validTextPrice, yuanToCents } from '../miniprogram/core/orders';
+import { hasSpokenNumber, spokenNumbers } from '../miniprogram/core/spoken-numbers';
 import { latest, TripVersion } from '../miniprogram/core/trips';
 import { readAccount, readParties, readWorkspace, workspaceDraft } from './account-workspace';
 import { transaction } from './database';
@@ -68,7 +69,13 @@ function evalDraftCustomers(value: unknown): EvalDraftCustomer[] {
 }
 
 function spokenPrices(text: string): string[] {
-  return [...new Set([...text.matchAll(/(\d+(?:\.\d+)?)\s*(?:元|块)/g)].map(match => match[1]))];
+  const normalized = text.normalize('NFKC');
+  const prices = [...normalized.matchAll(/(\d+(?:\.\d+)?)\s*(?:元|块)/g)].map(match => match[1]);
+  for (const token of spokenNumbers(normalized)) {
+    if (token.value === null) continue;
+    if (/[元块]/.test(normalized.slice(token.start, token.end))) prices.push(String(token.value));
+  }
+  return [...new Set(prices)];
 }
 
 function nonEmptyPrice(price: unknown): string | null {
@@ -450,21 +457,54 @@ async function readEvalCase(pool: Pool, accountId: string, turnId: string) {
           ORDER BY created_at DESC, id DESC LIMIT 1)
       ORDER BY question.seq DESC LIMIT 1
     `, [accountId, turn.draftId, turn.startRevision, turn.id, delivery ? 'delivery' : '']);
-    const { rows: parties } = await client.query<{ id: string; name: string }>(`
+    const beforeCustomers = evalDraftCustomers(turn.beforeCustomers);
+    const rawLinks = events.filter(event => event.kind === 'customer_links').flatMap(event =>
+      isObject(event.payload) && Array.isArray(event.payload.links) ? event.payload.links : []);
+    const referencedPartyIds = [...new Set([
+      ...beforeCustomers.flatMap(customer => typeof customer.partyId === 'string' ? [customer.partyId] : []),
+      ...rawLinks.flatMap(link => isObject(link) && typeof link.customerId === 'string' ? [link.customerId] : []),
+    ])];
+    const { rows: parties } = await client.query<{ id: string; name: string }>(delivery ? `
       SELECT id, name FROM dispatch.parties WHERE account_id = $1 ORDER BY name, id
-    `, [accountId]);
+    ` : `
+      SELECT p.id, p.name FROM dispatch.parties p
+      WHERE p.account_id = $1
+        AND (p.id = ANY($2::uuid[])
+          OR EXISTS (
+            SELECT 1 FROM dispatch.sheets s
+            JOIN dispatch.trip_versions first
+              ON first.account_id = s.account_id AND first.trip_id = s.trip_id AND first.version = 1
+            WHERE s.account_id = p.account_id AND s.party_id = p.id
+              AND s.trip_id <> $3 AND first.saved_at <= $4
+          )
+          OR EXISTS (
+            SELECT 1 FROM dispatch.customer_aliases a
+            WHERE a.account_id = p.account_id AND a.customer_id = p.id AND a.created_at <= $4
+          )
+          OR EXISTS (
+            SELECT 1 FROM dispatch.opening_debts o
+            WHERE o.account_id = p.account_id AND o.party_id = p.id
+          )
+          OR NOT EXISTS (
+            SELECT 1 FROM dispatch.sheets s
+            WHERE s.account_id = p.account_id AND s.party_id = p.id
+          ))
+      ORDER BY p.name, p.id
+    `, delivery ? [accountId] : [accountId, referencedPartyIds, turn.draftId, turn.createdAt]);
     const partyKeys = new Map(parties.map((party, index) => [party.id, `party-${index + 1}`]));
     const partyKey = (id: string | null | undefined) => id === undefined ? undefined : id === null ? null : partyKeys.get(id) ?? null;
     const mapCustomers = (customers: EvalDraftCustomer[]) => customers.map(customer => ({
       ...customer, ...(customer.partyId === undefined ? {} : { partyId: partyKey(customer.partyId) }),
     }));
-    const beforeCustomers = evalDraftCustomers(turn.beforeCustomers);
     const { rows: aliases } = await client.query<{
       alias: string; normalizedAlias: string; customerId: string;
-    }>(`
+    }>(delivery ? `
       SELECT alias, normalized_alias AS "normalizedAlias", customer_id AS "customerId"
       FROM dispatch.customer_aliases WHERE account_id = $1 ORDER BY normalized_alias
-    `, [accountId]);
+    ` : `
+      SELECT alias, normalized_alias AS "normalizedAlias", customer_id AS "customerId"
+      FROM dispatch.customer_aliases WHERE account_id = $1 AND updated_at <= $2 ORDER BY normalized_alias
+    `, delivery ? [accountId] : [accountId, turn.createdAt]);
     const exportAliases = aliases.flatMap(alias => {
       const key = partyKeys.get(alias.customerId);
       return key ? [{ partyKey: key, alias: alias.alias, normalizedAlias: alias.normalizedAlias }] : [];
@@ -486,8 +526,10 @@ async function readEvalCase(pool: Pool, accountId: string, turnId: string) {
       ) head
       CROSS JOIN LATERAL jsonb_array_elements(head.customers) AS sheet(customer)
       WHERE s.account_id = $1 AND s.party_id = ANY($2::uuid[]) AND sheet.customer->>'id' = s.id
+        ${delivery ? '' : 'AND s.trip_id <> $3 AND first.saved_at <= $4'}
       ORDER BY first.saved_at DESC, s.trip_id, s.id LIMIT 100
-    `, [accountId, [...partyKeys.keys()]]);
+    `, delivery ? [accountId, [...partyKeys.keys()]]
+      : [accountId, [...partyKeys.keys()], turn.draftId, turn.createdAt]);
     const history = new Map<string, { key: string; partyKey: string; issuedAt: string; lines: {
       product: string; brand: string; specification: string; unit: string; quantity: string; price: string;
     }[] }>();
@@ -509,25 +551,88 @@ async function readEvalCase(pool: Pool, accountId: string, turnId: string) {
       }
     }
     const historicalSales = [...history.values()].filter(group => group.lines.length > 0);
-    const { rows: [nextTurn] } = await client.query<{ beforeCustomers: unknown }>(`
-      SELECT before_customers AS "beforeCustomers" FROM dispatch.agent_turns
-      WHERE account_id = $1 AND draft_id = $2 AND created_at > $3 AND start_revision >= $4
-      ORDER BY created_at ASC, id ASC LIMIT 1
-    `, [accountId, turn.draftId, turn.createdAt, turn.endRevision]);
-    let endCustomers = evalDraftCustomers(nextTurn?.beforeCustomers);
-    if (!endCustomers.length) {
-      const { rows: [workspace] } = await client.query<{ revision: number; customers: unknown }>(`
-        SELECT draft_revision AS revision, draft_customers AS customers
-        FROM dispatch.workspaces WHERE account_id = $1 AND draft_id = $2
-      `, [accountId, turn.draftId]);
-      if (workspace && workspace.revision === turn.endRevision) endCustomers = evalDraftCustomers(workspace.customers);
-    }
-    if (!endCustomers.length) {
-      const { rows: [version] } = await client.query<{ customers: unknown }>(`
-        SELECT customers FROM dispatch.trip_versions
-        WHERE account_id = $1 AND trip_id = $2 ORDER BY version DESC LIMIT 1
-      `, [accountId, turn.draftId]);
-      if (version) endCustomers = evalDraftCustomers(version.customers);
+    let endCustomers: EvalDraftCustomer[] = [];
+    let endSnapshotFound = false;
+    let environmentNote: string | undefined;
+    if (!delivery && !turn.undone && turn.startRevision === turn.endRevision) {
+      endCustomers = beforeCustomers;
+      endSnapshotFound = true;
+    } else if (!delivery) {
+      const { rows: [nextTurn] } = await client.query<{ beforeCustomers: unknown }>(`
+        SELECT before_customers AS "beforeCustomers" FROM dispatch.agent_turns
+        WHERE account_id = $1 AND draft_id = $2 AND id <> $3 AND start_revision = $4
+        ORDER BY created_at ASC, id ASC LIMIT 1
+      `, [accountId, turn.draftId, turn.id, turn.endRevision]);
+      if (nextTurn) {
+        endCustomers = evalDraftCustomers(nextTurn.beforeCustomers);
+        endSnapshotFound = true;
+      }
+      if (!endSnapshotFound) {
+        const { rows: [workspace] } = await client.query<{ customers: unknown }>(`
+          SELECT draft_customers AS customers FROM dispatch.workspaces
+          WHERE account_id = $1 AND draft_id = $2 AND draft_revision = $3
+        `, [accountId, turn.draftId, turn.endRevision]);
+        if (workspace) {
+          endCustomers = evalDraftCustomers(workspace.customers);
+          endSnapshotFound = true;
+        }
+      }
+      if (!endSnapshotFound) {
+        const { rows: [previewRow] } = await client.query<{ preview: unknown }>(`
+          SELECT preview FROM dispatch.trip_previews
+          WHERE account_id = $1 AND draft_id = $2 AND draft_revision = $3
+        `, [accountId, turn.draftId, turn.endRevision]);
+        const preview = isObject(previewRow?.preview) ? previewRow.preview : null;
+        if (preview) {
+          const choices = Array.isArray(preview.choices) ? preview.choices : [];
+          endCustomers = evalDraftCustomers(preview.customers).map((customer, index) => {
+            const choice = choices[index];
+            return { ...customer, partyId: isObject(choice) && typeof choice.id === 'string' ? choice.id : null };
+          });
+          endSnapshotFound = true;
+        }
+      }
+      if (!endSnapshotFound) {
+        const { rows: [laterTurn] } = await client.query<{ beforeCustomers: unknown }>(`
+          SELECT before_customers AS "beforeCustomers" FROM dispatch.agent_turns
+          WHERE account_id = $1 AND draft_id = $2 AND created_at > $3 AND start_revision >= $4
+          ORDER BY created_at ASC, id ASC LIMIT 1
+        `, [accountId, turn.draftId, turn.createdAt, turn.endRevision]);
+        if (laterTurn) {
+          endCustomers = evalDraftCustomers(laterTurn.beforeCustomers);
+          endSnapshotFound = true;
+        }
+        if (!endSnapshotFound) {
+          const { rows: [workspace] } = await client.query<{ customers: unknown }>(`
+            SELECT draft_customers AS customers FROM dispatch.workspaces
+            WHERE account_id = $1 AND draft_id = $2
+          `, [accountId, turn.draftId]);
+          if (workspace) {
+            endCustomers = evalDraftCustomers(workspace.customers);
+            endSnapshotFound = true;
+          }
+        }
+        if (!endSnapshotFound) {
+          const { rows: [version] } = await client.query<{ customers: unknown }>(`
+            SELECT customers FROM dispatch.trip_versions
+            WHERE account_id = $1 AND trip_id = $2 ORDER BY version DESC LIMIT 1
+          `, [accountId, turn.draftId]);
+          if (version) {
+            const { rows: sheetRows } = await client.query<{ id: string; partyId: string }>(`
+              SELECT id, party_id AS "partyId" FROM dispatch.sheets
+              WHERE account_id = $1 AND trip_id = $2
+            `, [accountId, turn.draftId]);
+            const sheetParties = new Map(sheetRows.map(row => [row.id, row.partyId]));
+            endCustomers = evalDraftCustomers(version.customers).map(customer => ({
+              ...customer, partyId: sheetParties.get(customer.id) ?? customer.partyId ?? null,
+            }));
+            endSnapshotFound = true;
+          }
+        }
+        if (endSnapshotFound) {
+          environmentNote = '注意：该回合后草稿发生过人工修改或撤销，回放前请核对 grader.expect.customers';
+        }
+      }
     }
     const lastEvent = (kind: string) => [...events].reverse().find(event => event.kind === kind);
     const endPayload = isObject(lastEvent('end')?.payload)
@@ -537,10 +642,8 @@ async function readEvalCase(pool: Pool, accountId: string, turnId: string) {
       isObject(payload) && Array.isArray(payload.questions) ? payload.questions : []);
     const changeLines = events.filter(event => event.kind === 'change').flatMap(event =>
       isObject(event.payload) && Array.isArray(event.payload.lines) ? event.payload.lines : []);
-    const customerLinks = events.filter(event => event.kind === 'customer_links').flatMap(event =>
-      isObject(event.payload) && Array.isArray(event.payload.links) ? event.payload.links : [])
-      .filter(isObject).map(link => ({ spoken: link.spoken, canonicalName: link.canonicalName,
-        matchedBy: link.matchedBy, merged: Boolean(link.merged) }));
+    const customerLinks = rawLinks.filter(isObject).map(link => ({ spoken: link.spoken, canonicalName: link.canonicalName,
+      matchedBy: link.matchedBy, merged: Boolean(link.merged) }));
     const proposalEvent = lastEvent('delivery_proposal');
     const deliveryIntentEvent = lastEvent('delivery_intent');
     const proposal = isObject(proposalEvent?.payload) ? proposalEvent.payload : null;
@@ -578,6 +681,7 @@ async function readEvalCase(pool: Pool, accountId: string, turnId: string) {
       aliases: exportAliases,
       historicalSales,
     };
+    if (environmentNote) environment.environmentNote = environmentNote;
     if (delivery) {
       const { rows: [formal] } = await client.query<{
         statuses: unknown; deliveryEdits: unknown; completedSheets: unknown;
@@ -608,7 +712,19 @@ async function readEvalCase(pool: Pool, accountId: string, turnId: string) {
         const price = nonEmptyPrice(edit.price);
         return price ? [price] : [];
       }) : [];
-    const allowedPrices = [...new Set([...spokenPrices(turn.userText), ...introducedPrices, ...proposalPrices])];
+    const previousPayload = isObject(previousRow?.payload) ? previousRow.payload : {};
+    const previous = previousRow ? {
+      text: typeof previousPayload.context === 'string' ? previousPayload.context
+        : typeof previousPayload.sourceText === 'string' ? previousPayload.sourceText : previousRow.text,
+      questions: Array.isArray(previousPayload.questions) ? previousPayload.questions : [],
+      ...(isObject(previousRow.confirmation) ? { confirmation: previousRow.confirmation } : {}),
+    } : undefined;
+    const priceSource = [turn.userText, previous?.text ?? ''].filter(Boolean).join('\n');
+    const allowedPrices = [...new Set([
+      ...spokenPrices(priceSource),
+      ...introducedPrices.filter(price => hasSpokenNumber(priceSource, price)),
+      ...proposalPrices.filter(price => hasSpokenNumber(priceSource, price)),
+    ])];
     const expectedCustomers = endCustomers
       .filter(customer => customer.customer.trim() || customer.items.some(item => item.product.trim() || nonEmptyPrice(item.price)))
       .map(customer => ({
@@ -618,13 +734,15 @@ async function readEvalCase(pool: Pool, accountId: string, turnId: string) {
           .map(item => ({ product: item.product, brand: item.brand, specification: item.specification,
             unit: item.unit, quantity: item.quantity, price: nonEmptyPrice(item.price) })),
       }));
-    const previousPayload = isObject(previousRow?.payload) ? previousRow.payload : {};
-    const previous = previousRow ? {
-      text: typeof previousPayload.context === 'string' ? previousPayload.context
-        : typeof previousPayload.sourceText === 'string' ? previousPayload.sourceText : previousRow.text,
-      questions: Array.isArray(previousPayload.questions) ? previousPayload.questions : [],
-      ...(isObject(previousRow.confirmation) ? { confirmation: previousRow.confirmation } : {}),
-    } : undefined;
+    const planEvent = events.find(event => event.kind === 'plan');
+    const planSteps = isObject(planEvent?.payload) && Array.isArray(planEvent.payload.steps)
+      ? planEvent.payload.steps : [];
+    const chosenFromCard = !delivery && isObject(planSteps[0]) && planSteps[0].text === '已收到你的选择';
+    const previewFromCard = chosenFromCard && !observed.models.length &&
+      (observed.tools.some(tool => isObject(tool) && tool.name === 'preview_trip') || !previous);
+    const directTask = delivery
+      ? isObject(observed.deliveryIntent) && observed.deliveryIntent.direct === true ? 'draft' : undefined
+      : previewFromCard ? 'preview' : chosenFromCard && previous ? 'draft' : undefined;
     const outcome = proposal ? 'proposal' : questions.length ? 'question' : 'text';
     const expect = delivery ? {
       status: turn.status, outcome,
@@ -643,6 +761,7 @@ async function readEvalCase(pool: Pool, accountId: string, turnId: string) {
       schemaVersion: 1, id: `case-${turn.id.slice(0, 8)}`, mode: delivery ? 'delivery' : 'entry',
       exportedAt: new Date().toISOString(),
       task: { text: turn.userText, ...(previous ? { previous } : {}), hasImages: turn.materialIds.length > 0,
+        ...(directTask ? { direct: directTask } : {}),
         ...(turn.materialIds.length ? { note: '原回合含上传图片，回放时可配置固定图片识别桩或替换测试图' } : {}) },
       environment, observed,
       grader: {
@@ -1281,6 +1400,9 @@ const adminPage = `<!doctype html>
     if (asked) signals.push({ label: '护栏追问/确认', cls: 'warn' });
     var changed = turn.startRevision !== turn.endRevision;
     if (changed) signals.push({ label: '有改动', cls: 'info' });
+    if (turn.events.some(function (event) { return event.kind === 'delivery_proposal'; })) {
+      signals.push({ label: '现场提案', cls: 'info' });
+    }
     var intent = intentOf(turn);
     if (intent && intent.draft && !changed && !asked) signals.push({ label: '口语未产生改动', cls: 'warn' });
     if (turn.elapsedMs !== null && turn.elapsedMs !== undefined && turn.elapsedMs > 3000) {
@@ -1321,7 +1443,7 @@ const adminPage = `<!doctype html>
     var result = payload.result || {};
     var outcome = result.outcome || 'recorded';
     var cls = outcome === 'error' || outcome === 'issues' ? 'bad'
-      : outcome === 'question' || outcome === 'confirmation' || outcome === 'blocked_or_noop' ? 'warn' : '';
+      : outcome === 'question' || outcome === 'questions' || outcome === 'confirmation' || outcome === 'blocked_or_noop' ? 'warn' : '';
     var badge = cls === 'bad' ? 'bad' : cls === 'warn' ? 'warn' : 'info';
     return '<div class="tool-card ' + cls + '"><div class="tool-head">' +
       '<span class="badge ' + badge + '">工具/护栏 · ' + esc(payload.name || '') + '</span>' +

@@ -930,6 +930,19 @@ const adminPage = `<!doctype html>
   .tabs button.active { background: #fff; color: var(--green-dark); font-weight: 700; }
   .status { min-height: 26px; padding: 4px 20px; color: var(--muted); font-size: 12px; }
   .status.error { color: var(--red); }
+  .toast-stack { position: fixed; right: 18px; bottom: 18px; z-index: 30; display: flex; flex-direction: column;
+    gap: 8px; width: min(380px, calc(100vw - 36px)); pointer-events: none; }
+  .toast { display: flex; align-items: flex-start; gap: 8px; padding: 10px 12px; border: 1px solid var(--line);
+    border-left: 4px solid var(--blue); border-radius: 9px; background: #fff; color: var(--ink);
+    box-shadow: 0 12px 30px rgba(18,102,77,.18); font-size: 12px; line-height: 1.45;
+    pointer-events: auto; animation: toast-in .18s ease-out; }
+  .toast.success { border-left-color: var(--green); }
+  .toast.error { border-color: #fecaca; border-left-color: var(--red); background: #fff7f7; }
+  .toast.info { border-left-color: var(--blue); }
+  .toast-text { flex: 1; min-width: 0; word-break: break-word; overflow-wrap: anywhere; }
+  .toast-close { flex: 0 0 auto; padding: 0 2px; border: 0; background: transparent; color: var(--muted);
+    font-size: 16px; line-height: 1; }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
   main { padding: 0 20px 28px; }
   .layout { display: grid; grid-template-columns: minmax(430px, 43%) minmax(0, 1fr); gap: 16px; align-items: start; }
   .panel { background: var(--paper); border: 1px solid var(--line); border-radius: 12px; min-width: 0; }
@@ -981,13 +994,16 @@ const adminPage = `<!doctype html>
   .model-card pre, .raw pre, .tools pre, .prompt-text { margin: 7px 0 0; padding: 9px; border-radius: 7px; background: #0f241d;
     color: #d8f3e8; font: 11px/1.55 var(--mono); white-space: pre-wrap; word-break: break-word; overflow: auto; max-height: 320px; }
   .input-summary { margin-top: 5px; color: var(--muted); font-size: 11px; }
-  .tool-card { margin-top: 8px; padding: 9px 10px; border: 1px solid #93c5fd; border-left: 3px solid var(--blue);
-    border-radius: 9px; background: #eff6ff; }
+  .tool-card { min-width: 0; margin-top: 8px; padding: 9px 10px; border: 1px solid #93c5fd;
+    border-left: 3px solid var(--blue); border-radius: 9px; background: #eff6ff; overflow: hidden; }
   .tool-card.warn { border-color: #fcd34d; border-left-color: var(--amber); background: #fffbeb; }
   .tool-card.bad { border-color: #fca5a5; border-left-color: var(--red); background: #fef2f2; }
   .tool-head { display: flex; flex-wrap: wrap; gap: 6px 9px; align-items: center; font-size: 11px; color: var(--muted); }
-  .tool-body { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; }
-  .tool-body pre { margin-top: 4px; max-height: 220px; background: #fff; color: var(--ink); border: 1px solid #dbeafe; }
+  .tool-body { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; align-items: start; }
+  .tool-body > div { min-width: 0; }
+  .tool-body pre { min-width: 0; margin-top: 4px; padding: 8px 9px; max-height: 220px; border-radius: 7px;
+    background: #fff; color: var(--ink); border: 1px solid #dbeafe; font: 11px/1.55 var(--mono);
+    white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere; overflow: auto; }
   .tool-body label { display: block; margin-top: 7px; color: var(--muted); font-size: 10px; font-weight: 700; }
   .turn-actions { display: flex; flex-wrap: wrap; gap: 6px; }
   .turn-actions button { padding: 3px 9px; border: 1px solid var(--line); border-radius: 6px; background: #fff;
@@ -1071,6 +1087,7 @@ const adminPage = `<!doctype html>
   </main>
 </div>
 <div id="lightbox" class="lightbox hidden"><img id="lightbox-img" alt="原图"></div>
+<div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="false"></div>
 <script>
 (function () {
   var state = { token: '', accounts: [], accountId: '', overview: null, scope: null, view: 'diagnostics',
@@ -1098,6 +1115,47 @@ const adminPage = `<!doctype html>
     var node = el('status');
     node.textContent = text || '';
     node.className = 'status' + (error ? ' error' : '');
+  };
+  var toast = function (message, type) {
+    var stack = el('toast-stack');
+    if (!stack || !message) return;
+    var node = document.createElement('div');
+    node.className = 'toast ' + (type || 'info');
+    node.setAttribute('role', type === 'error' ? 'alert' : 'status');
+    var text = document.createElement('div');
+    text.className = 'toast-text';
+    text.textContent = message;
+    var close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'toast-close';
+    close.setAttribute('aria-label', '关闭提示');
+    close.textContent = '×';
+    var remove = function () { if (node.parentNode) node.parentNode.removeChild(node); };
+    close.addEventListener('click', remove);
+    node.appendChild(text);
+    node.appendChild(close);
+    stack.appendChild(node);
+    while (stack.children.length > 3) stack.removeChild(stack.firstChild);
+    setTimeout(remove, type === 'error' ? 6000 : 3400);
+  };
+  var copyText = function (text, done, fail) {
+    var fallback = function () {
+      var area = document.createElement('textarea');
+      area.value = text;
+      area.setAttribute('readonly', '');
+      area.style.position = 'fixed';
+      area.style.top = '-9999px';
+      document.body.appendChild(area);
+      var copied = false;
+      try { area.select(); copied = document.execCommand('copy'); } catch (e) { copied = false; }
+      document.body.removeChild(area);
+      if (copied) done(); else fail();
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, fallback);
+    } else {
+      fallback();
+    }
   };
   var api = function (path) {
     return fetch('/admin/api' + path, { headers: { Authorization: 'Bearer ' + state.token }, cache: 'no-store' })
@@ -1137,6 +1195,7 @@ const adminPage = `<!doctype html>
     state.scope = null;
     sessionStorage.removeItem('dispatchAdminToken');
     el('login-error').textContent = expired ? '口令不正确或已失效，请重新输入。' : '';
+    if (expired) toast('口令不正确或已失效，请重新输入。', 'error');
     showLogin();
   };
   var boot = function () {
@@ -1144,7 +1203,7 @@ const adminPage = `<!doctype html>
     if (!state.token) { showLogin(); return; }
     el('login').classList.add('hidden');
     el('app').classList.remove('hidden');
-    loadAccounts();
+    loadAccounts().catch(function () { /* 顶部状态与登录页已提示错误 */ });
   };
   var loadAccounts = function () {
     setStatus('正在读取配送员账号…');
@@ -1548,24 +1607,33 @@ const adminPage = `<!doctype html>
   var openLightbox = function (url) {
     el('lightbox-img').src = url;
     el('lightbox').classList.remove('hidden');
+    setStatus('已放大原图，点击黑色遮罩关闭。');
   };
-  var setView = function (view) {
+  var setView = function (view, quiet) {
     state.view = view;
     el('diagnostics-view').classList.toggle('hidden', view !== 'diagnostics');
     el('prompts-view').classList.toggle('hidden', view !== 'prompts');
     Array.prototype.forEach.call(document.querySelectorAll('[data-view]'), function (button) {
       button.classList.toggle('active', button.getAttribute('data-view') === view);
     });
-    if (view === 'prompts') loadPrompts();
+    if (view === 'prompts') loadPrompts().catch(function () { /* 顶部状态已提示 */ });
+    if (!quiet) {
+      var label = view === 'prompts' ? '提示词与工具看板' : '单据与对话排障';
+      setStatus('已切换到「' + label + '」。');
+      toast('已切换到「' + label + '」。', 'info');
+    }
   };
   var loadPrompts = function () {
-    if (state.prompts) { renderPrompts(); return; }
+    if (state.prompts) { renderPrompts(); return Promise.resolve(); }
     setStatus('正在读取提示词与工具模板…');
-    api('/prompts').then(function (data) {
+    return api('/prompts').then(function (data) {
       state.prompts = data.prompts;
       setStatus('提示词与工具模板为当前服务端只读快照。');
       renderPrompts();
-    }).catch(function (error) { setStatus(error.message, true); });
+    }).catch(function (error) {
+      setStatus(error.message, true);
+      throw error;
+    });
   };
   var renderPrompts = function () {
     var html = '';
@@ -1597,38 +1665,39 @@ const adminPage = `<!doctype html>
     var entry = state.prompts[index];
     if (!entry) return;
     var text = entry.prompts.map(function (prompt) { return '【' + prompt.label + '】\\n' + prompt.text; }).join('\\n\\n');
-    var done = function () { setStatus('已复制「' + entry.title + '」全文。'); };
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).then(done, function () { setStatus('复制失败，请手动选择文本。', true); });
-    } else {
-      var area = document.createElement('textarea');
-      area.value = text;
-      document.body.appendChild(area);
-      area.select();
-      try { document.execCommand('copy'); done(); } catch (e) { setStatus('复制失败，请手动选择文本。', true); }
-      document.body.removeChild(area);
-    }
+    copyText(text, function () {
+      setStatus('已复制「' + entry.title + '」全文。');
+      toast('已复制「' + entry.title + '」全文。', 'success');
+    }, function () {
+      setStatus('复制失败，请手动选择文本。', true);
+      toast('复制失败：未能写入剪贴板，请手动选择文本。', 'error');
+    });
   };
   var copyEvalCase = function (turnId) {
-    if (!state.accountId) return;
+    if (!state.accountId) {
+      toast('请先选择配送员账号。', 'error');
+      return;
+    }
     setStatus('正在读取评测 Case…');
     api('/accounts/' + state.accountId + '/turns/' + turnId + '/eval-case').then(function (data) {
       var text = JSON.stringify(data, null, 2);
-      var done = function () { setStatus('已复制 ' + data.id + ' 的评测 Case JSON。'); };
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).then(done, function () { setStatus('复制失败，请改用导出按钮。', true); });
-      } else {
-        var area = document.createElement('textarea');
-        area.value = text;
-        document.body.appendChild(area);
-        area.select();
-        try { document.execCommand('copy'); done(); } catch (e) { setStatus('复制失败，请改用导出按钮。', true); }
-        document.body.removeChild(area);
-      }
-    }).catch(function (error) { setStatus(error.message, true); });
+      copyText(text, function () {
+        setStatus('已复制 ' + data.id + ' 的评测 Case JSON。');
+        toast('已复制 ' + data.id + ' 评测 Case。', 'success');
+      }, function () {
+        setStatus('复制失败，请改用导出按钮。', true);
+        toast('复制失败：未能写入剪贴板，请改用「导出评测 Case」。', 'error');
+      });
+    }).catch(function (error) {
+      setStatus(error.message, true);
+      toast('复制失败：' + error.message, 'error');
+    });
   };
   var exportEvalCase = function (turnId) {
-    if (!state.accountId) return;
+    if (!state.accountId) {
+      toast('请先选择配送员账号。', 'error');
+      return;
+    }
     setStatus('正在导出评测 Case…');
     api('/accounts/' + state.accountId + '/turns/' + turnId + '/eval-case').then(function (data) {
       var blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
@@ -1641,42 +1710,84 @@ const adminPage = `<!doctype html>
       document.body.removeChild(link);
       setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
       setStatus('已导出 ' + data.id + '.json；含脱敏环境、Trace 与双层 Grader 模板。');
-    }).catch(function (error) { setStatus(error.message, true); });
+      toast('已导出 ' + data.id + '.json。', 'success');
+    }).catch(function (error) {
+      setStatus(error.message, true);
+      toast('导出失败：' + error.message, 'error');
+    });
   };
   el('login-form').addEventListener('submit', function (event) {
     event.preventDefault();
     var value = el('login-token').value.trim();
-    if (!value) return;
+    if (!value) {
+      el('login-error').textContent = '请输入排障后台口令。';
+      toast('请输入排障后台口令。', 'error');
+      return;
+    }
     state.token = value;
     sessionStorage.setItem('dispatchAdminToken', value);
     el('login-error').textContent = '';
     loadAccounts().then(function () {
       el('login').classList.add('hidden');
       el('app').classList.remove('hidden');
+      toast('已进入排障后台。', 'success');
     }).catch(function (error) {
       state.token = '';
       sessionStorage.removeItem('dispatchAdminToken');
       el('login-error').textContent = error.message;
+      toast('登录失败：' + error.message, 'error');
       showLogin();
     });
   });
-  el('logout').addEventListener('click', function () { logout(false); });
+  el('logout').addEventListener('click', function () {
+    logout(false);
+    toast('已退出口令。', 'info');
+  });
   el('refresh').addEventListener('click', function () {
-    if (state.view === 'prompts') { state.prompts = null; loadPrompts(); }
-    else if (state.accountId) loadAccounts();
+    if (state.view === 'prompts') {
+      state.prompts = null;
+      loadPrompts().then(function () {
+        toast('已刷新提示词与工具模板。', 'success');
+      }, function (error) {
+        toast('刷新失败：' + error.message, 'error');
+      });
+    } else if (state.accountId) {
+      loadAccounts().then(function () {
+        toast('已刷新最新排障数据。', 'success');
+      }, function (error) {
+        toast('刷新失败：' + error.message, 'error');
+      });
+    } else {
+      toast('当前没有可刷新的配送员账号。', 'info');
+    }
   });
   el('account-select').addEventListener('change', function (event) {
     clearMaterialUrls();
     state.accountId = event.target.value;
     currentScopeValue = '';
-    loadOverview().catch(function (error) { setStatus(error.message, true); });
+    loadOverview().then(function () {
+      var account = state.accounts.filter(function (item) { return item.id === state.accountId; })[0];
+      toast('已切换到配送员 ' + (account ? account.subject : state.accountId.slice(0, 8)) + '。', 'success');
+    }, function (error) {
+      toast('切换账号失败：' + error.message, 'error');
+    });
   });
   el('scope-select').addEventListener('change', function () {
-    loadScope().catch(function (error) { setStatus(error.message, true); });
+    loadScope().then(function () {
+      var select = el('scope-select');
+      var label = select.options[select.selectedIndex] ? select.options[select.selectedIndex].textContent : '所选范围';
+      toast('已载入「' + label + '」。', 'success');
+    }, function (error) {
+      toast('载入范围失败：' + error.message, 'error');
+    });
   });
   el('anomaly-filter').addEventListener('change', function (event) {
     state.onlyAnomaly = event.target.checked;
     if (state.scope) renderTurns();
+    var count = document.querySelectorAll('#turns article.turn').length;
+    var message = state.onlyAnomaly ? '已筛选出 ' + count + ' 轮需关注回合。' : '已显示全部 ' + count + ' 轮回合。';
+    setStatus(message);
+    toast(message, 'info');
   });
   document.addEventListener('click', function (event) {
     var view = event.target.closest('[data-view]');
@@ -1688,12 +1799,17 @@ const adminPage = `<!doctype html>
         button.classList.toggle('active', button.getAttribute('data-left') === state.left);
       });
       renderLeft();
+      var leftLabel = { sheets: '送货单', picking: '取货单', memory: '熟客与叫法' }[state.left] || state.left;
+      setStatus('已切换到「' + leftLabel + '」视图。');
+      toast('已切换到「' + leftLabel + '」。', 'info');
       return;
     }
     var version = event.target.closest('[data-prompt-version]');
     if (version) {
-      state.focusVersion = version.getAttribute('data-prompt-version');
-      setView('prompts');
+      var versionLabel = version.getAttribute('data-prompt-version');
+      state.focusVersion = versionLabel;
+      setView('prompts', true);
+      toast('已定位到版本 ' + (versionLabel || '未标版本') + ' 的提示词卡片。', 'success');
       return;
     }
     var copy = event.target.closest('[data-copy-prompt]');
@@ -1702,7 +1818,10 @@ const adminPage = `<!doctype html>
     if (exportCase) { exportEvalCase(exportCase.getAttribute('data-eval-export')); return; }
     var copyCase = event.target.closest('[data-eval-copy]');
     if (copyCase) { copyEvalCase(copyCase.getAttribute('data-eval-copy')); return; }
-    if (event.target === el('lightbox')) el('lightbox').classList.add('hidden');
+    if (event.target === el('lightbox')) {
+      el('lightbox').classList.add('hidden');
+      setStatus('已关闭原图。');
+    }
   });
   boot();
 })();

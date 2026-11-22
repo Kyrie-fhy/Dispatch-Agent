@@ -1,6 +1,6 @@
 import { isObject } from '../../miniprogram/core/orders';
 import { HttpError } from '../http-error';
-import type { AgentModelTrace } from './model';
+import { summarizeToolCalls, type AgentModelTrace } from './model';
 
 export const deliveryPromptVersion = 'a2-delivery-v3';
 export const deliveryIntentPrompt = `你是冻品送货现场意图分类器。仅输出 JSON：{"adjust":false,"query":false,"answering":false,"lookup":"none","shop":""}。
@@ -73,6 +73,7 @@ export function configuredDeliveryModel(env: NodeJS.ProcessEnv): DeliveryModel |
         if (isObject(tool) && typeof tool.arguments === 'string') {
           const args: unknown = JSON.parse(tool.arguments);
           trace.outcome = 'tool_calls';
+          trace.toolCalls = summarizeToolCalls(message.tool_calls);
           return { tool: tool.name, args };
         }
       }

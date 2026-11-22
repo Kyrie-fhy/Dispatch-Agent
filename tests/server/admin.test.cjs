@@ -772,9 +772,11 @@ test('eval-case export pairs A1/A2 traces, stays read-only and replays through t
     await writeFile(casePath, JSON.stringify([
       a1Case.data, postConfirmA1.data, correctedSpoken, directCase.data, directDraftCase.data, a2Case.data,
     ]));
+    const childEnv = { ...process.env, DISPATCH_CASE_PATH: casePath };
+    delete childEnv.NODE_TEST_CONTEXT;
     const replay = spawnSync(process.execPath, ['--test', resolve(__dirname, 'harness-cases.test.cjs')], {
       cwd: resolve(__dirname, '../..'), encoding: 'utf8', timeout: 170_000,
-      env: { ...process.env, DISPATCH_CASE_PATH: casePath },
+      env: childEnv,
     });
     assert.equal(replay.status, 0, `${replay.stdout}\n${replay.stderr}`);
     assert.match(`${replay.stdout}\n${replay.stderr}`, /HARNESS SUMMARY/);
@@ -789,7 +791,7 @@ test('eval-case export pairs A1/A2 traces, stays read-only and replays through t
     await writeFile(casePath, JSON.stringify([unauthorized]));
     const rejected = spawnSync(process.execPath, ['--test', resolve(__dirname, 'harness-cases.test.cjs')], {
       cwd: resolve(__dirname, '../..'), encoding: 'utf8', timeout: 170_000,
-      env: { ...process.env, DISPATCH_CASE_PATH: casePath },
+      env: childEnv,
     });
     assert.notEqual(rejected.status, 0, `${rejected.stdout}\n${rejected.stderr}`);
     assert.match(`${rejected.stdout}\n${rejected.stderr}`, /forbidInventedPrice/);

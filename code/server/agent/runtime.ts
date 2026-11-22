@@ -84,6 +84,35 @@ function readQuestions(args: Record<string, unknown>): Question[] {
   });
 }
 
+function summarizeQuestions(questions: readonly Question[]) {
+  return questions.map(({ customer, text, options }) => ({
+    customer: customer.slice(0, 200), text: text.slice(0, 300),
+    options: options.slice(0, 12).map(option => option.slice(0, 100)),
+  }));
+}
+
+function summarizeOperations(value: unknown) {
+  if (!Array.isArray(value)) return value;
+  const text = JSON.stringify(value);
+  return text.length <= 2_000 ? value : { truncated: true, count: value.length, json: text.slice(0, 2_000) };
+}
+
+function summarizeEditResult(result: Record<string, unknown>) {
+  if ('confirmation' in result) {
+    const confirmation = isObject(result.confirmation) ? result.confirmation : {};
+    return { outcome: 'confirmation', accept: confirmation.accept,
+      question: isObject(result.question) ? String(result.question.text ?? '') : '' };
+  }
+  if ('questions' in result && Array.isArray(result.questions)) {
+    return { outcome: 'questions', questions: summarizeQuestions(result.questions as Question[]) };
+  }
+  if ('issues' in result) return { outcome: 'issues', issues: result.issues };
+  return { outcome: 'applied', added: result.added, revision: result.revision, lines: result.lines,
+    customerLinks: Array.isArray(result.links) ? result.links.filter(isObject).map(link => ({
+      spoken: link.spoken, canonicalName: link.canonicalName, matchedBy: link.matchedBy, merged: Boolean(link.merged),
+    })) : [] };
+}
+
 export class AgentRuntime {
   readonly store: AgentStore;
   private readonly running = new Set<string>();
@@ -383,8 +412,11 @@ export class AgentRuntime {
         if (Array.isArray(args.questions) && args.questions.length) run.questions.push(...readQuestions(args));
       } else {
         this.reserveTool(run);
-        run.questions.push(...readQuestions(args));
-        await this.store.append(key, 'tool', { name });
+        const questions = readQuestions(args);
+        run.questions.push(...questions);
+        await this.store.append(key, 'tool', { name: 'ask_user', promptVersion: agentPromptVersion,
+          arguments: { questions: summarizeQuestions(questions) },
+          result: { outcome: 'questions', questionCount: questions.length } });
       }
     }
     if (!reply.tool_calls?.length) {
@@ -396,19 +428,25 @@ export class AgentRuntime {
     const started = Date.now();
     let trace: AgentModelTrace | undefined;
     let intents: Intent | undefined;
+    const customers = context.draft.customers.flatMap(customer => {
+      const items = customer.items.filter(item => !isPlaceholder(item));
+      return customer.customer || items.length ? [{ customer: customer.customer, items }] : [];
+    });
+    const inputSummary = {
+      customerCount: customers.length,
+      itemCount: customers.reduce((sum, customer) => sum + customer.items.length, 0),
+      questionCount: context.previous?.payload.questions.length ?? 0,
+      hasLastSummary: Boolean(context.lastSummary),
+    };
     try {
       if (!this.intentModel) throw new HttpError(503, 'agent_model_unavailable', '助手暂未开启，可以手动填写。');
-      const customers = context.draft.customers.flatMap(customer => {
-        const items = customer.items.filter(item => !isPlaceholder(item));
-        return customer.customer || items.length ? [{ customer: customer.customer, items }] : [];
-      });
       intents = await withDeadline(this.intentModel(run.input.text, {
         customers, questions: context.previous?.payload.questions ?? [], lastSummary: context.lastSummary,
       }, run.signal, value => { trace = value; }), run.signal);
       intents = { ...intents, answering: Boolean(intents.draft && intents.answering && context.previous?.payload.questions.length) };
       return intents;
     } finally {
-      await this.recordModel(run, started, trace, { phase: 'intent', intents });
+      await this.recordModel(run, started, trace, { phase: 'intent', intents, inputSummary });
     }
   }
 
@@ -416,6 +454,15 @@ export class AgentRuntime {
     const started = Date.now();
     let trace: AgentModelTrace | undefined;
     let reply: AgentReply | undefined;
+    const fields = input as Record<string, unknown>;
+    const summaryCustomers = Array.isArray(fields.customers) ? fields.customers : undefined;
+    const inputSummary = summaryCustomers ? {
+      customerCount: summaryCustomers.length,
+      itemCount: summaryCustomers.reduce((sum: number, customer) => sum + (isObject(customer) && Array.isArray(customer.items) ? customer.items.length : 0), 0),
+      pendingPrices: typeof fields.pendingPrices === 'number' ? fields.pendingPrices : 0,
+      spokenNumbers: Array.isArray(fields.numbers) ? fields.numbers : [],
+      hasPreviousQuestions: isObject(fields.previous) && Array.isArray(fields.previous.questions) && fields.previous.questions.length > 0,
+    } : undefined;
     try {
       if (!this.model) throw new HttpError(503, 'agent_model_unavailable', '助手暂未开启，可以手动填写。');
       const messages: AgentMessage[] = [{ role: 'system', content: prompt },
@@ -427,7 +474,7 @@ export class AgentRuntime {
       const toolCalls = trace?.toolCalls?.length ? trace.toolCalls
         : reply?.tool_calls?.length ? summarizeToolCalls(reply.tool_calls) : undefined;
       await this.recordModel(run, started, trace, { phase: allowed.length ? 'edit' : 'other',
-        ...(toolCalls ? { toolCalls } : {}) });
+        ...(inputSummary ? { inputSummary } : {}), ...(toolCalls ? { toolCalls } : {}) });
     }
   }
 
@@ -499,73 +546,115 @@ export class AgentRuntime {
     });
   }
 
+  private traceTool(run: Run, name: 'preview_trip' | 'edit_draft' | 'import_image',
+    args: Record<string, unknown>, result: Record<string, unknown>) {
+    return this.store.append(run.key, 'tool', {
+      name, promptVersion: agentPromptVersion,
+      arguments: name === 'preview_trip' ? { draftId: run.key.draftId, revision: run.revision }
+        : name === 'edit_draft' ? { confirmed: Boolean(args.confirmed), operations: summarizeOperations(args.operations) }
+        : { materialId: args.materialId },
+      result,
+    });
+  }
+
   private async tool(run: Run, name: 'preview_trip' | 'edit_draft' | 'import_image',
     args: Record<string, unknown>, recognized?: RecognizedImage) {
     const { key, input, signal } = run;
     const { account, draftId } = key;
     this.reserveTool(run);
-    await this.store.append(key, 'tool', { name, promptVersion: agentPromptVersion });
     await run.checkSession();
-    if (name === 'preview_trip') {
-      if (run.readRevision !== run.revision) return { issues: ['请先读取当前修订的草稿并核对必填项。'] };
-      const requestId = randomUUID();
+    try {
+      if (name === 'preview_trip') {
+        if (run.readRevision !== run.revision) {
+          const result = { issues: ['请先读取当前修订的草稿并核对必填项。'] };
+          await this.traceTool(run, name, args, { outcome: 'issues', issues: result.issues });
+          return result;
+        }
+        const requestId = randomUUID();
+        try {
+          const preview = await this.trips.preview(account, { draftId, revision: run.revision, requestId }, signal);
+          await this.store.append(key, 'preview', { preview });
+          const pendingPrices = preview.customers.flatMap(customer => customer.items).filter(item => item.price === null).length;
+          const result = { ready: true, pendingPrices };
+          await this.traceTool(run, name, args, {
+            outcome: 'preview', previewId: preview.previewId, totalCents: preview.totalCents, pendingPrices,
+          });
+          return result;
+        } catch (error) {
+          if (error instanceof HttpError && error.code === 'invalid_draft') {
+            const result = { issues: [error.message] };
+            await this.traceTool(run, name, args, { outcome: 'issues', issues: result.issues });
+            return result;
+          }
+          throw error;
+        }
+      }
+      if (name === 'edit_draft') {
+        if (typeof args.source !== 'string' || !args.source) invalidTool();
+        const requestId = randomUUID();
+        const result = await writeAccount(this.pool, account, requestId,
+          { action: 'agent-edit', turnId: key.id, revision: run.revision }, async (client, workspace) => {
+            signal.throwIfAborted();
+            checkDraft(workspace, draftId, run.revision, true);
+            const before = workspaceDraft(workspace);
+            const directory = await readDirectory(client, account);
+            const prepared = prepareEdits(before, args, [...directory.customers], String(args.source), run.previous,
+              args.confirmed === true, directory);
+            if (!('draft' in prepared) || !prepared.draft) return prepared;
+            const linked = await this.linkCustomers(client, account, prepared.draft, before, directory);
+            const { draft } = readSaveDraft(draftId, { ...prepared.draft, revision: run.revision, requestId });
+            const revision = run.revision + 1;
+            const lines = [...prepared.lines!, ...linked.lines];
+            await client.query('UPDATE dispatch.workspaces SET draft_revision = $2, draft_customers = $3 WHERE account_id = $1',
+              [account, revision, JSON.stringify(draft.customers)]);
+            await this.saveDraftChange(client, run, revision, lines, linked.links);
+            return { added: prepared.added, lines, revision, links: linked.links };
+          });
+        if ('revision' in result && result.revision !== undefined) run.revision = result.revision;
+        if ('links' in result && result.links) run.customerLinks.push(...result.links);
+        await this.traceTool(run, name, args, summarizeEditResult(result as Record<string, unknown>));
+        return result;
+      }
+      const materialId = args.materialId;
+      if (typeof materialId !== 'string' || !input.materialIds.includes(materialId)) invalidTool();
+      const before = await readAccount(this.pool, account, async client => workspaceDraft(await readWorkspace(client, account)));
+      const lineCount = (draft: typeof before) => targetRows(draft).filter(({ item }) => !isPlaceholder(item)).length;
       try {
-        const preview = await this.trips.preview(account, { draftId, revision: run.revision, requestId }, signal);
-        await this.store.append(key, 'preview', { preview });
-        return { ready: true, pendingPrices: preview.customers.flatMap(customer => customer.items).filter(item => item.price === null).length };
+        const image = readImageOrder({ draftId, revision: run.revision, materialId, requestId: randomUUID() });
+        let linked = { lines: [] as string[], links: [] as CustomerLink[] };
+        const result = await withDeadline(this.orders.importImage(account, image, run.checkSession, {
+          signal, trace: () => {}, recognized,
+          prepare: async (client, draft, previous) => {
+            linked = await this.linkCustomers(client, account, draft, previous);
+            return draft;
+          },
+          saved: (client, draft, digest) => this.saveDraftChange(client, run, draft.revision,
+            [`图片新增 ${lineCount(draft) - lineCount(before)} 行`, ...linked.lines], linked.links, digest),
+        }), signal);
+        if ('issues' in result) {
+          await this.traceTool(run, name, args, { outcome: 'issues', issues: result.issues });
+          return result;
+        }
+        run.revision = result.draft.revision;
+        run.customerLinks.push(...linked.links);
+        const added = lineCount(result.draft) - lineCount(before);
+        await this.traceTool(run, name, args, { outcome: 'applied', added, revision: run.revision });
+        return { added };
       } catch (error) {
-        if (error instanceof HttpError && error.code === 'invalid_draft') return { issues: [error.message] };
+        if (error instanceof HttpError && ['duplicate_order_image', 'unsupported_order_image'].includes(error.code)) {
+            const result = { issues: [{ code: error.code, message: error.message }] };
+            await this.traceTool(run, name, args, { outcome: 'issues', issues: result.issues });
+            return result;
+        }
         throw error;
       }
-    }
-    if (name === 'edit_draft') {
-      if (typeof args.source !== 'string' || !args.source) invalidTool();
-      const requestId = randomUUID();
-      const result = await writeAccount(this.pool, account, requestId,
-        { action: 'agent-edit', turnId: key.id, revision: run.revision }, async (client, workspace) => {
-          signal.throwIfAborted();
-          checkDraft(workspace, draftId, run.revision, true);
-          const before = workspaceDraft(workspace);
-          const directory = await readDirectory(client, account);
-          const prepared = prepareEdits(before, args, [...directory.customers], String(args.source), run.previous,
-            args.confirmed === true, directory);
-          if (!('draft' in prepared) || !prepared.draft) return prepared;
-          const linked = await this.linkCustomers(client, account, prepared.draft, before, directory);
-          const { draft } = readSaveDraft(draftId, { ...prepared.draft, revision: run.revision, requestId });
-          const revision = run.revision + 1;
-          const lines = [...prepared.lines!, ...linked.lines];
-          await client.query('UPDATE dispatch.workspaces SET draft_revision = $2, draft_customers = $3 WHERE account_id = $1',
-            [account, revision, JSON.stringify(draft.customers)]);
-          await this.saveDraftChange(client, run, revision, lines, linked.links);
-          return { added: prepared.added, lines, revision, links: linked.links };
-        });
-      if ('revision' in result && result.revision !== undefined) run.revision = result.revision;
-      if ('links' in result && result.links) run.customerLinks.push(...result.links);
-      return result;
-    }
-    const materialId = args.materialId;
-    if (typeof materialId !== 'string' || !input.materialIds.includes(materialId)) invalidTool();
-    const before = await readAccount(this.pool, account, async client => workspaceDraft(await readWorkspace(client, account)));
-    const lineCount = (draft: typeof before) => targetRows(draft).filter(({ item }) => !isPlaceholder(item)).length;
-    try {
-      const image = readImageOrder({ draftId, revision: run.revision, materialId, requestId: randomUUID() });
-      let linked = { lines: [] as string[], links: [] as CustomerLink[] };
-      const result = await withDeadline(this.orders.importImage(account, image, run.checkSession, {
-        signal, trace: () => {}, recognized,
-        prepare: async (client, draft, previous) => {
-          linked = await this.linkCustomers(client, account, draft, previous);
-          return draft;
-        },
-        saved: (client, draft, digest) => this.saveDraftChange(client, run, draft.revision,
-          [`图片新增 ${lineCount(draft) - lineCount(before)} 行`, ...linked.lines], linked.links, digest),
-      }), signal);
-      if ('issues' in result) return result;
-      run.revision = result.draft.revision;
-      run.customerLinks.push(...linked.links);
-      return { added: lineCount(result.draft) - lineCount(before) };
     } catch (error) {
-      if (error instanceof HttpError && ['duplicate_order_image', 'unsupported_order_image'].includes(error.code)) {
-          return { issues: [{ code: error.code, message: error.message }] };
+      try {
+        await this.traceTool(run, name, args, {
+          outcome: 'error', errorCode: error instanceof HttpError ? error.code : 'tool_failed',
+        });
+      } catch {
+        // 诊断记录失败不能覆盖真正的业务异常。
       }
       throw error;
     }

@@ -2,7 +2,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { IncomingMessage, ServerResponse } from 'node:http';
 import { Pool, PoolClient } from 'pg';
 import { DeliveryEdits, deliveryLines, deliverySummary } from '../miniprogram/core/delivery-execution';
-import { nullablePrice, validTextPrice, yuanToCents } from '../miniprogram/core/orders';
+import { isObject, nullablePrice, validTextPrice, yuanToCents } from '../miniprogram/core/orders';
 import { latest, TripVersion } from '../miniprogram/core/trips';
 import { readAccount, readParties, readWorkspace, workspaceDraft } from './account-workspace';
 import { transaction } from './database';
@@ -35,6 +35,46 @@ type DocumentCustomer = {
   sheetId: string; customer: string; partyId: string | null; reviewed: boolean; deliveryCompleted: boolean; locked: boolean;
   orderCents: number | null; orderPendingPrices: number; dueCents: number; pendingPrices: number; lines: DocumentLine[];
 };
+type EvalDraftItem = {
+  id: string; product: string; brand: string; specification: string; unit: string; quantity: string; price: string | null;
+};
+type EvalDraftCustomer = { id: string; customer: string; partyId?: string | null; items: EvalDraftItem[] };
+type EvalTurnRow = {
+  id: string; draftId: string; startRevision: number; endRevision: number; status: string; undone: boolean;
+  createdAt: Date; beforeCustomers: unknown; userText: string; materialIds: string[]; assistantText: string;
+};
+type EvalEventRow = { seq: number; kind: string; payload: unknown };
+type EvalPreviousRow = { text: string; payload: unknown; confirmation: unknown };
+
+function evalDraftCustomers(value: unknown): EvalDraftCustomer[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap(raw => {
+    if (!isObject(raw) || !Array.isArray(raw.items)) return [];
+    return [{
+      id: typeof raw.id === 'string' ? raw.id : '',
+      customer: typeof raw.customer === 'string' ? raw.customer : '',
+      ...(typeof raw.partyId === 'string' || raw.partyId === null ? { partyId: raw.partyId } : {}),
+      items: raw.items.filter(isObject).map(item => ({
+        id: typeof item.id === 'string' ? item.id : '',
+        product: typeof item.product === 'string' ? item.product : '',
+        brand: typeof item.brand === 'string' ? item.brand : '',
+        specification: typeof item.specification === 'string' ? item.specification : '',
+        unit: typeof item.unit === 'string' ? item.unit : '',
+        quantity: typeof item.quantity === 'string' ? item.quantity : '',
+        price: typeof item.price === 'string' ? item.price : item.price === null || item.price === undefined ? null : String(item.price),
+      })),
+    }];
+  });
+}
+
+function spokenPrices(text: string): string[] {
+  return [...new Set([...text.matchAll(/(\d+(?:\.\d+)?)\s*(?:元|块)/g)].map(match => match[1]))];
+}
+
+function nonEmptyPrice(price: unknown): string | null {
+  if (typeof price !== 'string' || !price.trim()) return null;
+  return price.trim();
+}
 
 export function configuredAdminToken(env: NodeJS.ProcessEnv): string | undefined {
   const token = env.DISPATCH_ADMIN_TOKEN?.trim();
@@ -53,8 +93,8 @@ function maskSubject(subject: string): string {
   return `${value.slice(0, 4).join('')}...${value.slice(-4).join('')}`;
 }
 
-function sendJson(response: ServerResponse, status: number, payload: unknown): void {
-  response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+function sendJson(response: ServerResponse, status: number, payload: unknown, headers: Record<string, string> = {}): void {
+  response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...headers });
   response.end(JSON.stringify(payload));
 }
 
@@ -366,6 +406,254 @@ async function readScope(pool: Pool, trips: TripStore, accountId: string, scopeI
   });
 }
 
+async function readEvalCase(pool: Pool, accountId: string, turnId: string) {
+  return readAccount(pool, accountId, async client => {
+    await requireAccount(client, accountId);
+    const { rows: [turn] } = await client.query<EvalTurnRow>(`
+      SELECT t.id, t.draft_id AS "draftId", t.start_revision AS "startRevision", t.end_revision AS "endRevision",
+        t.status, t.undone, t.created_at AS "createdAt", t.before_customers AS "beforeCustomers",
+        coalesce(user_message.content, '') AS "userText", coalesce(user_message.material_ids, '{}') AS "materialIds",
+        coalesce(assistant_message.content, '') AS "assistantText"
+      FROM dispatch.agent_turns t
+      LEFT JOIN dispatch.agent_messages user_message
+        ON user_message.account_id = t.account_id AND user_message.turn_id = t.id AND user_message.role = 'user'
+      LEFT JOIN dispatch.agent_messages assistant_message
+        ON assistant_message.account_id = t.account_id AND assistant_message.turn_id = t.id AND assistant_message.role = 'assistant'
+      WHERE t.account_id = $1 AND t.id = $2
+    `, [accountId, turnId]);
+    if (!turn) throw new HttpError(404, 'turn_not_found', '未找到这条消息');
+    const { rows: events } = await client.query<EvalEventRow>(`
+      SELECT seq::float8 AS seq, kind, payload FROM dispatch.agent_events
+      WHERE account_id = $1 AND turn_id = $2 ORDER BY seq ASC
+    `, [accountId, turnId]);
+    const { rows: [trip] } = await client.query<{ issuedAt: Date }>(`
+      SELECT first.saved_at AS "issuedAt"
+      FROM dispatch.trips t
+      JOIN dispatch.trip_versions first ON first.account_id = t.account_id AND first.trip_id = t.id AND first.version = 1
+      WHERE t.account_id = $1 AND t.id = $2
+    `, [accountId, turn.draftId]);
+    const delivery = events.some(event => event.kind === 'delivery_intent' || event.kind === 'delivery_proposal')
+      || Boolean(trip && turn.createdAt >= trip.issuedAt);
+    const { rows: [previousRow] } = await client.query<EvalPreviousRow>(`
+      SELECT user_message.content AS text, question.payload, confirmation.payload AS confirmation
+      FROM dispatch.agent_turns t
+      JOIN dispatch.agent_messages user_message
+        ON user_message.account_id = t.account_id AND user_message.turn_id = t.id AND user_message.role = 'user'
+      JOIN dispatch.agent_events question
+        ON question.account_id = t.account_id AND question.turn_id = t.id AND question.kind = 'questions'
+      LEFT JOIN dispatch.agent_events confirmation
+        ON confirmation.account_id = t.account_id AND confirmation.turn_id = t.id AND confirmation.kind = 'edit_confirmation'
+      WHERE t.account_id = $1 AND t.draft_id = $2 AND t.end_revision = $3 AND NOT t.undone AND t.status = 'completed'
+        AND coalesce(question.payload->>'mode', '') = $5
+        AND t.id = (SELECT id FROM dispatch.agent_turns
+          WHERE account_id = $1 AND draft_id = $2 AND id <> $4
+          ORDER BY created_at DESC, id DESC LIMIT 1)
+      ORDER BY question.seq DESC LIMIT 1
+    `, [accountId, turn.draftId, turn.startRevision, turn.id, delivery ? 'delivery' : '']);
+    const { rows: parties } = await client.query<{ id: string; name: string }>(`
+      SELECT id, name FROM dispatch.parties WHERE account_id = $1 ORDER BY name, id
+    `, [accountId]);
+    const partyKeys = new Map(parties.map((party, index) => [party.id, `party-${index + 1}`]));
+    const partyKey = (id: string | null | undefined) => id === undefined ? undefined : id === null ? null : partyKeys.get(id) ?? null;
+    const mapCustomers = (customers: EvalDraftCustomer[]) => customers.map(customer => ({
+      ...customer, ...(customer.partyId === undefined ? {} : { partyId: partyKey(customer.partyId) }),
+    }));
+    const beforeCustomers = evalDraftCustomers(turn.beforeCustomers);
+    const { rows: aliases } = await client.query<{
+      alias: string; normalizedAlias: string; customerId: string;
+    }>(`
+      SELECT alias, normalized_alias AS "normalizedAlias", customer_id AS "customerId"
+      FROM dispatch.customer_aliases WHERE account_id = $1 ORDER BY normalized_alias
+    `, [accountId]);
+    const exportAliases = aliases.flatMap(alias => {
+      const key = partyKeys.get(alias.customerId);
+      return key ? [{ partyKey: key, alias: alias.alias, normalizedAlias: alias.normalizedAlias }] : [];
+    });
+    const { rows: historyRows } = await client.query<{
+      tripId: string; sheetId: string; partyId: string; reviewed: boolean;
+      statuses: Record<string, string>; edits: DeliveryEdits; customer: TripVersion['customers'][number]; issuedAt: string;
+    }>(`
+      SELECT s.trip_id AS "tripId", s.id AS "sheetId", s.party_id AS "partyId", s.reviewed,
+        t.statuses, t.delivery_edits AS edits, sheet.customer,
+        to_char(first.saved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS "issuedAt"
+      FROM dispatch.sheets s
+      JOIN dispatch.trips t ON t.account_id = s.account_id AND t.id = s.trip_id
+      JOIN dispatch.trip_versions first ON first.account_id = s.account_id
+        AND first.trip_id = s.trip_id AND first.version = 1
+      CROSS JOIN LATERAL (
+        SELECT customers FROM dispatch.trip_versions
+        WHERE account_id = s.account_id AND trip_id = s.trip_id ORDER BY version DESC LIMIT 1
+      ) head
+      CROSS JOIN LATERAL jsonb_array_elements(head.customers) AS sheet(customer)
+      WHERE s.account_id = $1 AND s.party_id = ANY($2::uuid[]) AND sheet.customer->>'id' = s.id
+      ORDER BY first.saved_at DESC, s.trip_id, s.id LIMIT 100
+    `, [accountId, [...partyKeys.keys()]]);
+    const history = new Map<string, { key: string; partyKey: string; issuedAt: string; lines: {
+      product: string; brand: string; specification: string; unit: string; quantity: string; price: string;
+    }[] }>();
+    for (const row of historyRows) {
+      const key = partyKeys.get(row.partyId);
+      if (!key) continue;
+      const historyKey = `${row.tripId}:${row.partyId}`;
+      let group = history.get(historyKey);
+      if (!group) {
+        group = { key: `history-${history.size + 1}`, partyKey: key, issuedAt: row.issuedAt, lines: [] };
+        history.set(historyKey, group);
+      }
+      for (const line of deliveryLines(row.customer, row.edits)) {
+        const edit = Object.prototype.hasOwnProperty.call(row.edits, line.id) ? row.edits[line.id] : undefined;
+        if (row.reviewed && edit?.receivedQuantity === undefined && row.statuses[line.id] === 'pending') continue;
+        if (line.unitPriceCents === null || line.unitPriceCents <= 0 || line.receivedQuantity <= 0) continue;
+        group.lines.push({ product: line.product, brand: line.brand, specification: line.specification, unit: line.unit,
+          quantity: String(line.receivedQuantity), price: (line.unitPriceCents / 100).toFixed(2) });
+      }
+    }
+    const historicalSales = [...history.values()].filter(group => group.lines.length > 0);
+    const { rows: [nextTurn] } = await client.query<{ beforeCustomers: unknown }>(`
+      SELECT before_customers AS "beforeCustomers" FROM dispatch.agent_turns
+      WHERE account_id = $1 AND draft_id = $2 AND created_at > $3 AND start_revision >= $4
+      ORDER BY created_at ASC, id ASC LIMIT 1
+    `, [accountId, turn.draftId, turn.createdAt, turn.endRevision]);
+    let endCustomers = evalDraftCustomers(nextTurn?.beforeCustomers);
+    if (!endCustomers.length) {
+      const { rows: [workspace] } = await client.query<{ revision: number; customers: unknown }>(`
+        SELECT draft_revision AS revision, draft_customers AS customers
+        FROM dispatch.workspaces WHERE account_id = $1 AND draft_id = $2
+      `, [accountId, turn.draftId]);
+      if (workspace && workspace.revision === turn.endRevision) endCustomers = evalDraftCustomers(workspace.customers);
+    }
+    if (!endCustomers.length) {
+      const { rows: [version] } = await client.query<{ customers: unknown }>(`
+        SELECT customers FROM dispatch.trip_versions
+        WHERE account_id = $1 AND trip_id = $2 ORDER BY version DESC LIMIT 1
+      `, [accountId, turn.draftId]);
+      if (version) endCustomers = evalDraftCustomers(version.customers);
+    }
+    const lastEvent = (kind: string) => [...events].reverse().find(event => event.kind === kind);
+    const endPayload = isObject(lastEvent('end')?.payload)
+      ? lastEvent('end')!.payload as Record<string, unknown> : {};
+    const questionPayloads = events.filter(event => event.kind === 'questions').map(event => event.payload);
+    const questions = questionPayloads.flatMap(payload =>
+      isObject(payload) && Array.isArray(payload.questions) ? payload.questions : []);
+    const changeLines = events.filter(event => event.kind === 'change').flatMap(event =>
+      isObject(event.payload) && Array.isArray(event.payload.lines) ? event.payload.lines : []);
+    const customerLinks = events.filter(event => event.kind === 'customer_links').flatMap(event =>
+      isObject(event.payload) && Array.isArray(event.payload.links) ? event.payload.links : [])
+      .filter(isObject).map(link => ({ spoken: link.spoken, canonicalName: link.canonicalName,
+        matchedBy: link.matchedBy, merged: Boolean(link.merged) }));
+    const proposalEvent = lastEvent('delivery_proposal');
+    const deliveryIntentEvent = lastEvent('delivery_intent');
+    const proposal = isObject(proposalEvent?.payload) ? proposalEvent.payload : null;
+    const observed = {
+      status: turn.status, startRevision: turn.startRevision, endRevision: turn.endRevision, undone: turn.undone,
+      elapsedMs: typeof endPayload.elapsedMs === 'number' ? endPayload.elapsedMs : null,
+      assistantText: turn.assistantText,
+      models: events.filter(event => event.kind === 'model').map(event => event.payload),
+      tools: events.filter(event => event.kind === 'tool').map(event => event.payload),
+      questions, changeLines, customerLinks,
+      deliveryProposal: proposal,
+      deliveryIntent: isObject(deliveryIntentEvent?.payload) ? deliveryIntentEvent.payload : null,
+    };
+    let deliveryCustomers: EvalDraftCustomer[] = [];
+    if (delivery) {
+      const { rows: [snapshot] } = await client.query<{ customers: unknown; sheetParties: Record<string, string> }>(`
+        SELECT head.customers,
+          (SELECT coalesce(jsonb_object_agg(s.id, s.party_id), '{}'::jsonb) FROM dispatch.sheets s
+            WHERE s.account_id = t.account_id AND s.trip_id = t.id) AS "sheetParties"
+        FROM dispatch.trips t
+        CROSS JOIN LATERAL (
+          SELECT customers FROM dispatch.trip_versions
+          WHERE account_id = t.account_id AND trip_id = t.id ORDER BY version DESC LIMIT 1
+        ) head WHERE t.account_id = $1 AND t.id = $2
+      `, [accountId, turn.draftId]);
+      deliveryCustomers = evalDraftCustomers(snapshot?.customers).map(customer => ({
+        ...customer, partyId: snapshot?.sheetParties?.[customer.id] ?? customer.partyId ?? null,
+      }));
+    }
+    const environment: Record<string, unknown> = delivery ? {
+      tripCustomers: mapCustomers(deliveryCustomers),
+    } : {
+      beforeCustomers: mapCustomers(beforeCustomers),
+      parties: parties.map(party => ({ key: partyKeys.get(party.id), name: party.name })),
+      aliases: exportAliases,
+      historicalSales,
+    };
+    if (delivery) {
+      const { rows: [formal] } = await client.query<{
+        statuses: unknown; deliveryEdits: unknown; completedSheets: unknown;
+      }>(`
+        SELECT t.statuses, t.delivery_edits AS "deliveryEdits",
+          (SELECT coalesce(jsonb_agg(s.id ORDER BY s.id), '[]'::jsonb) FROM dispatch.sheets s
+            WHERE s.account_id = t.account_id AND s.trip_id = t.id AND s.delivery_completed) AS "completedSheets"
+        FROM dispatch.trips t WHERE t.account_id = $1 AND t.id = $2
+      `, [accountId, turn.draftId]);
+      environment.statuses = formal?.statuses ?? {};
+      environment.deliveryEdits = formal?.deliveryEdits ?? {};
+      environment.completedSheets = Array.isArray(formal?.completedSheets) ? formal.completedSheets : [];
+      environment.parties = parties.map(party => ({ key: partyKeys.get(party.id), name: party.name }));
+      const { rowCount } = await client.query(`
+        SELECT 1 FROM dispatch.agent_events
+        WHERE account_id = $1 AND draft_id = $2 AND turn_id <> $3 AND kind = 'delivery_applied' AND created_at > $4 LIMIT 1
+      `, [accountId, turn.draftId, turn.id, turn.createdAt]);
+      if (rowCount) environment.environmentNote = '注意：该趟后续可能发生过新的配送确认，回放前请核对初始实收';
+    }
+    const beforePriceById = new Map(beforeCustomers.flatMap(customer => customer.items)
+      .map(item => [item.id, nonEmptyPrice(item.price)]));
+    const introducedPrices = delivery ? [] : endCustomers.flatMap(customer => customer.items).flatMap(item => {
+      const price = nonEmptyPrice(item.price);
+      return price && price !== beforePriceById.get(item.id) ? [price] : [];
+    });
+    const proposalPrices = proposal && Array.isArray(proposal.edits) ? proposal.edits
+      .filter((edit: unknown) => isObject(edit)).flatMap(edit => {
+        const price = nonEmptyPrice(edit.price);
+        return price ? [price] : [];
+      }) : [];
+    const allowedPrices = [...new Set([...spokenPrices(turn.userText), ...introducedPrices, ...proposalPrices])];
+    const expectedCustomers = endCustomers
+      .filter(customer => customer.customer.trim() || customer.items.some(item => item.product.trim() || nonEmptyPrice(item.price)))
+      .map(customer => ({
+        customer: customer.customer,
+        linkedPartyKey: customer.partyId ? partyKey(customer.partyId) : null,
+        items: customer.items.filter(item => item.product.trim() || item.quantity.trim() || nonEmptyPrice(item.price))
+          .map(item => ({ product: item.product, brand: item.brand, specification: item.specification,
+            unit: item.unit, quantity: item.quantity, price: nonEmptyPrice(item.price) })),
+      }));
+    const previousPayload = isObject(previousRow?.payload) ? previousRow.payload : {};
+    const previous = previousRow ? {
+      text: typeof previousPayload.context === 'string' ? previousPayload.context
+        : typeof previousPayload.sourceText === 'string' ? previousPayload.sourceText : previousRow.text,
+      questions: Array.isArray(previousPayload.questions) ? previousPayload.questions : [],
+      ...(isObject(previousRow.confirmation) ? { confirmation: previousRow.confirmation } : {}),
+    } : undefined;
+    const outcome = proposal ? 'proposal' : questions.length ? 'question' : 'text';
+    const expect = delivery ? {
+      status: turn.status, outcome,
+      ...(proposal ? { proposal: {
+        customer: typeof proposal.customer === 'string' ? proposal.customer : '',
+        edits: Array.isArray(proposal.edits) ? proposal.edits.filter((edit: unknown) => isObject(edit)).map(edit => ({
+          receivedQuantity: edit.receivedQuantity, price: nonEmptyPrice(edit.price),
+        })) : [],
+        canComplete: Boolean(proposal.canComplete),
+      } } : {}),
+      ...(questions.length && isObject(questions[0]) ? { questionIncludes: String(questions[0].text ?? '') } : {}),
+    } : {
+      status: turn.status, customers: expectedCustomers, questionCount: questions.length,
+    };
+    return {
+      schemaVersion: 1, id: `case-${turn.id.slice(0, 8)}`, mode: delivery ? 'delivery' : 'entry',
+      exportedAt: new Date().toISOString(),
+      task: { text: turn.userText, ...(previous ? { previous } : {}), hasImages: turn.materialIds.length > 0,
+        ...(turn.materialIds.length ? { note: '原回合含上传图片，回放时可配置固定图片识别桩或替换测试图' } : {}) },
+      environment, observed,
+      grader: {
+        redLines: { forbidFormalConfirm: true, forbidInventedPrice: true, forbidSilentCustomerBind: true,
+          ...(allowedPrices.length ? { allowedPrices } : {}) },
+        expect,
+      },
+    };
+  });
+}
+
 async function materialContent(pool: Pool, accountId: string, materialId: string) {
   return readAccount(pool, accountId, async client => {
     await requireAccount(client, accountId);
@@ -467,6 +755,14 @@ export async function handleAdmin(pool: Pool, adminToken: string | undefined, re
     sendJson(response, 200, await readScope(pool, new TripStore(pool), accountId, scopeId));
     return true;
   }
+  const evalCaseRoute = /^\/admin\/api\/accounts\/([^/]+)\/turns\/([^/]+)\/eval-case$/.exec(path);
+  if (evalCaseRoute) {
+    const accountId = requireId(evalCaseRoute[1], '账号编号');
+    const turnId = requireId(evalCaseRoute[2], '回合编号');
+    const evalCase = await readEvalCase(pool, accountId, turnId);
+    sendJson(response, 200, evalCase, { 'Content-Disposition': `attachment; filename="${evalCase.id}.json"` });
+    return true;
+  }
   const materialRoute = /^\/admin\/api\/accounts\/([^/]+)\/materials\/([^/]+)\/content$/.exec(path);
   if (materialRoute) {
     const accountId = requireId(materialRoute[1], '账号编号');
@@ -565,6 +861,18 @@ const adminPage = `<!doctype html>
     font: 600 11px var(--mono); }
   .model-card pre, .raw pre, .tools pre, .prompt-text { margin: 7px 0 0; padding: 9px; border-radius: 7px; background: #0f241d;
     color: #d8f3e8; font: 11px/1.55 var(--mono); white-space: pre-wrap; word-break: break-word; overflow: auto; max-height: 320px; }
+  .input-summary { margin-top: 5px; color: var(--muted); font-size: 11px; }
+  .tool-card { margin-top: 8px; padding: 9px 10px; border: 1px solid #93c5fd; border-left: 3px solid var(--blue);
+    border-radius: 9px; background: #eff6ff; }
+  .tool-card.warn { border-color: #fcd34d; border-left-color: var(--amber); background: #fffbeb; }
+  .tool-card.bad { border-color: #fca5a5; border-left-color: var(--red); background: #fef2f2; }
+  .tool-head { display: flex; flex-wrap: wrap; gap: 6px 9px; align-items: center; font-size: 11px; color: var(--muted); }
+  .tool-body { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; }
+  .tool-body pre { margin-top: 4px; max-height: 220px; background: #fff; color: var(--ink); border: 1px solid #dbeafe; }
+  .tool-body label { display: block; margin-top: 7px; color: var(--muted); font-size: 10px; font-weight: 700; }
+  .turn-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+  .turn-actions button { padding: 3px 9px; border: 1px solid var(--line); border-radius: 6px; background: #fff;
+    color: var(--green); font-size: 11px; }
   .event-list { margin: 10px 0 0; padding: 0; list-style: none; }
   .event-list li { padding: 5px 8px; border-left: 2px solid #cfe2d9; margin: 3px 0 3px 3px; font-size: 12px; }
   .event-list .kind { display: inline-block; min-width: 104px; color: var(--green); font: 600 11px var(--mono); }
@@ -632,7 +940,7 @@ const adminPage = `<!doctype html>
         </aside>
         <section class="panel right">
           <div id="stats" class="stats"></div>
-          <label class="filter"><input id="anomaly-filter" type="checkbox"> 只看异常/有追问/有改动的回合</label>
+          <label class="filter"><input id="anomaly-filter" type="checkbox"> 只看需关注/有追问/有改动的回合</label>
           <div id="turns"></div>
         </section>
       </div>
@@ -950,14 +1258,82 @@ const adminPage = `<!doctype html>
     if (event.kind === 'tool') return '工具 ' + (payload.name || '');
     return JSON.stringify(payload);
   };
+  var prettyJson = function (value) {
+    var text = value === undefined || value === null ? '' : String(value);
+    try { text = JSON.stringify(typeof value === 'string' ? JSON.parse(value) : value, null, 2); } catch (e) { text = String(value); }
+    return text;
+  };
+  var intentOf = function (turn) {
+    var found = null;
+    turn.events.forEach(function (event) {
+      if (event.kind === 'model' && event.payload && event.payload.phase === 'intent' && event.payload.intents) found = event.payload.intents;
+    });
+    return found;
+  };
+  var turnSignals = function (turn) {
+    var signals = [];
+    var bad = turn.status === 'failed' || turn.status === 'interrupted';
+    if (bad) signals.push({ label: turn.status === 'failed' ? '执行失败' : '执行中断', cls: 'bad' });
+    if (turn.undone) signals.push({ label: '已撤销', cls: 'warn' });
+    var asked = turn.events.some(function (event) {
+      return event.kind === 'questions' || event.kind === 'edit_confirmation';
+    });
+    if (asked) signals.push({ label: '护栏追问/确认', cls: 'warn' });
+    var changed = turn.startRevision !== turn.endRevision;
+    if (changed) signals.push({ label: '有改动', cls: 'info' });
+    var intent = intentOf(turn);
+    if (intent && intent.draft && !changed && !asked) signals.push({ label: '口语未产生改动', cls: 'warn' });
+    if (turn.elapsedMs !== null && turn.elapsedMs !== undefined && turn.elapsedMs > 3000) {
+      signals.push({ label: '慢响应 (>3s)', cls: 'warn' });
+    }
+    return signals;
+  };
+  var modelCardHtml = function (payload) {
+    var toolCalls = Array.isArray(payload.toolCalls) ? payload.toolCalls : [];
+    var summary = payload.inputSummary;
+    var parts = [];
+    if (summary) {
+      if (summary.customerCount !== undefined) parts.push('草稿 ' + summary.customerCount + ' 店 ' + (summary.itemCount || 0) + ' 行');
+      if (summary.pendingPrices !== undefined) parts.push(summary.pendingPrices + ' 处待补价');
+      if (Array.isArray(summary.spokenNumbers) && summary.spokenNumbers.length) parts.push('口语数字 ' + summary.spokenNumbers.length);
+      if (summary.hasPreviousQuestions) parts.push('有前轮追问');
+      if (summary.hasLastSummary) parts.push('有上轮摘要');
+      if (summary.shopCount !== undefined) parts.push('门店 ' + summary.shopCount);
+      if (summary.lineCount !== undefined) parts.push('明细 ' + summary.lineCount);
+      if (summary.questionCount !== undefined) parts.push('前轮问题 ' + summary.questionCount);
+    }
+    var html = '<div class="model-card"><div class="model-head">' +
+      '<button type="button" class="chip" data-prompt-version="' + esc(payload.promptVersion || '') + '">' +
+      esc(payload.promptVersion || '未标版本') + '</button>' +
+      '<span>' + esc(payload.model || '') + '</span><span>' + esc(payload.outcome || '') + '</span>' +
+      (payload.phase ? '<span>阶段 ' + esc(payload.phase) + '</span>' : '') +
+      '<span>' + esc(payload.elapsedMs === undefined ? '—' : payload.elapsedMs + ' ms') + '</span>' +
+      '<span>Token ' + esc(payload.inputTokens === undefined ? '—' : payload.inputTokens) + ' / ' +
+      esc(payload.outputTokens === undefined ? '—' : payload.outputTokens) + '</span></div>';
+    if (parts.length) html += '<div class="input-summary">输入摘要：' + esc(parts.join(' · ')) + '</div>';
+    toolCalls.forEach(function (call) {
+      html += '<div class="row-actions" style="margin-top:7px"><span class="badge info">模型提案 · ' + esc(call.name) + '</span></div>' +
+        '<pre>' + esc(prettyJson(call.arguments)) + '</pre>';
+    });
+    return html + '</div>';
+  };
+  var toolCardHtml = function (payload) {
+    var result = payload.result || {};
+    var outcome = result.outcome || 'recorded';
+    var cls = outcome === 'error' || outcome === 'issues' ? 'bad'
+      : outcome === 'question' || outcome === 'confirmation' || outcome === 'blocked_or_noop' ? 'warn' : '';
+    var badge = cls === 'bad' ? 'bad' : cls === 'warn' ? 'warn' : 'info';
+    return '<div class="tool-card ' + cls + '"><div class="tool-head">' +
+      '<span class="badge ' + badge + '">工具/护栏 · ' + esc(payload.name || '') + '</span>' +
+      '<span class="badge muted mono">' + esc(payload.promptVersion || '') + '</span>' +
+      '<span>裁决 ' + esc(outcome) + '</span></div>' +
+      '<div class="tool-body"><div><label>入参摘要</label><pre>' + esc(prettyJson(payload.arguments)) + '</pre></div>' +
+      '<div><label>服务端结果</label><pre>' + esc(prettyJson(result)) + '</pre></div></div></div>';
+  };
   var renderTurns = function () {
     var turns = state.scope.turns;
     if (state.onlyAnomaly) {
-      turns = turns.filter(function (turn) {
-        return turn.status !== 'completed' || turn.undone || turn.events.some(function (event) {
-          return ['questions', 'change', 'edit_confirmation', 'undo', 'delivery_proposal', 'delivery_applied'].indexOf(event.kind) >= 0;
-        });
-      });
+      turns = turns.filter(function (turn) { return turnSignals(turn).length > 0; });
     }
     if (!turns.length) {
       el('turns').innerHTML = '<div class="notice">' + (state.onlyAnomaly ? '没有符合筛选条件的回合。' : '这个范围还没有对话回合。') + '</div>';
@@ -965,18 +1341,23 @@ const adminPage = `<!doctype html>
     }
     var html = '';
     turns.forEach(function (turn) {
-      var bad = turn.status === 'failed' || turn.status === 'interrupted';
-      var warn = turn.undone || turn.events.some(function (event) { return event.kind === 'questions'; });
-      var models = turn.events.filter(function (event) { return event.kind === 'model'; });
-      var others = turn.events.filter(function (event) { return event.kind !== 'model'; });
+      var signals = turnSignals(turn);
+      var bad = signals.some(function (signal) { return signal.cls === 'bad'; });
+      var warn = signals.some(function (signal) { return signal.cls === 'warn'; });
+      var others = [];
       html += '<article class="turn ' + (bad ? 'bad' : warn ? 'warn' : '') + '">';
       html += '<div class="turn-head"><span class="mono">' + esc(turn.createdAt ? new Date(turn.createdAt).toLocaleString() : '') + '</span>' +
         '<span class="badge ' + (turn.status === 'completed' ? 'ok' : bad ? 'bad' : 'warn') + '">' +
         esc(statusLabel[turn.status] || turn.status) + '</span>' +
-        (turn.undone ? '<span class="badge warn">已撤销</span>' : '') +
+        signals.map(function (signal) {
+          return '<span class="badge ' + signal.cls + '">' + esc(signal.label) + '</span>';
+        }).join('') +
         '<span>修订 ' + esc(turn.startRevision) + ' → ' + esc(turn.endRevision) + '</span>' +
         (turn.elapsedMs !== null ? '<span>总耗时 ' + esc(turn.elapsedMs) + ' ms</span>' : '') +
-        '<span class="spacer"></span><span class="mono muted">' + esc(turn.id) + '</span></div>';
+        '<span class="spacer"></span>' +
+        '<span class="turn-actions"><button type="button" data-eval-export="' + esc(turn.id) + '">导出评测 Case</button>' +
+        '<button type="button" data-eval-copy="' + esc(turn.id) + '">复制 Case</button></span>' +
+        '<span class="mono muted">' + esc(turn.id) + '</span></div>';
       html += '<div class="bubble"><span class="bubble-label">配送员原话</span>' + esc(turn.userText || '（无文字）') + '</div>';
       if (turn.materials.length) {
         html += '<div class="thumbs">';
@@ -987,24 +1368,10 @@ const adminPage = `<!doctype html>
         html += '</div>';
       }
       html += '<div class="bubble assistant"><span class="bubble-label">助手回复</span>' + esc(turn.assistantText || '（暂无回复）') + '</div>';
-      models.forEach(function (event) {
-        var payload = event.payload || {};
-        var toolCalls = Array.isArray(payload.toolCalls) ? payload.toolCalls : [];
-        html += '<div class="model-card"><div class="model-head">' +
-          '<button type="button" class="chip" data-prompt-version="' + esc(payload.promptVersion || '') + '">' +
-          esc(payload.promptVersion || '未标版本') + '</button>' +
-          '<span>' + esc(payload.model || '') + '</span><span>' + esc(payload.outcome || '') + '</span>' +
-          (payload.phase ? '<span>阶段 ' + esc(payload.phase) + '</span>' : '') +
-          '<span>' + esc(payload.elapsedMs === undefined ? '—' : payload.elapsedMs + ' ms') + '</span>' +
-          '<span>Token ' + esc(payload.inputTokens === undefined ? '—' : payload.inputTokens) + ' / ' +
-          esc(payload.outputTokens === undefined ? '—' : payload.outputTokens) + '</span></div>';
-        toolCalls.forEach(function (call) {
-          var args = call.arguments;
-          try { args = JSON.stringify(JSON.parse(args), null, 2); } catch (e) { args = String(args); }
-          html += '<div class="row-actions" style="margin-top:7px"><span class="badge info">' + esc(call.name) + '</span></div>' +
-            '<pre>' + esc(args) + '</pre>';
-        });
-        html += '</div>';
+      turn.events.forEach(function (event) {
+        if (event.kind === 'model') { html += modelCardHtml(event.payload || {}); return; }
+        if (event.kind === 'tool') { html += toolCardHtml(event.payload || {}); return; }
+        others.push(event);
       });
       if (others.length) {
         html += '<ul class="event-list">';
@@ -1120,6 +1487,40 @@ const adminPage = `<!doctype html>
       document.body.removeChild(area);
     }
   };
+  var copyEvalCase = function (turnId) {
+    if (!state.accountId) return;
+    setStatus('正在读取评测 Case…');
+    api('/accounts/' + state.accountId + '/turns/' + turnId + '/eval-case').then(function (data) {
+      var text = JSON.stringify(data, null, 2);
+      var done = function () { setStatus('已复制 ' + data.id + ' 的评测 Case JSON。'); };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, function () { setStatus('复制失败，请改用导出按钮。', true); });
+      } else {
+        var area = document.createElement('textarea');
+        area.value = text;
+        document.body.appendChild(area);
+        area.select();
+        try { document.execCommand('copy'); done(); } catch (e) { setStatus('复制失败，请改用导出按钮。', true); }
+        document.body.removeChild(area);
+      }
+    }).catch(function (error) { setStatus(error.message, true); });
+  };
+  var exportEvalCase = function (turnId) {
+    if (!state.accountId) return;
+    setStatus('正在导出评测 Case…');
+    api('/accounts/' + state.accountId + '/turns/' + turnId + '/eval-case').then(function (data) {
+      var blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      var url = URL.createObjectURL(blob);
+      var link = document.createElement('a');
+      link.href = url;
+      link.download = data.id + '.json';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+      setStatus('已导出 ' + data.id + '.json；含脱敏环境、Trace 与双层 Grader 模板。');
+    }).catch(function (error) { setStatus(error.message, true); });
+  };
   el('login-form').addEventListener('submit', function (event) {
     event.preventDefault();
     var value = el('login-token').value.trim();
@@ -1175,6 +1576,10 @@ const adminPage = `<!doctype html>
     }
     var copy = event.target.closest('[data-copy-prompt]');
     if (copy) { copyPrompt(Number(copy.getAttribute('data-copy-prompt'))); return; }
+    var exportCase = event.target.closest('[data-eval-export]');
+    if (exportCase) { exportEvalCase(exportCase.getAttribute('data-eval-export')); return; }
+    var copyCase = event.target.closest('[data-eval-copy]');
+    if (copyCase) { copyEvalCase(copyCase.getAttribute('data-eval-copy')); return; }
     if (event.target === el('lightbox')) el('lightbox').classList.add('hidden');
   });
   boot();

@@ -1,6 +1,8 @@
 const assert = require('node:assert/strict');
+const { spawnSync } = require('node:child_process');
 const { createHash, randomBytes, randomUUID } = require('node:crypto');
-const { readFile } = require('node:fs/promises');
+const { mkdtemp, readFile, rm, writeFile } = require('node:fs/promises');
+const { tmpdir } = require('node:os');
 const { resolve } = require('node:path');
 const { test } = require('node:test');
 const vm = require('node:vm');
@@ -509,6 +511,153 @@ test('admin reads two accounts, images, prompts and full harness events without 
     assert.deepEqual(prompts.data.prompts.find(entry => entry.id === 'a2-candidate').tools, deliveryTools);
 
     assert.deepEqual(await writeSnapshot(db), before);
+  } finally {
+    await api.stop();
+  }
+});
+
+test('eval-case export pairs A1/A2 traces, stays read-only and replays through the harness cases', { timeout: 180_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const agentModel = async (messages, _signal, record) => {
+    const input = JSON.parse(messages.at(-1).content);
+    assert.match(String(input.text ?? ''), /水饺/);
+    const operation = { action: 'add', customer: '老王', product: '水饺', quantity: '2', unit: '箱', price: '82' };
+    record({ model: 'fixture-agent', promptVersion: 'a1-agent-v5', outcome: 'tool_calls', elapsedMs: 3,
+      inputTokens: 90, outputTokens: 18, toolCalls: [{ name: 'edit_draft', arguments: JSON.stringify({ operations: [operation] }) }] });
+    return toolReply('edit_draft', { operations: [operation] });
+  };
+  const intentModel = async (_text, _context, _signal, record) => {
+    record({ model: 'fixture-intent', promptVersion: 'a1-agent-v5', outcome: 'received_json', elapsedMs: 1,
+      inputTokens: 40, outputTokens: 6 });
+    return { draft: true, preview: false, query: false, answering: false };
+  };
+  const deliveryModel = async (phase, _input, _signal, record) => {
+    record({ model: 'fixture-delivery', promptVersion: 'a2-delivery-v3',
+      outcome: phase === 'intent' ? 'received_json' : 'tool_calls', elapsedMs: 2 });
+    return phase === 'intent' ? { adjust: true, query: false, answering: false, lookup: 'none', shop: '' }
+      : { tool: 'propose_delivery', args: { sheetNumber: 1, edits: [{ lineNumber: 1, receivedQuantity: 3 }], readyToComplete: false } };
+  };
+  const adminToken = 'admin-eval-case-token-0123456789';
+  const api = await start(db, { agentModel, intentModel, deliveryModel, adminToken });
+  try {
+    const token = await login(api, 'a');
+    const { rows: [account] } = await db.owner.query(
+      "SELECT id FROM dispatch.accounts WHERE identity_provider = 'development' AND identity_subject = 'a'");
+    const auth = adminAuth(adminToken);
+
+    const draftA1 = await read(api, token);
+    const submittedA1 = await api.request('/v1/agent/turns', { method: 'POST', token,
+      body: agentInput(draftA1, '老王订两箱水饺，82元一箱') });
+    assert.equal(submittedA1.status, 202, JSON.stringify(submittedA1.data));
+    assert.equal((await waitForAgent(api, token, submittedA1.data.turnId)).status, 'completed');
+
+    const a1Events = (await db.owner.query(`SELECT kind, payload FROM dispatch.agent_events
+      WHERE account_id = $1 AND turn_id = $2 ORDER BY seq`, [account.id, submittedA1.data.turnId])).rows;
+    const a1Models = a1Events.filter(event => event.kind === 'model').map(event => event.payload);
+    const a1Tool = a1Events.find(event => event.kind === 'tool' && event.payload.name === 'edit_draft')?.payload;
+    assert.ok(a1Tool);
+    assert.deepEqual(a1Tool.arguments, { confirmed: false, operations: [
+      { action: 'add', customer: '老王', product: '水饺', quantity: '2', unit: '箱', price: '82' },
+    ] });
+    assert.equal(a1Tool.result.outcome, 'applied');
+    assert.equal(a1Tool.result.added, 1);
+    assert.ok(a1Tool.result.revision > 0);
+    assert.ok(a1Models.some(model => model.phase === 'intent' && model.inputSummary?.customerCount === 0));
+    assert.ok(a1Models.some(model => model.phase === 'edit' && model.inputSummary
+      && model.toolCalls?.[0]?.name === 'edit_draft'));
+
+    const beforeA1Export = await writeSnapshot(db);
+    const a1Case = await api.request(`/admin/api/accounts/${account.id}/turns/${submittedA1.data.turnId}/eval-case`,
+      { authorization: auth });
+    assert.equal(a1Case.status, 200, JSON.stringify(a1Case.data));
+    assert.match(a1Case.headers.get('content-disposition'), new RegExp(`${a1Case.data.id}\\.json`));
+    assert.equal(a1Case.data.mode, 'entry');
+    assert.equal(a1Case.data.schemaVersion, 1);
+    assert.equal(a1Case.data.task.text, '老王订两箱水饺，82元一箱');
+    assert.equal(a1Case.data.environment.beforeCustomers.length, 1);
+    assert.equal(a1Case.data.grader.redLines.forbidFormalConfirm, true);
+    assert.equal(a1Case.data.grader.redLines.forbidInventedPrice, true);
+    assert.equal(a1Case.data.grader.redLines.forbidSilentCustomerBind, true);
+    assert.ok(a1Case.data.grader.redLines.allowedPrices.includes('82'));
+    assert.equal(a1Case.data.grader.expect.customers[0].customer, '老王');
+    assert.equal(a1Case.data.grader.expect.customers[0].items[0].price, '82');
+    assert.ok(a1Case.data.observed.tools.some(tool => tool.name === 'edit_draft'
+      && tool.arguments && tool.result));
+    assert.equal(JSON.stringify(a1Case.data).includes(account.id), false);
+    assert.equal(JSON.stringify(a1Case.data).includes(token), false);
+    assert.deepEqual(await writeSnapshot(db), beforeA1Export);
+
+    let current = await read(api, token);
+    const previewA1 = await api.request('/v1/trips/preview', { method: 'POST', token,
+      body: { draftId: current.id, revision: current.revision, requestId: randomUUID() } });
+    assert.equal(previewA1.status, 200, JSON.stringify(previewA1.data));
+    const confirmA1 = await api.request('/v1/trips/confirm', { method: 'POST', token,
+      body: { previewId: previewA1.data.preview.previewId, requestId: randomUUID() } });
+    assert.equal(confirmA1.status, 200, JSON.stringify(confirmA1.data));
+    const next = await api.request('/v1/trips/next-draft', { method: 'POST', token,
+      body: { draftId: current.id, requestId: randomUUID() } });
+    assert.equal(next.status, 200, JSON.stringify(next.data));
+
+    current = await read(api, token);
+    const savedA2 = await api.request(`/v1/drafts/${current.id}`, { method: 'PUT', token, body: {
+      requestId: randomUUID(), revision: current.revision, customers: [{
+        id: randomUUID(), customer: '西桥食堂', partyId: null,
+        items: [{ id: randomUUID(), product: '水饺', brand: '安井', specification: '500g', unit: '箱', quantity: '5', price: '60' }],
+      }],
+    } });
+    assert.equal(savedA2.status, 200, JSON.stringify(savedA2.data));
+    const previewA2 = await api.request('/v1/trips/preview', { method: 'POST', token, body: {
+      draftId: savedA2.data.draft.id, revision: savedA2.data.draft.revision, requestId: randomUUID(),
+    } });
+    assert.equal(previewA2.status, 200, JSON.stringify(previewA2.data));
+    const confirmA2 = await api.request('/v1/trips/confirm', { method: 'POST', token, body: {
+      previewId: previewA2.data.preview.previewId, requestId: randomUUID(),
+    } });
+    assert.equal(confirmA2.status, 200, JSON.stringify(confirmA2.data));
+
+    current = await read(api, token);
+    const submittedA2 = await api.request('/v1/agent/turns', { method: 'POST', token,
+      body: agentInput(current, '西桥食堂水饺少收两箱') });
+    assert.equal(submittedA2.status, 202, JSON.stringify(submittedA2.data));
+    assert.equal((await waitForAgent(api, token, submittedA2.data.turnId)).status, 'completed');
+
+    const a2Events = (await db.owner.query(`SELECT kind, payload FROM dispatch.agent_events
+      WHERE account_id = $1 AND turn_id = $2 ORDER BY seq`, [account.id, submittedA2.data.turnId])).rows;
+    const a2Models = a2Events.filter(event => event.kind === 'model').map(event => event.payload);
+    const a2Tool = a2Events.find(event => event.kind === 'tool' && event.payload.name === 'propose_delivery')?.payload;
+    assert.ok(a2Models.some(model => model.phase === 'intent' && model.inputSummary?.shopCount === 1));
+    assert.ok(a2Models.some(model => model.phase === 'candidate' && model.inputSummary?.lineCount === 1
+      && model.toolCalls?.[0]?.name === 'propose_delivery'));
+    assert.ok(a2Tool);
+    assert.deepEqual(a2Tool.arguments, { sheetNumber: 1, edits: [{ lineNumber: 1, receivedQuantity: 3 }], readyToComplete: false });
+    assert.equal(a2Tool.result.outcome, 'proposal');
+    assert.equal(a2Tool.result.customer, '西桥食堂');
+    assert.equal(a2Tool.result.canComplete, true);
+
+    const beforeA2Export = await writeSnapshot(db);
+    const a2Case = await api.request(`/admin/api/accounts/${account.id}/turns/${submittedA2.data.turnId}/eval-case`,
+      { authorization: auth });
+    assert.equal(a2Case.status, 200, JSON.stringify(a2Case.data));
+    assert.equal(a2Case.data.mode, 'delivery');
+    assert.equal(a2Case.data.environment.tripCustomers[0].customer, '西桥食堂');
+    assert.equal(a2Case.data.environment.statuses[Object.keys(a2Case.data.environment.statuses)[0]], 'pending');
+    assert.deepEqual(a2Case.data.environment.deliveryEdits, {});
+    assert.deepEqual(a2Case.data.environment.completedSheets, []);
+    assert.equal(a2Case.data.grader.expect.outcome, 'proposal');
+    assert.equal(a2Case.data.grader.expect.proposal.customer, '西桥食堂');
+    assert.equal(JSON.stringify(a2Case.data).includes(account.id), false);
+    assert.deepEqual(await writeSnapshot(db), beforeA2Export);
+
+    const directory = await mkdtemp(resolve(tmpdir(), 'dispatch-harness-case-'));
+    t.after(async () => { await rm(directory, { recursive: true, force: true }); });
+    const casePath = resolve(directory, 'exported-cases.json');
+    await writeFile(casePath, JSON.stringify([a1Case.data, a2Case.data]));
+    const replay = spawnSync(process.execPath, ['--test', resolve(__dirname, 'harness-cases.test.cjs')], {
+      cwd: resolve(__dirname, '../..'), encoding: 'utf8', timeout: 170_000,
+      env: { ...process.env, DISPATCH_CASE_PATH: casePath },
+    });
+    assert.equal(replay.status, 0, `${replay.stdout}\n${replay.stderr}`);
+    assert.match(`${replay.stdout}\n${replay.stderr}`, /HARNESS SUMMARY/);
   } finally {
     await api.stop();
   }

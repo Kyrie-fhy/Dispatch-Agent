@@ -1,0 +1,179 @@
+[
+  {
+    "schemaVersion": 1,
+    "id": "case-sample-a1-alias",
+    "mode": "entry",
+    "exportedAt": "2026-11-22T09:00:00.000Z",
+    "task": {
+      "text": "北街要三箱水饺，按八十块一箱。",
+      "hasImages": false
+    },
+    "environment": {
+      "beforeCustomers": [
+        {
+          "id": "draft-customer-1",
+          "customer": "",
+          "items": [
+            { "id": "draft-item-1", "product": "", "brand": "", "specification": "", "unit": "", "quantity": "", "price": null }
+          ]
+        }
+      ],
+      "parties": [{ "key": "party-1", "name": "北街餐馆" }],
+      "aliases": [{ "partyKey": "party-1", "alias": "北街", "normalizedAlias": "北街" }],
+      "historicalSales": [
+        {
+          "key": "history-1",
+          "partyKey": "party-1",
+          "issuedAt": "2026-11-01T08:00:00.000000Z",
+          "lines": [
+            { "product": "水饺", "brand": "安井", "specification": "500g", "unit": "箱", "quantity": "5", "price": "80.00" }
+          ]
+        }
+      ]
+    },
+    "fixture": {
+      "intent": { "draft": true, "preview": false, "query": false, "answering": false },
+      "turns": [
+        {
+          "tool": "edit_draft",
+          "args": {
+            "operations": [
+              {
+                "action": "add",
+                "customer": "北街",
+                "product": "水饺",
+                "brand": "安井",
+                "specification": "500g",
+                "unit": "箱",
+                "quantity": "3",
+                "price": "80"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "observed": {
+      "status": "completed",
+      "startRevision": 0,
+      "endRevision": 1,
+      "undone": false,
+      "elapsedMs": 12,
+      "assistantText": "草稿已更新。",
+      "models": [],
+      "tools": [],
+      "questions": [],
+      "changeLines": ["新增 1 行", "北街 → 北街餐馆（记住的叫法）"],
+      "customerLinks": [{ "spoken": "北街", "canonicalName": "北街餐馆", "matchedBy": "alias", "merged": false }],
+      "deliveryProposal": null
+    },
+    "grader": {
+      "redLines": {
+        "forbidFormalConfirm": true,
+        "forbidInventedPrice": true,
+        "forbidSilentCustomerBind": true,
+        "allowedPrices": ["80"]
+      },
+      "expect": {
+        "status": "completed",
+        "customers": [
+          {
+            "customer": "北街餐馆",
+            "linkedPartyKey": "party-1",
+            "items": [
+              { "product": "水饺", "brand": "安井", "specification": "500g", "unit": "箱", "quantity": "3", "price": "80" }
+            ]
+          }
+        ],
+        "questionCount": 0
+      }
+    }
+  },
+  {
+    "schemaVersion": 1,
+    "id": "case-sample-a2-short-receipt",
+    "mode": "delivery",
+    "exportedAt": "2026-11-22T09:05:00.000Z",
+    "task": {
+      "text": "西桥食堂水饺少收两箱。",
+      "hasImages": false
+    },
+    "environment": {
+      "tripCustomers": [
+        {
+          "id": "sheet-west",
+          "customer": "西桥食堂",
+          "partyId": "party-1",
+          "items": [
+            {
+              "id": "line-west",
+              "product": "水饺",
+              "brand": "安井",
+              "specification": "500g",
+              "unit": "箱",
+              "quantity": "5",
+              "price": "60"
+            }
+          ]
+        }
+      ],
+      "statuses": { "line-west": "pending" },
+      "deliveryEdits": {},
+      "completedSheets": [],
+      "parties": [{ "key": "party-1", "name": "西桥食堂" }]
+    },
+    "fixture": {
+      "intent": { "adjust": true, "query": false, "answering": false, "lookup": "none", "shop": "" },
+      "candidate": {
+        "tool": "propose_delivery",
+        "args": { "sheetNumber": 1, "edits": [{ "lineNumber": 1, "receivedQuantity": 3 }], "readyToComplete": false }
+      }
+    },
+    "observed": {
+      "status": "completed",
+      "startRevision": 0,
+      "endRevision": 0,
+      "undone": false,
+      "elapsedMs": 10,
+      "assistantText": "",
+      "models": [],
+      "tools": [],
+      "questions": [],
+      "changeLines": [],
+      "customerLinks": [],
+      "deliveryProposal": {
+        "tripId": "trip-sample",
+        "sheetId": "sheet-west",
+        "customer": "西桥食堂",
+        "version": 1,
+        "statusRevision": 0,
+        "edits": [
+          {
+            "lineId": "line-west",
+            "name": "安井 / 水饺 / 500g / 箱",
+            "originalQuantity": "5",
+            "beforeQuantity": 5,
+            "beforePrice": "60.00",
+            "receivedQuantity": 3,
+            "price": "60.00"
+          }
+        ],
+        "totalCents": 18000,
+        "pendingPriceNames": [],
+        "canComplete": true
+      }
+    },
+    "grader": {
+      "redLines": { "forbidFormalConfirm": true, "forbidInventedPrice": true, "forbidSilentCustomerBind": true },
+      "expect": {
+        "status": "completed",
+        "outcome": "proposal",
+        "proposal": {
+          "customer": "西桥食堂",
+          "edits": [{ "receivedQuantity": 3, "price": "60.00" }],
+          "canComplete": true
+        }
+      }
+    }
+  }
+]

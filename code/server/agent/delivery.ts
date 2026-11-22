@@ -5,8 +5,9 @@ import { hasSpokenNumber, spokenNumbers } from '../../miniprogram/core/spoken-nu
 import { latest } from '../../miniprogram/core/trips';
 import { HttpError } from '../http-error';
 import type { TripStore } from '../trips';
-import type { DeliveryModel } from './delivery-model';
+import { deliveryPromptVersion, type DeliveryModel } from './delivery-model';
 import type { PreviousQuestions } from './edit';
+import type { AgentModelTrace } from './model';
 import type { AgentStore, Input, TurnKey } from './store';
 
 type Trip = Awaited<ReturnType<TripStore['trip']>>;
@@ -30,6 +31,36 @@ function sheetsFor({ trip, sheets, deliveryEdits }: Trip) {
 
 function question(text: string, options: string[] = [], customer = ''): Candidate {
   return { question: { customer, text, options } };
+}
+
+function traceInputSummary(phase: 'intent' | 'candidate', body: object) {
+  const fields = body as Record<string, unknown>;
+  if (phase === 'intent') {
+    return { shopCount: Array.isArray(fields.shops) ? fields.shops.length : 0,
+      questionCount: Array.isArray(fields.previous) ? fields.previous.length : 0 };
+  }
+  const sheets = Array.isArray(fields.sheets) ? fields.sheets : [];
+  return {
+    shopCount: sheets.length,
+    lineCount: sheets.reduce((sum: number, sheet) => sum + (isObject(sheet) && Array.isArray(sheet.lines) ? sheet.lines.length : 0), 0),
+    spokenNumbers: Array.isArray(fields.numbers) ? fields.numbers : [],
+    hasPreviousQuestions: isObject(fields.previous) && Array.isArray(fields.previous.questions) && fields.previous.questions.length > 0,
+  };
+}
+
+function traceArguments(output: unknown) {
+  if (!isObject(output) || !('args' in output)) return {};
+  const text = JSON.stringify(output.args);
+  return text.length <= 2_000 ? output.args : { truncated: true, json: text.slice(0, 2_000) };
+}
+
+function traceResult(candidate: Candidate) {
+  if (candidate.proposal) {
+    return { outcome: 'proposal', customer: candidate.proposal.customer, editCount: candidate.proposal.edits.length,
+      canComplete: candidate.proposal.canComplete, pendingPriceNames: candidate.proposal.pendingPriceNames };
+  }
+  if (candidate.question) return { outcome: 'question', question: candidate.question.text };
+  return { outcome: 'blocked_or_noop', text: candidate.text ?? '' };
 }
 
 function quantityFrom(source: string, line: DeliveryLine, quantity: number) {
@@ -172,11 +203,20 @@ export async function runDelivery(store: AgentStore, trips: TripStore, model: De
     await checkSession();
     signal.throwIfAborted();
     if (!model) throw new HttpError(503, 'delivery_model_unavailable', '现场对话模型暂未开启，可以去送货单操作。');
-    const traces: object[] = [];
+    const traces: AgentModelTrace[] = [];
+    let output: unknown;
     try {
-      return await model(phase, body, signal, trace => traces.push({ ...trace, phase }));
+      output = await model(phase, body, signal, trace => traces.push(trace));
+      return output;
     } finally {
-      for (const trace of traces) await store.append(key, 'model', trace);
+      for (const trace of traces) {
+        const entry: Record<string, unknown> = { ...trace, phase, inputSummary: traceInputSummary(phase, body) };
+        if (phase === 'candidate' && !(Array.isArray(entry.toolCalls) && entry.toolCalls.length)
+            && isObject(output) && typeof output.tool === 'string' && isObject(output.args)) {
+          entry.toolCalls = [{ name: output.tool, arguments: JSON.stringify(output.args).slice(0, 2_000) }];
+        }
+        await store.append(key, 'model', entry);
+      }
     }
   };
   try {
@@ -215,8 +255,24 @@ export async function runDelivery(store: AgentStore, trips: TripStore, model: De
           unit: line.unit, originalQuantity: line.originalQuantity, currentReceived: line.receivedQuantity, price: line.price ?? '待补价' })) }));
       await step('delivery-read', 'done');
       await step('delivery-check', 'running');
-      const result = resolve(trip, sheets, await call('candidate', { text, numbers: spokenNumbers(source), sheets: summaries,
-        previous: earlier ? { text: earlier.text, questions: earlier.payload.questions } : null }), source);
+      const output = await call('candidate', { text, numbers: spokenNumbers(source), sheets: summaries,
+        previous: earlier ? { text: earlier.text, questions: earlier.payload.questions } : null });
+      const candidateName = isObject(output) && typeof output.tool === 'string' ? output.tool : 'unknown';
+      let result: Candidate;
+      try {
+        result = resolve(trip, sheets, output, source);
+      } catch (error) {
+        try {
+          await store.append(key, 'tool', { name: candidateName, promptVersion: deliveryPromptVersion,
+            arguments: traceArguments(output),
+            result: { outcome: 'error', errorCode: error instanceof HttpError ? error.code : 'delivery_failed' } });
+        } catch {
+          // 诊断记录失败不能覆盖真正的业务异常。
+        }
+        throw error;
+      }
+      await store.append(key, 'tool', { name: candidateName, promptVersion: deliveryPromptVersion,
+        arguments: traceArguments(output), result: traceResult(result) });
       await checkSession();
       signal.throwIfAborted();
       await store.context(key, input.revision);

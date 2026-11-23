@@ -25,6 +25,18 @@ export function amountLabel(cents: number, pendingPrices: number, label: string)
   return pendingPrices ? `已算金额 ¥${money(cents)} · 含 ${pendingPrices} 项待补价` : `${label} ¥${money(cents)}`;
 }
 
+export function priceSourceLabel(source: ItemInput['priceSource']): string {
+  if (source === 'customer_history') return '熟客价';
+  if (source === 'catalog') return '库内价';
+  return '';
+}
+
+export function catalogHintText(priceHint: string | null | undefined, discontinued: boolean): string {
+  const text = (priceHint ?? '').trim();
+  if (!text) return '';
+  return discontinued && text === '已下架，请核实库存' ? '' : text;
+}
+
 export function editLines(items: ItemInput[], id: string, field: string, value: string): ItemInput[] {
   if (!fields.some(entry => entry.key === field)) return items;
   return items.map(item => item.id === id ? { ...item, [field]: value } : item);
@@ -33,9 +45,12 @@ export function editLines(items: ItemInput[], id: string, field: string, value: 
 export const deliveryLabel: Record<DeliveryStatus, string> = { pending: '未配送', delivered: '已送达', unrecorded: '未记录' };
 
 export function lineView(line: OrderLine) {
+  const discontinued = line.catalogStatus === 'discontinued';
   return { ...line, productLabel: productLabel(line), priceLabel: line.price === null ? '待补价' : `¥${line.price}`,
     amount: line.amountCents === null ? '待补价' : money(line.amountCents),
-    amountLabel: line.amountCents === null ? '待补价' : `¥${money(line.amountCents)}` };
+    amountLabel: line.amountCents === null ? '待补价' : `¥${money(line.amountCents)}`,
+    priceSourceLabel: priceSourceLabel(line.priceSource), discontinued,
+    priceHint: line.priceHint ?? '', catalogHint: catalogHintText(line.priceHint, discontinued) };
 }
 
 function customerView(customer: CustomerOrder) {

@@ -5,6 +5,8 @@ import { revokeSession, wechatCode, Workspace, WorkspaceError, workspaceRequest 
 import { errorMessage } from '../order-view';
 
 type AliasView = { alias: string; canonicalName: string };
+type CatalogSummary = { productCount: number; variantCount: number; activeVariantCount: number;
+  discontinuedVariantCount: number; missingUnitVariantCount: number };
 
 function draftCounts(draft: TripDraft) {
   let customers = 0;
@@ -34,6 +36,8 @@ Page({
     aliases: [] as AliasView[],
     aliasesLoaded: false,
     aliasError: '',
+    catalogSummary: null as CatalogSummary | null,
+    catalogError: '',
   },
   generation: 0,
   retiredToken: '',
@@ -51,7 +55,7 @@ Page({
     this.generation += 1;
     this.setData({ signedIn: false, busy: false, error, revokeFailed: !!this.retiredToken,
       loaded: false, tripMode: '', tripDetail: '', partyCount: 0, canEditForm: false,
-      aliases: [], aliasesLoaded: false, aliasError: '' });
+      aliases: [], aliasesLoaded: false, aliasError: '', catalogSummary: null, catalogError: '' });
   },
 
   async run(action: () => Promise<void>) {
@@ -91,15 +95,19 @@ Page({
       partyCount: result.parties.length,
       canEditForm: !result.draftConfirmed,
     });
-    try {
-      const { aliases } = await workspaceRequest<{ aliases: AliasView[] }>('GET', '/customer-aliases', token);
-      if (generation !== this.generation || token !== agentSession.token) return;
-      this.setData({ aliases: aliases.map(({ alias, canonicalName }) => ({ alias, canonicalName })),
-        aliasesLoaded: true, aliasError: '' });
-    } catch {
-      if (generation !== this.generation || token !== agentSession.token) return;
-      this.setData({ aliasError: '叫法列表没加载出来，重进本页可重试。' });
-    }
+    const [aliasResult, catalogResult] = await Promise.all([
+      workspaceRequest<{ aliases: AliasView[] }>('GET', '/customer-aliases', token).then(
+        ({ aliases }) => ({ aliases, error: '' }),
+        () => ({ aliases: null, error: '叫法列表没加载出来，重进本页可重试。' })),
+      workspaceRequest<CatalogSummary>('GET', '/catalog/summary', token).then(
+        summary => ({ summary, error: '' }),
+        () => ({ summary: null, error: '货品库信息没加载出来' })),
+    ]);
+    if (generation !== this.generation || token !== agentSession.token) return;
+    if (aliasResult.aliases) this.setData({ aliases: aliasResult.aliases.map(({ alias, canonicalName }) =>
+      ({ alias, canonicalName })), aliasesLoaded: true, aliasError: '' });
+    else this.setData({ aliasError: aliasResult.error });
+    this.setData({ catalogSummary: catalogResult.summary, catalogError: catalogResult.error });
   },
 
   login(): Promise<void> | undefined {
@@ -126,7 +134,7 @@ Page({
     this.generation += 1;
     this.setData({ signedIn: false, busy: false, error: '', revokeFailed: !!this.retiredToken,
       loaded: false, tripMode: '', tripDetail: '', partyCount: 0, canEditForm: false,
-      aliases: [], aliasesLoaded: false, aliasError: '' });
+      aliases: [], aliasesLoaded: false, aliasError: '', catalogSummary: null, catalogError: '' });
     return this.run(async () => {
       const generation = this.generation;
       try { await revokeSession(this.retiredToken); }

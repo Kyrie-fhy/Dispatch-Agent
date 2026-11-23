@@ -90,6 +90,22 @@ page {
 .price-options { display: flex; flex-wrap: wrap; gap: 12rpx; }
 .price-option { flex: 0 0 auto; min-width: 160rpx; padding: 10rpx 20rpx; }
 .preview-hint { display: block; padding-bottom: 8rpx; }
+.price-wrap { display: flex; flex: none; flex-wrap: wrap; align-items: baseline; justify-content: flex-end; gap: 8rpx; }
+.price-tag, .warn-tag {
+  display: inline-flex;
+  align-items: center;
+  box-sizing: border-box;
+  padding: 2rpx 10rpx;
+  border-radius: var(--radius-sm);
+  font-size: 24rpx;
+  line-height: 1.4;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.price-tag-history { background: var(--success-weak); color: var(--success); }
+.price-tag-catalog { background: var(--canvas-sub); color: var(--ink-2); }
+.warn-tag { background: var(--warning-weak); color: var(--warning); }
+.catalog-hint { display: block; padding: 4rpx 0 6rpx; }
 
 .card-actions { display: flex; flex-wrap: wrap; gap: 16rpx; margin-top: 20rpx; }
 .card-btn-primary, .card-btn-secondary, .card-btn-ghost, .option-btn {
@@ -141,6 +157,8 @@ page {
   font-weight: 500;
 }
 .option-btn:active { background: var(--surface-sunken); }
+.option-btn-warn { background: var(--warning-weak); border-color: var(--warning); color: var(--warning); }
+.option-btn-warn:active { background: var(--warning-weak); }
 .card-btn-primary[disabled], .card-btn-secondary[disabled], .card-btn-ghost[disabled], .option-btn[disabled] {
   color: var(--ink-disabled);
   background: var(--canvas-sub);

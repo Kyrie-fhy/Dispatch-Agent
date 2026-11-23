@@ -67,6 +67,8 @@ function setup(t, initialDraft) {
         confirmed, customers: [], mentions: [], prices: [] });
       if (path === '/customer-aliases') return entry.ok({ aliases: [] });
       if (path === '/customer-aliases/unbind') return entry.ok({ removed: null });
+      if (path === '/catalog/summary') return entry.ok({ productCount: 0, variantCount: 0, activeVariantCount: 0,
+        discontinuedVariantCount: 0, missingUnitVariantCount: 0 });
       assert.fail(`Unhandled request ${entry.method} ${path}`);
     },
     navigateTo: ({ url }) => navigation.push(url),
@@ -1271,4 +1273,267 @@ test('A3-2 never adopts prices while loading, polling or reloading the conversat
   assert.equal(adopts, 0);
   await page.reload();
   assert.equal(adopts, 0);
+});
+
+test('6.5-2 tags draft and preview lines with price source, a discontinued flag and catalog hints', async t => {
+  const draft = order();
+  const customer = draft.customers[0];
+  const base = customer.items[0];
+  Object.assign(base, { price: '82', priceSource: 'customer_history', catalogStatus: 'active', priceHint: null });
+  customer.items.push({ ...base, id: 'line-catalog', product: '鸭血', quantity: '2', unit: '盒', price: '6',
+    priceSource: 'catalog', catalogStatus: 'discontinued',
+    priceHint: '已下架，请核实库存。 库内仅记 ¥6.00（未标箱价）' });
+  customer.items.push({ ...base, id: 'line-exact', product: '汤圆', quantity: '1', unit: '箱', price: '30',
+    priceSource: 'catalog', catalogStatus: 'discontinued', priceHint: '已下架，请核实库存' });
+  customer.items.push({ ...base, id: 'line-spoken', product: '馄饨', quantity: '3', unit: '袋', price: '15',
+    priceSource: 'spoken', catalogStatus: 'active', priceHint: null });
+  const { page, event, setTurns } = setup(t, draft);
+  const preview = { ...previewTrip(draft, true), previewId: 'pre-1', draftId: draft.id, revision: draft.revision, choices: [null] };
+  setTurns([{ id: 'preview-turn', text: '生成送货单', materialIds: [], status: 'completed', revision: draft.revision,
+    events: [event('preview', { preview }),
+      event('end', { status: 'completed', text: '请确认', revision: draft.revision })] }]);
+  await page.onShow();
+  await page.login();
+
+  const lines = page.data.draftSummary.customers[0].lines;
+  assert.equal(lines[0].priceSourceLabel, '熟客价');
+  assert.equal(lines[0].discontinued, false);
+  assert.equal(lines[0].catalogHint, '');
+  assert.equal(lines[1].priceSourceLabel, '库内价');
+  assert.equal(lines[1].priceSource, 'catalog');
+  assert.equal(lines[1].discontinued, true);
+  assert.equal(lines[1].catalogHint, '已下架，请核实库存。 库内仅记 ¥6.00（未标箱价）');
+  assert.equal(lines[2].discontinued, true);
+  assert.equal(lines[2].catalogHint, '', '黄牌已表达的下架文案不重复刷出');
+  assert.equal(lines[3].priceSourceLabel, '');
+  assert.equal(lines[3].discontinued, false);
+
+  const items = page.data.turns[0].preview.customers[0].items;
+  assert.equal(items[0].priceSourceLabel, '熟客价');
+  assert.equal(items[1].priceSourceLabel, '库内价');
+  assert.equal(items[1].discontinued, true);
+  assert.equal(items[1].catalogHint, '已下架，请核实库存。 库内仅记 ¥6.00（未标箱价）');
+  assert.equal(items[2].catalogHint, '');
+  assert.equal(items[3].priceSourceLabel, '');
+
+  const wxml = fs.readFileSync(require.resolve('../code/dist/pages/agent/index.wxml'), 'utf8');
+  for (const token of ['price-tag-history', 'price-tag-catalog', 'warn-tag', '已下架·核实库存', 'catalog-hint']) {
+    assert.ok(wxml.includes(token), `缺少价格来源结构 ${token}`);
+  }
+  const deliveryWxml = fs.readFileSync(require.resolve('../code/dist/pages/trip-delivery/index.wxml'), 'utf8');
+  assert.equal(deliveryWxml.includes('price-tag'), false, '正式送货单不展示草稿价格来源标签');
+});
+
+function catalogDraft() {
+  const draft = order();
+  Object.assign(draft.customers[0].items[0], { product: '鸭血', brand: '', specification: '', unit: '盒',
+    quantity: '2', price: null, priceSource: null, catalogStatus: 'ambiguous', priceHint: null });
+  return draft;
+}
+
+function catalogChoices() {
+  return [{ draftCustomerId: '', lineId: '', status: 'ambiguous', priceHint: null, candidates: [
+    { productId: 'p-duck', variantId: 'v-300', product: '鸭血', brand: '甲牌', specification: '300g', unit: '盒',
+      priceCents: 700, status: 'active' },
+    { productId: 'p-duck', variantId: 'v-500', product: '鸭血', brand: '乙牌', specification: '500g', unit: null,
+      priceCents: 900, status: 'discontinued' },
+  ] }];
+}
+
+test('6.5-2 catalog cards choose a variant or keep external with idempotent posts and conflict reloads', async t => {
+  const draft = catalogDraft();
+  const customer = draft.customers[0];
+  const line = customer.items[0];
+  const { page, requests, event, handle, setTurns } = setup(t, draft);
+  const choices = () => catalogChoices().map(choice => ({ ...choice, draftCustomerId: customer.id, lineId: line.id }));
+  const posts = [];
+  const toasts = [];
+  let conversations = 0;
+  let mode = 'success';
+  global.wx.showToast = spec => toasts.push(spec);
+  setTurns([{ id: 'turn-catalog', text: '老王两盒鸭血', materialIds: [], revision: draft.revision, status: 'completed',
+    events: [event('change', { lines: ['老王 鸭血 +2 盒'] }),
+      event('end', { status: 'completed', text: '草稿已更新。', revision: draft.revision })] }]);
+  handle(request => {
+    if (request.path === '/agent/conversation') { conversations++; return false; }
+    if (request.path === '/agent/memory') {
+      request.ok({ draftId: draft.id, revision: draft.revision, confirmed: false, customers: [], mentions: [], prices: [],
+        catalogChoices: choices() });
+      return true;
+    }
+    if (request.path === '/agent/catalog-choice') {
+      posts.push(request.data);
+      if (mode === 'conflict') {
+        request.ok({ error: 'catalog_choice_changed', message: '候选规格已更新，请刷新后重新选择' }, 409);
+        return true;
+      }
+      if (request.data.choice === 'variant') {
+        request.ok({ revision: draft.revision + 1, item: { ...line, price: '7.00', priceSource: 'catalog' },
+          priceUpdates: [{ draftCustomerId: customer.id, lineId: line.id, product: '鸭血', beforePrice: null,
+            beforeSource: null, price: '7.00', priceSource: 'catalog', text: '鸭血：待补价 → 库内价 ¥7.00' }] });
+      } else {
+        request.ok({ revision: draft.revision + 1, item: { ...line, catalogStatus: 'external', priceHint: null },
+          priceUpdates: [] });
+      }
+      return true;
+    }
+    return false;
+  });
+  await page.onShow();
+  await page.login();
+
+  assert.equal(page.data.catalogChoices.length, 1);
+  const choice = page.data.catalogChoices[0];
+  assert.equal(choice.customerName, '老王');
+  assert.equal(choice.lineLabel, '鸭血 2 盒');
+  assert.equal(choice.hint, '库内有多款货品或规格，请选定后核对单价');
+  assert.deepEqual(choice.candidates.map(candidate => candidate.label), [
+    '甲牌 鸭血 300g · 盒 ¥7.00',
+    '乙牌 鸭血 500g · 库内 ¥9.00（未标单位） · 已下架',
+  ]);
+  assert.deepEqual(choice.candidates.map(candidate => candidate.warn), [false, true]);
+  const cardWxml = fs.readFileSync(require.resolve('../code/dist/pages/agent/index.wxml'), 'utf8');
+  assert.ok(cardWxml.includes('按库外新货保留'));
+  assert.ok(cardWxml.includes('catalog-choices'));
+
+  await page.chooseCatalogVariant(tap({ line: line.id, variant: 'v-300' }));
+  const variantPost = posts.at(-1);
+  assert.equal(variantPost.choice, 'variant');
+  assert.equal(variantPost.variantId, 'v-300');
+  assert.equal(variantPost.draftCustomerId, customer.id);
+  assert.equal(variantPost.lineId, line.id);
+  assert.equal(variantPost.draftId, draft.id);
+  assert.equal(variantPost.revision, draft.revision);
+  assert.ok(variantPost.requestId, '货品选款复用幂等 requestId');
+  assert.match(page.data.notice, /已选定规格/);
+  assert.match(page.data.notice, /鸭血：待补价 → 库内价 ¥7\.00/);
+  assert.equal(toasts.length, 0, '有价格更新说明时不再重复弹成功提示');
+  assert.equal(page.data.error, '');
+
+  await page.keepExternalCatalog(tap({ line: line.id }));
+  const externalPost = posts.at(-1);
+  assert.equal(externalPost.choice, 'external');
+  assert.equal(externalPost.variantId, undefined);
+  assert.ok(externalPost.requestId);
+  assert.deepEqual(toasts, [{ title: '已选定规格', icon: 'success' }]);
+
+  mode = 'conflict';
+  page.setData({ notice: '', error: '' });
+  const before = conversations;
+  const toastsBefore = toasts.length;
+  await page.chooseCatalogVariant(tap({ line: line.id, variant: 'v-500' }));
+  assert.match(page.data.error, /候选规格已更新/);
+  assert.ok(conversations > before, '冲突后自动刷新对话');
+  assert.equal(toasts.length, toastsBefore, '失败时不得提示已选定');
+  assert.equal(page.data.notice, '');
+  assert.ok(requests.some(request => request.path === '/agent/catalog-choice'));
+});
+
+test('6.5-2 reports customer-price upgrades after choosing a shop without losing the name conflict note', async t => {
+  const draft = order();
+  Object.assign(draft.customers[0], { customer: '阿强' });
+  delete draft.customers[0].partyId;
+  const draftCustomerId = draft.customers[0].id;
+  const lineId = draft.customers[0].items[0].id;
+  const { page, event, handle, setTurns } = setup(t, draft);
+  const toasts = [];
+  let mode = 'remembered';
+  global.wx.showToast = spec => toasts.push(spec);
+  setTurns([{ id: 'turn-choice', text: '阿强两箱水饺', materialIds: [], revision: draft.revision, status: 'completed',
+    events: [event('change', { lines: ['阿强：待选店'] }),
+      event('end', { status: 'completed', text: '草稿已更新。', revision: draft.revision })] }]);
+  handle(request => {
+    if (request.path === '/agent/memory') {
+      request.ok({ draftId: draft.id, revision: draft.revision, confirmed: false,
+        customers: [{ id: 'p-qiang', name: '强记面馆' }], prices: [],
+        mentions: [{ draftCustomerId, resolution: { status: 'resolved', customerId: 'p-qiang', canonicalName: '强记面馆' } }] });
+      return true;
+    }
+    if (request.path === '/agent/customer-choice') {
+      const priceUpdates = [{ draftCustomerId, lineId, product: '水饺', beforePrice: '82', beforeSource: 'catalog',
+        price: '80', priceSource: 'customer_history', text: '水饺：库内价 ¥82.00 → 熟客价 ¥80.00' }];
+      if (mode === 'remembered') request.ok({ revision: draft.revision + 1, remembered: true, priceUpdates });
+      else request.ok({ revision: draft.revision + 1, remembered: false, rememberIssue: 'name_conflict', priceUpdates });
+      return true;
+    }
+    return false;
+  });
+  await page.onShow();
+  await page.login();
+  assert.equal(page.data.choices.length, 1);
+
+  await page.chooseCustomer(tap({ customer: draftCustomerId, party: 'p-qiang' }));
+  assert.match(page.data.notice, /按熟客价更新：水饺：库内价 ¥82\.00 → 熟客价 ¥80\.00/);
+  assert.equal(page.data.error, '');
+  assert.deepEqual(toasts, [{ title: '已记住叫法', icon: 'success' }]);
+
+  page.setData({ notice: '' });
+  mode = 'conflict';
+  await page.chooseCustomer(tap({ customer: draftCustomerId, party: 'p-qiang' }));
+  assert.match(page.data.notice, /没有记住这个叫法/);
+  assert.match(page.data.notice, /按熟客价更新/);
+  assert.equal(page.data.error, '');
+});
+
+test('6.5-2 profile shows the read-only catalog summary and degrades quietly when it fails', async t => {
+  const draft = order();
+  const { pageFor, handle } = setup(t, draft);
+  const profile = pageFor('profile');
+  let mode = 'loaded';
+  handle(request => {
+    if (request.path === '/workspace') {
+      request.ok({ draft, parties: [{ id: 'party-1', name: '王记餐饮' }], draftConfirmed: false, currentTrip: null });
+      return true;
+    }
+    if (request.path === '/catalog/summary') {
+      if (mode === 'failed') request.fail();
+      else if (mode === 'empty') request.ok({ productCount: 0, variantCount: 0, activeVariantCount: 0,
+        discontinuedVariantCount: 0, missingUnitVariantCount: 0 });
+      else request.ok({ productCount: 12, variantCount: 20, activeVariantCount: 18,
+        discontinuedVariantCount: 2, missingUnitVariantCount: 1 });
+      return true;
+    }
+    return false;
+  });
+  await profile.onShow();
+  await profile.login();
+  assert.deepEqual(profile.data.catalogSummary, { productCount: 12, variantCount: 20, activeVariantCount: 18,
+    discontinuedVariantCount: 2, missingUnitVariantCount: 1 });
+  assert.equal(profile.data.catalogError, '');
+
+  mode = 'failed';
+  await profile.reload();
+  assert.equal(profile.data.catalogSummary, null);
+  assert.equal(profile.data.catalogError, '货品库信息没加载出来');
+  assert.equal(profile.data.loaded, true);
+  assert.equal(profile.data.tripMode, '晚间录单中');
+  assert.equal(profile.data.partyCount, 1);
+  assert.equal(profile.data.error, '', '货品库失败不阻断整页');
+
+  mode = 'empty';
+  await profile.reload();
+  assert.equal(profile.data.catalogSummary.productCount, 0);
+  assert.equal(profile.data.catalogError, '');
+  assert.equal(profile.data.partyCount, 1);
+
+  const profileWxml = fs.readFileSync(require.resolve('../code/dist/pages/profile/index.wxml'), 'utf8');
+  for (const token of ['货品库', '{{catalogSummary.productCount}} 种', '尚未导入', '正在同步']) {
+    assert.ok(profileWxml.includes(token), `缺少货品库概览结构 ${token}`);
+  }
+  const profileSource = fs.readFileSync(require.resolve('../code/dist/pages/profile/index.js'), 'utf8');
+  assert.ok(profileSource.includes('货品库信息没加载出来'));
+});
+
+test('6.5-2 catalog controls keep the native design baseline on both pages', () => {
+  const agentWxml = fs.readFileSync(require.resolve('../code/dist/pages/agent/index.wxml'), 'utf8');
+  const profileWxml = fs.readFileSync(require.resolve('../code/dist/pages/profile/index.wxml'), 'utf8');
+  const emoji = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{26FF}\u{FE0F}]/u;
+  for (const [name, wxml] of [['agent', agentWxml], ['profile', profileWxml]]) {
+    assert.equal(wxml.includes('size="mini"'), false, `${name} 不得使用 mini 按钮`);
+    assert.equal(emoji.test(wxml), false, `${name} 不得出现 Emoji`);
+  }
+  for (const token of ['按库外新货保留', '已下架·核实库存', 'price-tag-history', 'price-tag-catalog']) {
+    assert.ok(agentWxml.includes(token), `缺少 ${token}`);
+  }
+  assert.ok(profileWxml.includes('货品库'));
 });

@@ -1,6 +1,7 @@
 import type { AgentEvent, AgentStatus, AgentTurn, DeliveryCardState, DeliveryProgress, DeliveryProposal, DirectIntent, PlanStep, StepState } from '../../core/agent';
 import type { CustomerMention, DraftPriceSuggestion } from '../../core/memory';
 import { money } from '../../core/orders';
+import type { ItemInput } from '../../core/orders';
 import { materialImagePattern, Material, MaterialSource } from '../../core/materials';
 import { textOrderLimit, textOrderQuestions } from '../../core/text-order';
 import type { TripDraft } from '../../core/trips';
@@ -10,18 +11,29 @@ import { chooseMaterial, forgetStaged, materialInfo, sameMaterial, stagedMateria
   transferMaterial } from '../../services/materials';
 import { readVoiceFile, startVoiceRecording, transcribeVoice, VoiceFileError } from '../../services/voice';
 import { revokeSession, wechatCode, WorkspaceError, workspaceRequest } from '../../services/workspace';
-import { errorMessage, productLabel, tripView } from '../order-view';
+import { errorMessage, catalogHintText, priceSourceLabel, productLabel, tripView } from '../order-view';
 
 type Conversation = { draft: TripDraft; draftConfirmed: boolean; confirmedPreviewId?: string | null; turns: AgentTurn[]; delivery?: DeliveryProgress | null };
 type PollResult = { status: AgentStatus; events: AgentEvent[] };
 type Attachment = { id: string; name: string };
 type VoiceFile = { draft: TripDraft; path: string };
 type AgentMemory = { draftId: string; revision: number; confirmed: boolean; customers: { id: string; name: string }[];
-  mentions: { draftCustomerId: string; resolution: CustomerMention }[]; prices: DraftPriceSuggestion[] };
+  mentions: { draftCustomerId: string; resolution: CustomerMention }[]; prices: DraftPriceSuggestion[];
+  catalogChoices?: CatalogChoice[] };
 type ChoiceView = { draftCustomerId: string; spoken: string; remember: boolean;
   candidates: { id: string; name: string }[]; hint: string };
+type CatalogCandidate = { productId: string; variantId: string; product: string; brand: string; specification: string;
+  unit: string | null; priceCents: number; status: 'active' | 'discontinued' };
+type CatalogChoice = { draftCustomerId: string; lineId: string; status: 'ambiguous'; priceHint: string | null;
+  candidates: CatalogCandidate[] };
+type CatalogCandidateView = { variantId: string; label: string; warn: boolean };
+type CatalogChoiceView = { draftCustomerId: string; lineId: string; customerName: string; lineLabel: string; hint: string;
+  candidates: CatalogCandidateView[] };
+type PriceUpdate = { draftCustomerId: string; lineId: string; product: string; beforePrice: string | null;
+  beforeSource: string | null; price: string | null; priceSource: string | null; text: string };
+type CatalogChoiceResult = { revision: number; item: ItemInput; priceUpdates: PriceUpdate[] };
 type CustomerMerge = 'append' | 'keep_existing';
-type ChoiceResult = { revision: number; remembered: boolean | null; rememberIssue?: string };
+type ChoiceResult = { revision: number; remembered: boolean | null; rememberIssue?: string; priceUpdates?: PriceUpdate[] };
 type ChoicePayload = { draftCustomerId: string; choice: 'existing'; customerId: string; remember: boolean; merge?: CustomerMerge }
   | { draftCustomerId: string; choice: 'new' }
   | { draftCustomerId: string; choice: 'unlink'; spoken: string };
@@ -34,6 +46,8 @@ const choiceConflicts = ['draft_changed', 'draft_confirmed', 'draft_not_found', 
   'customer_not_linked', 'draft_customer_not_found'];
 const priceConflicts = ['draft_changed', 'draft_confirmed', 'draft_not_found', 'agent_busy',
   'price_suggestion_changed', 'price_not_suggested'];
+const catalogConflicts = ['draft_changed', 'draft_confirmed', 'draft_not_found', 'agent_busy',
+  'catalog_choice_changed', 'draft_line_not_found'];
 const imageLimit = 4;
 
 // 只用于展示判断，规则与 core/memory 的 normalizeMemoryText 保持一致。
@@ -47,6 +61,14 @@ function shortDate(issuedAt: string): string {
   const date = new Date(issuedAt);
   if (Number.isNaN(date.getTime())) return '';
   return `${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+function catalogCandidateView(candidate: CatalogCandidate): CatalogCandidateView {
+  const name = [candidate.brand, candidate.product, candidate.specification].filter(Boolean).join(' ');
+  const price = money(candidate.priceCents);
+  const priced = candidate.unit ? `· ${candidate.unit} ¥${price}` : `· 库内 ¥${price}（未标单位）`;
+  return { variantId: candidate.variantId, warn: candidate.status === 'discontinued',
+    label: `${name} ${priced}${candidate.status === 'discontinued' ? ' · 已下架' : ''}` };
 }
 
 function priceHintView(suggestion: DraftPriceSuggestion): PriceHint | null {
@@ -176,7 +198,10 @@ function draftSummary(draft: TripDraft, pending: number) {
     id: customer.id, name: customer.customer || '未命名客户',
     lines: customer.items.filter(line => line.product || line.quantity || line.price || line.brand || line.specification)
       .map(line => ({ id: line.id, product: productLabel(line) || '未命名货品', quantity: line.quantity, unit: line.unit,
-        price: line.price ? '¥' + line.price : '待补价', pending: !line.price })),
+        price: line.price ? '¥' + line.price : '待补价', pending: !line.price,
+        priceSource: line.priceSource ?? '', priceSourceLabel: priceSourceLabel(line.priceSource),
+        discontinued: line.catalogStatus === 'discontinued', priceHint: line.priceHint ?? '',
+        catalogHint: catalogHintText(line.priceHint, line.catalogStatus === 'discontinued') })),
   })).filter(customer => customer.lines.length);
   const lines = customers.reduce((sum, customer) => sum + customer.lines.length, 0);
   const issues = pending || (lines ? textOrderQuestions(draft).reduce((sum, customer) => sum + customer.issues.length, 0) : 0);
@@ -198,6 +223,7 @@ Page({
     deliverySummary: null as ReturnType<typeof deliverySummaryView> | null, navTitle: '录单助手', focusInput: false, imageLimit,
     choices: [] as ChoiceView[], memoryNames: [] as string[], rememberOff: {} as Record<string, boolean>,
     memoryFailed: false, notice: '', priceHints: {} as Record<string, PriceHint>, adoptableCount: 0,
+    catalogChoices: [] as CatalogChoiceView[],
   },
   draft: null as TripDraft | null,
   turns: [] as AgentTurn[],
@@ -256,7 +282,8 @@ Page({
       error: '', text: '', turns: [], attachments: [], readyImages: [], uploadRows: [], pendingMaterial: '',
       scrollTo: '', draftSummary: null, deliverySummary: null, navTitle: '录单助手', focusInput: false, draftExpanded: false,
       issuedCard: false, voiceRetry: false, inputMode: 'text', revokeFailed: !!this.retiredToken,
-      choices: [], memoryNames: [], rememberOff: {}, memoryFailed: false, notice: '', priceHints: {}, adoptableCount: 0 });
+      choices: [], memoryNames: [], rememberOff: {}, memoryFailed: false, notice: '', priceHints: {}, adoptableCount: 0,
+      catalogChoices: [] });
     applyNavTitle('录单助手');
   },
 
@@ -368,6 +395,17 @@ Page({
             : resolution.status === 'candidate_only' ? '像下面这几家' : '熟客里没有这个叫法' });
     }
     const memoryNames = memory ? memory.customers.map(customer => customer.name) : [];
+    const catalogChoices: CatalogChoiceView[] = [];
+    if (memory && this.draft) for (const choice of memory.catalogChoices ?? []) {
+      const customer = this.draft.customers.find(entry => entry.id === choice.draftCustomerId);
+      const line = customer?.items.find(entry => entry.id === choice.lineId);
+      if (!customer || !line) continue;
+      catalogChoices.push({ draftCustomerId: choice.draftCustomerId, lineId: choice.lineId,
+        customerName: customer.customer || '未命名客户',
+        lineLabel: [line.product || '未命名货品', line.quantity, line.unit].filter(Boolean).join(' '),
+        hint: choice.priceHint || '库内有多款货品或规格，请选定后核对单价',
+        candidates: choice.candidates.map(catalogCandidateView) });
+    }
     const priceHints: Record<string, PriceHint> = {};
     let adoptableCount = 0;
     if (memory) for (const suggestion of memory.prices) {
@@ -387,7 +425,8 @@ Page({
         ? `送货助手（${this.delivery.shops.filter(shop => shop.locked).length}/${this.delivery.shops.length} 已送达）`
         : '送货助手');
     this.setData({ turns, scrollTo: '', issuedCard: turns.some(turn => turn.issued),
-      deliverySummary, draftSummary: draftInfo, navTitle, choices, memoryNames, priceHints, adoptableCount });
+      deliverySummary, draftSummary: draftInfo, navTitle, choices, memoryNames, priceHints, adoptableCount,
+      catalogChoices });
     this.setData({ scrollTo: 'latest' });
     applyNavTitle(navTitle);
   },
@@ -620,11 +659,47 @@ Page({
         await this.reload();
         if (result.remembered === true) {
           if (typeof wx.showToast === 'function') wx.showToast({ title: '已记住叫法', icon: 'success' });
-        } else if (result.remembered === false && result.rememberIssue === 'name_conflict') {
-          this.setData({ notice: `已选好店。${spoken ? `「${spoken}」` : '这个叫法'}和另一家的正式店名一样，没有记住这个叫法。` });
         }
+        const notices: string[] = [];
+        if (result.remembered === false && result.rememberIssue === 'name_conflict') {
+          notices.push(`已选好店。${spoken ? `「${spoken}」` : '这个叫法'}和另一家的正式店名一样，没有记住这个叫法。`);
+        }
+        const updates = (result.priceUpdates ?? []).map(update => update.text).filter(Boolean);
+        if (updates.length) notices.push(`按熟客价更新：${updates.join('；')}`);
+        if (notices.length) this.setData({ notice: notices.join(' ') });
       } catch (error) {
         await this.reloadAfterConflict(error, choiceConflicts);
+        throw error;
+      }
+    });
+  },
+
+  chooseCatalogVariant(event: WechatMiniprogram.TouchEvent): Promise<void> | undefined {
+    const lineId = String(event.currentTarget.dataset.line ?? '');
+    const variantId = String(event.currentTarget.dataset.variant ?? '');
+    if (!variantId) return;
+    return this.catalogChoice(lineId, { choice: 'variant', variantId });
+  },
+
+  keepExternalCatalog(event: WechatMiniprogram.TouchEvent): Promise<void> | undefined {
+    return this.catalogChoice(String(event.currentTarget.dataset.line ?? ''), { choice: 'external' });
+  },
+
+  catalogChoice(lineId: string, selection: { choice: 'variant'; variantId: string } | { choice: 'external' }):
+  Promise<void> | undefined {
+    const draft = this.draft;
+    const choice = this.data.catalogChoices.find(item => item.lineId === lineId);
+    if (!draft || !choice || this.data.busy || this.data.polling) return;
+    return this.run(async () => {
+      try {
+        const result = await this.request<CatalogChoiceResult>('/agent/catalog-choice',
+          { draftId: draft.id, revision: draft.revision, draftCustomerId: choice.draftCustomerId, lineId, ...selection });
+        await this.reload();
+        const updates = (result.priceUpdates ?? []).map(update => update.text).filter(Boolean);
+        if (updates.length) this.setData({ notice: `已选定规格：${updates.join('；')}` });
+        else if (typeof wx.showToast === 'function') wx.showToast({ title: '已选定规格', icon: 'success' });
+      } catch (error) {
+        await this.reloadAfterConflict(error, catalogConflicts);
         throw error;
       }
     });

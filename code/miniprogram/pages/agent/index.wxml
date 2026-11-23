@@ -21,6 +21,22 @@
   </view>
 </template>
 
+<template name="catalog-choices">
+  <view wx:if="{{catalogChoices.length}}" class="choice-list">
+    <view wx:for="{{catalogChoices}}" wx:for-item="choice" wx:key="lineId" class="choice-item">
+      <text class="card-title">{{choice.customerName}} · 「{{choice.lineLabel}}」是哪款？</text>
+      <text class="muted">{{choice.hint}}</text>
+      <view class="actions">
+        <button wx:for="{{choice.candidates}}" wx:for-item="candidate" wx:key="variantId"
+          class="option-btn {{candidate.warn ? 'option-btn-warn' : ''}}" disabled="{{busy || polling}}"
+          data-line="{{choice.lineId}}" data-variant="{{candidate.variantId}}" bindtap="chooseCatalogVariant">{{candidate.label}}</button>
+      </view>
+      <button class="card-btn-ghost choice-new" disabled="{{busy || polling}}" data-line="{{choice.lineId}}"
+        bindtap="keepExternalCatalog">按库外新货保留</button>
+    </view>
+  </view>
+</template>
+
 <view class="agent">
   <view wx:if="{{!signedIn}}" class="card guest-card">
     <text class="title">录单助手</text>
@@ -52,8 +68,13 @@
                   <view wx:for="{{customer.lines}}" wx:for-item="line" wx:key="id" class="draft-line">
                     <view class="preview-line">
                       <text class="num">{{line.product}} {{line.quantity}} {{line.unit}}</text>
-                      <text class="num {{line.pending ? 'pending-price' : ''}}">{{line.price}}</text>
+                      <view class="price-wrap">
+                        <text wx:if="{{line.priceSourceLabel}}" class="price-tag {{line.priceSource === 'customer_history' ? 'price-tag-history' : 'price-tag-catalog'}}">{{line.priceSourceLabel}}</text>
+                        <text wx:if="{{line.discontinued}}" class="warn-tag">已下架·核实库存</text>
+                        <text class="num {{line.pending ? 'pending-price' : ''}}">{{line.price}}</text>
+                      </view>
                     </view>
+                    <text wx:if="{{line.catalogHint}}" class="muted catalog-hint num">{{line.catalogHint}}</text>
                     <view wx:if="{{priceHints[line.id]}}" class="price-hint">
                       <text class="muted">{{priceHints[line.id].text}}</text>
                       <view class="price-options">
@@ -68,6 +89,7 @@
               </scroll-view>
             </view>
             <template is="customer-choices" data="{{choices: choices, memoryNames: memoryNames, busy: busy, polling: polling}}" />
+            <template is="catalog-choices" data="{{catalogChoices: catalogChoices, busy: busy, polling: polling}}" />
             <view wx:if="{{memoryFailed && !choices.length}}" class="detail">
               <text class="muted">选店信息没加载出来</text>
               <button class="card-btn-ghost" disabled="{{busy}}" bindtap="reloadMemory">重新加载</button>
@@ -145,6 +167,9 @@
               <view wx:if="{{turn.showChoices && choices.length && !polling}}">
                 <template is="customer-choices" data="{{choices: choices, memoryNames: memoryNames, busy: busy, polling: polling}}" />
               </view>
+              <view wx:if="{{turn.showChoices && catalogChoices.length && !polling}}">
+                <template is="catalog-choices" data="{{catalogChoices: catalogChoices, busy: busy, polling: polling}}" />
+              </view>
               <view wx:if="{{turn.showChoices && memoryFailed && !choices.length}}" class="detail">
                 <text class="muted">选店信息没加载出来</text>
                 <button class="card-btn-ghost" disabled="{{busy}}" bindtap="reloadMemory">重新加载</button>
@@ -157,8 +182,13 @@
                   <view wx:for="{{customer.items}}" wx:for-item="line" wx:key="id" class="preview-block">
                     <view class="preview-line">
                       <text class="num">{{line.productLabel}} · {{line.quantity}} {{line.unit}}</text>
-                      <text class="num {{line.amountLabel === '待补价' ? 'pending-price' : ''}}">{{line.amountLabel}}</text>
+                      <view class="price-wrap">
+                        <text wx:if="{{line.priceSourceLabel}}" class="price-tag {{line.priceSource === 'customer_history' ? 'price-tag-history' : 'price-tag-catalog'}}">{{line.priceSourceLabel}}</text>
+                        <text wx:if="{{line.discontinued}}" class="warn-tag">已下架·核实库存</text>
+                        <text class="num {{line.amountLabel === '待补价' ? 'pending-price' : ''}}">{{line.amountLabel}}</text>
+                      </view>
                     </view>
+                    <text wx:if="{{line.catalogHint}}" class="muted catalog-hint num">{{line.catalogHint}}</text>
                     <text wx:if="{{line.amountLabel === '待补价' && priceHints[line.id]}}" class="muted preview-hint">{{priceHints[line.id].text}}</text>
                   </view>
                 </view>
@@ -199,8 +229,13 @@
                     <view wx:for="{{customer.lines}}" wx:for-item="line" wx:key="id" class="draft-line">
                       <view class="preview-line">
                         <text class="num">{{line.product}} {{line.quantity}} {{line.unit}}</text>
-                        <text class="num {{line.pending ? 'pending-price' : ''}}">{{line.price}}</text>
+                        <view class="price-wrap">
+                          <text wx:if="{{line.priceSourceLabel}}" class="price-tag {{line.priceSource === 'customer_history' ? 'price-tag-history' : 'price-tag-catalog'}}">{{line.priceSourceLabel}}</text>
+                          <text wx:if="{{line.discontinued}}" class="warn-tag">已下架·核实库存</text>
+                          <text class="num {{line.pending ? 'pending-price' : ''}}">{{line.price}}</text>
+                        </view>
                       </view>
+                      <text wx:if="{{line.catalogHint}}" class="muted catalog-hint num">{{line.catalogHint}}</text>
                       <view wx:if="{{priceHints[line.id]}}" class="price-hint">
                         <text class="muted">{{priceHints[line.id].text}}</text>
                         <view class="price-options">

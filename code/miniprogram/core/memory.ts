@@ -236,8 +236,9 @@ export function lookupDeliveredPrice(sales: readonly HistoricalSale[], customerI
   const matches = sales.filter(sale => sale.customerId === customerId && sale.deliveryCompleted === true
     && (sale.receivedQuantity === undefined || (Number.isSafeInteger(sale.receivedQuantity) && sale.receivedQuantity > 0))
     && Number.isSafeInteger(sale.unitPriceCents) && sale.unitPriceCents > 0 && key(sale.unit) === unit
+    && key(sale.spec) === key(product.spec)
     && (sale.catalogVariantId ? sale.catalogVariantId === product.catalogVariantId
-      : key(sale.productName) === key(product.productName) && key(sale.brand) === key(product.brand) && key(sale.spec) === key(product.spec)))
+      : key(sale.productName) === key(product.productName) && key(sale.brand) === key(product.brand)))
     .sort(laterSaleFirst);
   const latest = matches[0];
   if (!latest) return { status: 'no_match' };

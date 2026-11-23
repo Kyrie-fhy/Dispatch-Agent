@@ -220,6 +220,7 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
       customer !== old.customer && customer.customer.trim() && targetSource.includes(normalized(customer.customer)));
     const explicit = changeVerb.test(response + selected);
     const fields = safeFields(op, invalidTool);
+    const unitChanged = fields.unit !== undefined && fields.unit !== row.item.unit;
     if (checkRepeat && fields.quantity && (!fields.unit || normalized(fields.unit) === normalized(old.item.unit))) {
       const quantity = repeatedQuantity(response, normalized(old.item.unit));
       if (quantity !== undefined &&
@@ -229,7 +230,7 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
     }
     for (const field of textFields) {
       const value = fields[field];
-      if (typeof value !== 'string' || value === row.item[field]) continue;
+      if (typeof value !== 'string' || (value === row.item[field] && !(field === 'price' && unitChanged))) continue;
       const increment = field === 'quantity'
         ? statedQuantity(selected || response, normalized(row.item.unit), incrementVerb) ||
           (selected && priorText && incrementVerb.test(selected)
@@ -247,12 +248,12 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
       row.item[field] = value;
       if (field === 'price' && catalogEnabled) row.item.priceSource = 'spoken';
     }
-    if (itemIdentityChanged(row.item, old.item)) {
-      clearCatalogIdentity(row.item);
-      if (row.item.priceSource === 'catalog' || row.item.priceSource === 'customer_history') {
-        row.item.price = null;
-        row.item.priceSource = null;
-      }
+    const identityChanged = itemIdentityChanged(row.item, old.item);
+    if (identityChanged) clearCatalogIdentity(row.item);
+    if (!fields.price && (unitChanged || (identityChanged
+      && (row.item.priceSource === 'catalog' || row.item.priceSource === 'customer_history')))) {
+      row.item.price = null;
+      row.item.priceSource = null;
     }
   }
 

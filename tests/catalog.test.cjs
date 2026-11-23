@@ -1,7 +1,8 @@
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const {
-  catalogCsvColumns, extractCatalogAliases, hasQuotedLinePrice, matchCatalogChoice, matchCatalogItem, parseCatalogCsv, resolveCatalogAutoPrice,
+  catalogCsvColumns, extractCatalogAliases, hasQuotedLinePrice, matchCatalogChoice, matchCatalogItem, parseCatalogCsv,
+  quotedLinePrices, resolveCatalogAutoPrice,
 } = require('../code/dist/core/catalog');
 const { lookupDeliveredPrice, lookupHistoricalPrice, collectHistoricalSales } = require('../code/dist/core/memory');
 const { isDraft, preview } = require('../code/dist/core/orders');
@@ -212,6 +213,20 @@ test('catalog history uses completed delivery, actual receipt, strict variant/un
   assert.deepEqual(collectHistoricalSales([historical]).map(row => [row.catalogVariantId, row.receivedQuantity]), [[variant.variantId, 2]]);
 });
 
+test('reuse of a catalog variant ID after a packaging change does not reuse the delivered price', () => {
+  const [oldVariant] = variants([record({ packaging: '500g' })]);
+  const updated = variants([record({ packaging: '1kg', price: '9.25' })]);
+  assert.equal(oldVariant.variantId, updated[0].variantId);
+  const sales = [{
+    customerId: 'one', tripId: 'trip', sheetId: 'sheet', issuedAt: '2026-01-01T00:00:00Z', linePosition: 0,
+    catalogVariantId: oldVariant.variantId, productName: oldVariant.product, brand: oldVariant.brand,
+    spec: '500克', unit: oldVariant.unit, receivedQuantity: 2, unitPriceCents: 501, deliveryCompleted: true,
+  }];
+  assert.equal(priceFor(line(), [oldVariant], 'one', sales).priceSource, 'customer_history');
+  const current = priceFor(line(), updated, 'one', sales);
+  assert.deepEqual([current.price, current.priceSource], ['9.25', 'catalog']);
+});
+
 test('quoted price evidence belongs to the specified item, customer and unit', () => {
   const carrot = { products: ['香菇丸'], customers: ['甲店'], unit: '箱' };
   const duplicate = { ...carrot, customers: ['乙店'] };
@@ -225,6 +240,22 @@ test('quoted price evidence belongs to the specified item, customer and unit', (
   assert.equal(hasQuotedLinePrice(source, 9000, duplicate, candidates), true);
   assert.equal(hasQuotedLinePrice('甲店香菇丸要82箱', 8200, carrot), false);
   assert.equal(hasQuotedLinePrice('甲店香菇丸80元/盒', 8000, carrot), false);
+});
+
+test('totals are ignored and both price units must agree with the ordered unit', () => {
+  const boxes = { products: ['临时肠'], customers: ['甲店'], unit: '箱' };
+  for (const label of ['一共', '总共是', '合计为', '总计收', '共计算', '总价付', '总金额', '共收', '共要', '总共算', '一共算', '共卖']) {
+    assert.deepEqual(quotedLinePrices(`甲店临时肠两箱，${label}￥80元`, boxes), [], label);
+  }
+  assert.deepEqual(quotedLinePrices('甲店临时肠两箱，单价40元，一共八十元', boxes), [4000]);
+  const rollBoxes = { products: ['香酥卷'], unit: '箱' };
+  const rollBags = { ...rollBoxes, unit: '袋' };
+  const candidates = [rollBoxes, rollBags];
+  assert.deepEqual(quotedLinePrices('香酥卷两箱，每袋10元', rollBoxes, candidates), []);
+  assert.deepEqual(quotedLinePrices('香酥卷两箱，每袋单价10元', rollBoxes, candidates), []);
+  assert.deepEqual(quotedLinePrices('香酥卷每 袋 10元/袋', rollBags, candidates), [1000]);
+  for (const row of candidates) assert.deepEqual(quotedLinePrices('香酥卷每袋10元/箱', row, candidates), []);
+  assert.deepEqual(quotedLinePrices('临时肠两箱，每袋10元，香酥卷两袋', rollBags, [boxes, rollBags]), []);
 });
 
 test('the complete brand-qualified mention owns a quote ahead of a product-name suffix', () => {

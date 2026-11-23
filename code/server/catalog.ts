@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import {
-  catalogKey, matchCatalogChoice, matchCatalogItem, parseCatalogCsv, quotedLinePrices, resolveCatalogAutoPrice,
+  catalogKey, matchCatalogChoice, matchCatalogItem, normalizeCatalogSpec, parseCatalogCsv, quotedLinePrices, resolveCatalogAutoPrice,
   type CatalogMatch, type CatalogVariant,
 } from '../miniprogram/core/catalog';
 import { money, nullablePrice, yuanToCents, type ItemInput } from '../miniprogram/core/orders';
@@ -78,6 +78,22 @@ export function suggestCatalogChoices(draft: TripDraft, catalog: readonly Catalo
   }));
 }
 
+function groundedCatalogDetails(item: ItemInput, previous: ItemInput | undefined, source: string,
+  catalog: readonly CatalogVariant[]): ItemInput {
+  const brand = catalogKey(item.brand);
+  const specification = catalogKey(normalizeCatalogSpec(item.specification));
+  const brandMentioned = (name: string) => Boolean(name && source.includes(name));
+  const hasBrand = !brand || item.brand === previous?.brand || brandMentioned(brand) || catalog.some(variant => {
+    const names = [variant.brand, ...(variant.brandAliases ?? [])].map(catalogKey);
+    return names.includes(brand) && names.some(brandMentioned);
+  });
+  // A package such as 500g must not match the tail of 1500g or 1.500g.
+  const escapedSpec = specification.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const hasSpec = !specification || item.specification === previous?.specification ||
+    new RegExp((/^\d/.test(specification) ? '(?<![\\d.])' : '') + escapedSpec).test(source);
+  return { ...item, brand: hasBrand ? item.brand : '', specification: hasSpec ? item.specification : '' };
+}
+
 export async function applyCatalogToDraft(client: PoolClient, accountId: string, draft: TripDraft, before: TripDraft,
   catalog?: readonly CatalogVariant[], sourceText?: string) {
   const lines: string[] = [];
@@ -88,7 +104,7 @@ export async function applyCatalogToDraft(client: PoolClient, accountId: string,
   const previously = new Map(before.customers.flatMap(customer =>
     customer.items.map(item => [item.id, { item, partyId: customer.partyId, customer: customer.customer }] as const)));
   const changed = draft.customers.flatMap(customer => customer.items.flatMap((item, index) => {
-    if (!item.product.trim()) return [];
+    if (!item.product.trim() && (sourceText !== undefined || nullablePrice(item.price) === null)) return [];
     const prior = previously.get(item.id);
     if (prior?.partyId === customer.partyId && prior?.item && JSON.stringify(prior.item) === JSON.stringify(item)) return [];
     return [{ customer, item, index }];
@@ -99,35 +115,43 @@ export async function applyCatalogToDraft(client: PoolClient, accountId: string,
   const sales = await readHistoricalSales(client, accountId, [...new Set(changed.flatMap(({ customer }) =>
     customer.partyId ? [customer.partyId] : []))]);
   const directory = sourceText ? await readDirectory(client, accountId) : undefined;
-  const targets = draft.customers.flatMap(customer => customer.items.filter(item => item.product.trim()).map(item => {
+  const normalizedSource = sourceText === undefined ? undefined : catalogKey(normalizeCatalogSpec(sourceText));
+  const changedItems = new Set(changed.map(row => row.item));
+  const targets = draft.customers.flatMap(customer => customer.items.filter(item => item.product.trim() || changedItems.has(item)).map(item => {
     const previous = previously.get(item.id);
     const aliases = directory?.aliases.filter(alias => alias.customerId === customer.partyId) ?? [];
-    const match = matchCatalogItem(item, variants);
+    const input = normalizedSource !== undefined && changedItems.has(item)
+      ? groundedCatalogDetails(item, previous?.item, normalizedSource, variants) : item;
+    const match = matchCatalogItem(input, variants);
     const matchedVariants = 'variant' in match ? [match.variant] : match.candidates;
-    return { item, match, quote: {
-      products: [item.product, previous?.item.product ?? '', ...matchedVariants.flatMap(variant => variant.aliases)],
+    return { item, input, match, quote: {
+      products: [input.product, previous?.item.product ?? '', ...matchedVariants.flatMap(variant => variant.aliases)],
       customers: [customer.customer, previous?.customer ?? '', ...aliases.map(alias => alias.alias)],
-      specifications: [item.specification, item.brand,
-        ...('variant' in match && match.variant.flavorOrGrade ? [match.variant.flavorOrGrade] : [])], unit: item.unit,
+      specifications: [input.specification, input.brand,
+        ...('variant' in match && match.variant.flavorOrGrade ? [match.variant.flavorOrGrade] : [])], unit: input.unit,
       requireProductMention: !previous?.item.product.trim(),
     } };
   }));
   const quotes = targets.map(row => row.quote);
   const byItem = new Map(targets.map(row => [row.item, row]));
   for (const { customer, item, index } of changed) {
-    const { match, quote } = byItem.get(item)!;
+    const { input, match, quote } = byItem.get(item)!;
     const previous = previously.get(item.id)?.item;
-    const incomingPrice = nullablePrice(item.price);
-    const freshPrice = incomingPrice !== null && nullablePrice(previous?.price ?? null) !== incomingPrice
-      && (item.priceSource == null || item.priceSource === 'spoken');
+    const incomingPrice = nullablePrice(input.price);
+    const freshPrice = incomingPrice !== null && (input.priceSource == null || input.priceSource === 'spoken')
+      && (nullablePrice(previous?.price ?? null) !== incomingPrice || previous?.unit !== input.unit
+        || (input.priceSource === 'spoken' && previous?.priceSource !== 'spoken'));
     const quoted = sourceText ? quotedLinePrices(sourceText, quote, quotes) : [];
-    let candidate = item;
-    if (freshPrice && (sourceText === undefined || quoted.includes(yuanToCents(incomingPrice)))) {
-      candidate = { ...item, priceSource: 'spoken' };
+    const imagePrice = sourceText === undefined && freshPrice;
+    let candidate = input;
+    if (imagePrice) {
+      candidate = { ...input, price: null, priceSource: null };
+    } else if (freshPrice && quoted.includes(yuanToCents(incomingPrice))) {
+      candidate = { ...input, priceSource: 'spoken' };
     } else if (freshPrice) {
-      const protectPrevious = previous && !itemIdentityChanged(item, previous)
+      const protectPrevious = previous && !itemIdentityChanged(input, previous)
         && (previous.priceSource == null || previous.priceSource === 'manual' || previous.priceSource === 'spoken');
-      candidate = { ...item, price: protectPrevious ? previous.price : null,
+      candidate = { ...input, price: protectPrevious ? previous.price : null,
         priceSource: protectPrevious ? previous.priceSource : null };
     }
     if ((candidate.priceSource === 'catalog' || candidate.priceSource === 'customer_history' || !candidate.price)
@@ -135,6 +159,9 @@ export async function applyCatalogToDraft(client: PoolClient, accountId: string,
       candidate = { ...candidate, price: money(quoted[0]), priceSource: 'spoken' };
     }
     const next = resolveCatalogAutoPrice(candidate, match, customer.partyId, sales);
+    if (imagePrice && next.price === null && yuanToCents(incomingPrice) > 0) {
+      next.priceHint = [next.priceHint, `图片疑似标价 ¥${incomingPrice}（未自动填入，请核对）`].filter(Boolean).join(' · ');
+    }
     if (quoted.length > 1 && (next.priceSource === 'catalog' || next.priceSource === 'customer_history')) {
       next.price = null;
       next.priceSource = null;
@@ -149,7 +176,7 @@ export async function applyCatalogToDraft(client: PoolClient, accountId: string,
     if (next.priceHint) lines.push(`${next.product}：${next.priceHint}`);
     changes.push({ draftCustomerId: customer.id, lineId: item.id, product: next.product,
       status: next.catalogStatus, priceSource: next.priceSource, price: next.price, priceHint: next.priceHint ?? null,
-      input: { product: item.product, brand: item.brand, specification: item.specification, unit: item.unit } });
+      input: { product: input.product, brand: input.brand, specification: input.specification, unit: input.unit } });
   }
   return { lines, changes };
 }

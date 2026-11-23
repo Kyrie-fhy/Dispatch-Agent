@@ -583,7 +583,7 @@ function gradeCase(caseFile, mode, partyIds, before, after, storedEvents, finalD
           && quotedLinePrices(sourceText, quote, quotes).length === 0
           && (typeof quotedText !== 'string' || quotedLinePrices(quotedText, quote, quotes).length === 0);
       } else if (authorized && !unchanged && !originalPrice) {
-        const fromImage = caseFile.task?.hasImages && (caseFile.grader?.redLines?.linePriceEvidence || []).some(proof =>
+        const fromImage = !catalog.length && caseFile.task?.hasImages && (caseFile.grader?.redLines?.linePriceEvidence || []).some(proof =>
           proof.medium === 'image' && proof.source === 'spoken' && catalogKey(proof.customer) === catalogKey(customer.customer)
           && (proof.partyKey ?? null) === (partyKeys.get(customer.partyId) ?? null)
           && lineIdentity(proof) === lineIdentity(item) && yuanToCents(proof.price) === cents);
@@ -730,6 +730,27 @@ function median(values) {
   const sorted = values.filter(Number.isFinite).sort((left, right) => left - right);
   return sorted.length ? (sorted[Math.floor((sorted.length - 1) / 2)] + sorted[Math.floor(sorted.length / 2)]) / 2 : null;
 }
+
+if (require.main === module) test('Harness red line rejects totals, other-unit quotes and unverified image prices', () => {
+  const catalog = [{ product: '香酥卷', brand: '', unit: '袋', priceCents: 1000 }];
+  const snapshot = { trips: 0, tripRows: [] };
+  for (const [text, product, price] of [
+    ['甲店临时肠两箱，一共80元', '临时肠', '80'],
+    ['甲店香酥卷两箱，每袋10元', '香酥卷', '10'],
+    ['', '临时肠', '49'],
+  ]) {
+    const line = { id: 'line', product, brand: '', specification: '', quantity: '2', unit: '箱', price, priceSource: 'spoken' };
+    const customers = [{ id: 'customer', customer: '甲店', items: [line] }];
+    const caseFile = { task: { text, hasImages: !text }, grader: {
+      expect: { customers }, redLines: { allowedPrices: [price],
+        linePriceEvidence: text ? [] : [{ ...line, customer: '甲店', medium: 'image', source: 'spoken' }] },
+    } };
+    const result = gradeCase(caseFile, 'entry', new Map(), snapshot, snapshot, [], { customers }, catalog);
+    assert.equal(result.success, false);
+    assert.deepEqual(result.redLines, [`forbidInventedPrice: 甲店 / ${product} 出现未授权单价 ${price}`]);
+    if (!text) assert.equal(gradeCase(caseFile, 'entry', new Map(), snapshot, snapshot, [], { customers }).success, true);
+  }
+});
 
 if (require.main === module) test('Harness cases: single-turn replay with two-layer grader', { timeout: 1_800_000 }, async t => {
   const cases = await loadCases();

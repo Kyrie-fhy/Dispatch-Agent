@@ -297,6 +297,11 @@ export function quotedLinePrices(text: string, line: QuotedPriceLine,
   const source = text.normalize('NFKC').toLowerCase();
   const boundary = /[。;；!！?？\r\n]/;
   const measures = '[箱袋盒包板卷件桶瓶个支提盘条只组份斤]|公斤|千克';
+  const priceLabelEnd = '\\s*(?:是|算|定|报价|改成|改为|调到|为)?\\s*[¥￥]?\\s*$';
+  const leadingUnit = new RegExp(`每\\s*(${measures})(?:\\s*(?:单价|价格))?${priceLabelEnd}`);
+  const trailingUnit = new RegExp(`^\\s*(?:元|块)?\\s*(?:[/／每一1])\\s*(${measures})`);
+  const priceLabel = new RegExp(`(?:单价|价格)${priceLabelEnd}`);
+  const totalLabel = /(?:一共|总共|合计|总计|共计|总价|总金额|共收|共要|总共算|一共算|共)\s*(?:是|为|收|算|付|卖)?\s*:?\s*[¥￥]?\s*$/;
   const prices = new Set<number>();
   for (const token of spokenNumbers(source)) {
     if (token.value === null) continue;
@@ -306,10 +311,15 @@ export function quotedLinePrices(text: string, line: QuotedPriceLine,
     const after = source.slice(token.end);
     const quoted = source.slice(token.start, token.end);
     const local = before.split(boundary).pop() ?? '';
-    const priceLabel = /(?:单价|价格|每(?:箱|袋|盒|包|斤|公斤|件|个))\s*(?:是|算|定|报价|改成|改为|调到|为)?\s*$/.test(local);
-    const perUnit = after.match(new RegExp(`^\\s*(?:元|块)?\\s*(?:[/／每一1])\\s*(${measures})`));
-    if (perUnit && line.unit && catalogKey(perUnit[1]) !== catalogKey(line.unit)) continue;
-    const marked = /[元块]/.test(quoted) || /[¥￥]\s*$/.test(local) || priceLabel;
+    if (totalLabel.test(local)) continue;
+    const preUnit = local.match(leadingUnit)?.[1];
+    const perUnit = after.match(trailingUnit)?.[1];
+    const matchesUnit = (row: QuotedPriceLine) => {
+      const unit = catalogKey(row.unit);
+      return (!preUnit || catalogKey(preUnit) === unit) && (!perUnit || catalogKey(perUnit) === unit);
+    };
+    if (!matchesUnit(line)) continue;
+    const marked = /[元块]/.test(quoted) || /[¥￥]\s*$/.test(local) || preUnit || priceLabel.test(local);
     if (!marked && !perUnit) continue;
     if (/(?:不是|不要按|别按)\s*[¥￥]?\s*$/.test(local)) continue;
 
@@ -325,13 +335,12 @@ export function quotedLinePrices(text: string, line: QuotedPriceLine,
         const followingIndex = following.indexOf(term);
         return followingIndex < 0 ? score : Math.max(score, -100000 - followingIndex * 1000 + term.length);
       }, -Infinity);
-    const compatible = candidates.filter(candidate =>
-      !perUnit || !candidate.unit || catalogKey(candidate.unit) === catalogKey(perUnit[1]));
     const productScore = (row: QuotedPriceLine) => nearest(row.products, segment, localAfter);
     const product = productScore(line);
     if (line.requireProductMention && product === -Infinity) continue;
-    if (compatible.some(row => productScore(row) > product)) continue;
-    const possible = compatible.filter(row => productScore(row) === product);
+    // An incompatible unit cannot move a quote onto a different named product.
+    if (candidates.some(row => productScore(row) > product)) continue;
+    const possible = candidates.filter(row => matchesUnit(row) && productScore(row) === product);
     const scores = (row: QuotedPriceLine) => [
       nearest(row.customers ?? [], before, localAfter),
       nearest(row.specifications ?? [], segment, localAfter),

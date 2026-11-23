@@ -5,7 +5,10 @@ const { Pool } = require('pg');
 const { catalogCsvColumns, parseCatalogCsv } = require('../../code/server-dist/miniprogram/core/catalog');
 const { applyCatalogToDraft, CatalogStore, loadCatalog, suggestCatalogChoices } = require('../../code/server-dist/server/catalog');
 const { readAccount } = require('../../code/server-dist/server/account-workspace');
+const { prepareEdits } = require('../../code/server-dist/server/agent/edit');
 const { setAccount, transaction } = require('../../code/server-dist/server/database');
+const { readHistoricalSales } = require('../../code/server-dist/server/memory');
+const { previewTrip } = require('../../code/server-dist/miniprogram/core/trips');
 const {
   gradeCase, runCase, isolatedDatabase, start, login, read, agentInput, waitForAgent, uploadImage, toolReply, saveCustomers,
 } = require('./harness-cases.test.cjs');
@@ -20,6 +23,9 @@ const original = [
   ['P6', '1', '冻品', '喻记馄饨', '喻记', '馄饨', '400g', '单规格', '箱', '64', '在售', '已核实', ''],
 ];
 const csv = rows => [catalogCsvColumns, ...rows].map(row => row.join(',')).join('\n');
+const variants = rows => parseCatalogCsv(csv(rows)).map(row => ({
+  ...row, productId: row.productCode, variantId: row.productCode + '/' + row.variantCode,
+}));
 const item = (product, extra = {}) => ({
   id: randomUUID(), product, brand: '', specification: '', unit: '箱', quantity: '2', price: null, ...extra,
 });
@@ -30,6 +36,7 @@ const post = (api, token, path, body) => api.request(path, { method: 'POST', tok
 const stock = (api, token) => api.request('/v1/catalog/summary', { token });
 const zero = { productCount: 0, variantCount: 0, activeVariantCount: 0, discontinuedVariantCount: 0, missingUnitVariantCount: 0 };
 const orderOutput = operations => ({ operations, question: '' });
+const draftWith = (...items) => ({ id: 'draft', revision: 1, customers: [{ id: 'customer', customer: '甲店', partyId: null, items }] });
 
 async function confirmSale(api, token, customer, items, { completed = false, zeroReceipt = false, partyId = null } = {}) {
   const draft = await read(api, token);
@@ -294,6 +301,88 @@ test('catalog migration, import, pricing and choices through isolated PostgreSQL
   }
 });
 
+test('catalog entry guards preserve pending prices through text, unit edits, images and catalog reimport', { timeout: 60_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const seed = original.map(row => {
+    const copy = [...row];
+    if (copy[0] === 'P3') copy[10] = '在售';
+    if (copy[0] === 'P4') copy[8] = '袋';
+    return copy;
+  });
+  const turns = new Map([
+    ['甲店要两箱鸭血', [add('甲店', '鸭血', { brand: '秋丰' })]],
+    ['甲店临时肠两箱，一共80元', [add('甲店', '临时肠')]],
+    ['香酥卷两箱，每袋10元', [add('甲店', '香酥卷', { price: '10' })]],
+    ['虾丸两箱，每箱40元', [add('甲店', '虾丸', { price: '40' })]],
+    ['虾丸单位改成袋', [{ action: 'update', target: 4, unit: '袋' }]],
+    ['熟客店两箱荠菜猪肉春蔬饺，每箱47元', [add('熟客店', '春蔬饺', { specification: '荠菜猪肉', price: '47' })]],
+    ['熟客店两箱荠菜猪肉春蔬饺', [add('熟客店', '春蔬饺', { specification: '荠菜猪肉' })]],
+  ]);
+  const api = await start(db, {
+    imageModel: async () => orderOutput([add('甲店', '临时肠', { price: '49' })]),
+    intentModel: async () => ({ draft: true, query: false, preview: false, answering: false }),
+    agentModel: async messages => {
+      const { text } = JSON.parse(messages.at(-1).content);
+      assert.ok(turns.has(text), text);
+      return toolReply('edit_draft', { operations: turns.get(text) });
+    },
+  }, Number(process.env.DISPATCH_API_PORT || 0));
+  try {
+    const token = await login(api, 'a');
+    const catalog = new CatalogStore(db.owner);
+    const { accountId } = await catalog.importCsv('dev:a', csv(seed));
+    const say = async text => {
+      await runTurn(api, token, await read(api, token), text);
+      return read(api, token);
+    };
+
+    let draft = await say('甲店要两箱鸭血');
+    const [duck] = state(draft);
+    assert.deepEqual([duck.brand, duck.specification, duck.price, duck.catalogStatus], ['', '', null, 'ambiguous']);
+    const memory = await api.request('/v1/agent/memory?draftId=' + draft.id, { token });
+    assert.equal(memory.status, 200);
+    const choice = memory.data.catalogChoices.find(row => row.lineId === duck.id);
+    assert.deepEqual(choice.candidates.map(row => row.brand), ['秋丰', '南原']);
+    draft = await say('甲店临时肠两箱，一共80元');
+    assert.equal(state(draft)[1].price, null);
+    draft = await say('香酥卷两箱，每袋10元');
+    assert.deepEqual([state(draft)[2].price, state(draft)[2].catalogStatus], [null, 'unit_mismatch']);
+    draft = await say('虾丸两箱，每箱40元');
+    assert.deepEqual([state(draft)[3].price, state(draft)[3].priceSource], ['40', 'spoken']);
+    draft = await say('虾丸单位改成袋');
+    const shrimp = state(draft)[3];
+    assert.deepEqual([shrimp.unit, shrimp.price, shrimp.priceSource, shrimp.catalogStatus], ['袋', null, null, 'unit_mismatch']);
+
+    draft = await saveCustomers(api, token, draft, [{ id: randomUUID(), customer: '', items: [item('', { quantity: '' })] }]);
+    await runTurn(api, token, draft, '', [await uploadImage(api, token, draft)]);
+    draft = await read(api, token);
+    const [recognized] = state(draft);
+    assert.deepEqual([recognized.product, recognized.price, recognized.priceSource], ['临时肠', null, null]);
+    assert.match(recognized.priceHint, /图片疑似标价 ¥49（未自动填入，请核对）/);
+    const preview = await post(api, token, '/v1/trips/preview', { draftId: draft.id, revision: draft.revision, requestId: randomUUID() });
+    assert.equal(preview.status, 200, JSON.stringify(preview.data));
+    assert.equal(preview.data.preview.totalCents, 0);
+
+    draft = await saveCustomers(api, token, draft, [{ id: randomUUID(), customer: '', items: [item('', { quantity: '' })] }]);
+    const [sold] = state(await say('熟客店两箱荠菜猪肉春蔬饺，每箱47元'));
+    assert.deepEqual([sold.specification, sold.price, sold.priceSource], ['500g·荠菜猪肉', '47', 'spoken']);
+    await confirmSale(api, token, '熟客店', [sold], { completed: true });
+    const { rows: [party] } = await db.owner.query(
+      "SELECT id FROM dispatch.parties WHERE account_id = $1 AND name = '熟客店'", [accountId]);
+    const [sale] = await readAccount(db.owner, accountId, client => readHistoricalSales(client, accountId, [party.id]));
+    assert.ok(sold.catalogVariantId);
+    assert.deepEqual([sale.catalogVariantId, sale.spec, sale.unitPriceCents], [sold.catalogVariantId, '500g·荠菜猪肉', 4700]);
+    const revised = seed.map(row => row[0] === 'P5' && row[1] === '1'
+      ? row.map((value, index) => index === 6 ? '1kg' : value) : row);
+    await catalog.importCsv(accountId, csv(revised));
+    const [reordered] = state(await say('熟客店两箱荠菜猪肉春蔬饺'));
+    assert.deepEqual([reordered.catalogVariantId, reordered.specification, reordered.price, reordered.priceSource],
+      [sold.catalogVariantId, '1kg·荠菜猪肉', '55.00', 'catalog']);
+  } finally {
+    await api.stop();
+  }
+});
+
 test('catalog choice aligns missing and cross-unit candidates while retaining the ordered unit', { timeout: 60_000 }, async t => {
   const db = await isolatedDatabase(t);
   const api = await start(db, {}, Number(process.env.DISPATCH_API_PORT || 0));
@@ -352,7 +441,7 @@ test('catalog choice aligns missing and cross-unit candidates while retaining th
 });
 
 test('catalog draft writes distinguish raw quotes, guarded model output and catalog fallback', async () => {
-  const catalog = parseCatalogCsv(csv(original)).map(row => ({ ...row, productId: row.productCode, variantId: row.productCode + '/' + row.variantCode }));
+  const catalog = variants(original);
   const client = { async query(sql) {
     assert.match(sql, /dispatch\.(?:parties|customer_aliases)/);
     return { rows: [] };
@@ -376,6 +465,81 @@ test('catalog draft writes distinguish raw quotes, guarded model output and cata
   const copy = structuredClone(draft);
   assert.deepEqual(await applyCatalogToDraft(client, 'account', draft, before, []), { lines: [], changes: [] });
   assert.deepEqual(draft, copy);
+});
+
+test('catalog matches changed brand and spec only when the utterance supports them', async () => {
+  const catalog = variants([
+    ...original,
+    ['P7', '1', '冻品', '亚洲渔港鱼丸', '亚洲渔港', '鱼丸', '500g', '单规格', '箱', '29', '在售', '已核实', '厂牌「亚渔」'],
+    ['P7', '2', '冻品', '亚洲渔港鱼丸', '亚洲渔港', '鱼丸', '1kg', '单规格', '箱', '42', '在售', '已核实', ''],
+  ]);
+  const client = { query: async () => ({ rows: [] }) };
+  const price = async (text, row, before = draftWith()) => {
+    const draft = draftWith(row);
+    await applyCatalogToDraft(client, 'account', draft, before, catalog, text);
+    return state(draft)[0];
+  };
+  for (const detail of [{ brand: '秋丰' }, { specification: '200g' }]) {
+    const duck = await price('甲店要两箱鸭血', item('鸭血', detail));
+    assert.deepEqual([duck.brand, duck.specification, duck.catalogStatus, duck.price], ['', '', 'ambiguous', null]);
+  }
+  for (const [text, specification, expected] of [
+    ['甲店要两箱亚渔鱼丸500克', '500g', '29.00'],
+    ['甲店要两箱亚洲渔港鱼丸1公斤', '1kg', '42.00'],
+    ['甲店要两箱亚渔鱼丸1500克', '500g', null],
+  ]) {
+    const fish = await price(text, item('鱼丸', { brand: '亚洲渔港', specification }));
+    assert.deepEqual([fish.brand, fish.specification, fish.price], ['亚洲渔港', expected ? specification : '', expected]);
+  }
+  const confirmed = item('鸭血', { brand: '秋丰', specification: '200g' });
+  const updated = await price('鸭血数量改成三箱', { ...confirmed, quantity: '3' }, draftWith(confirmed));
+  assert.deepEqual([updated.brand, updated.specification, updated.price], ['秋丰', '200g', '15.00']);
+});
+
+test('changing a unit clears previous prices of every origin and checks an explicitly repeated amount', async () => {
+  const catalog = variants(original);
+  const client = { query: async () => ({ rows: [] }) };
+  const addSource = '甲店要两箱虾丸，每箱40元';
+  const initial = draftWith();
+  const { draft } = prepareEdits(initial, { operations: [add('甲店', '虾丸', { price: '40' })] }, [], addSource);
+  await applyCatalogToDraft(client, 'account', draft, initial, catalog, addSource);
+  const [shrimp] = state(draft);
+  assert.deepEqual([shrimp.price, shrimp.priceSource], ['40', 'spoken']);
+  for (const origin of ['spoken', 'manual', 'catalog', 'customer_history', null, undefined]) {
+    const before = draftWith({ ...shrimp, priceSource: origin });
+    const source = '虾丸单位改成袋';
+    const changed = prepareEdits(before, { operations: [{ action: 'update', target: 1, unit: '袋' }] }, [], source);
+    await applyCatalogToDraft(client, 'account', changed.draft, before, catalog, source);
+    const [row] = state(changed.draft);
+    assert.deepEqual([row.unit, row.price, row.priceSource, row.catalogStatus], ['袋', null, null, 'unit_mismatch'], String(origin));
+  }
+  for (const [quoteUnit, expected] of [['袋', '40'], ['箱', null]]) {
+    const source = `虾丸单位改成袋，每${quoteUnit}40元`;
+    const changed = prepareEdits(draft, { operations: [{ action: 'update', target: 1, unit: '袋', price: '40' }] },
+      [], source, undefined, false, undefined, true);
+    await applyCatalogToDraft(client, 'account', changed.draft, draft, catalog, source);
+    assert.equal(state(changed.draft)[0].price, expected);
+  }
+});
+
+test('image prices are reference hints when catalog pricing cannot fill the line', async () => {
+  const catalog = variants(original);
+  const client = { query: async () => ({ rows: [] }) };
+  const before = draftWith();
+  const recognized = item('临时肠', { price: '49' });
+  const draft = draftWith(recognized, item('虾丸', { price: '49' }), item('鸭血', { price: '49' }),
+    item('香酥卷', { price: '49' }), item('南原鸭血', { price: '49' }), item('', { price: '49' }));
+  await applyCatalogToDraft(client, 'account', draft, before, catalog);
+  assert.deepEqual(draft.customers[0].items.map(row => [row.catalogStatus, row.price, row.priceSource]), [
+    ['unmatched', null, null], ['active', '130.00', 'catalog'], ['ambiguous', null, null],
+    ['unit_mismatch', null, null], ['discontinued', null, null], ['unmatched', null, null],
+  ]);
+  for (const row of draft.customers[0].items.filter(row => row.price === null)) assert.match(row.priceHint, /图片疑似标价 ¥49/);
+  assert.match(draft.customers[0].items[3].priceHint, /库内仅记/);
+  assert.equal(previewTrip(draftWith(draft.customers[0].items[0]), true).totalCents, 0);
+  const legacy = draftWith(recognized);
+  await applyCatalogToDraft(client, 'account', legacy, before, []);
+  assert.equal(state(legacy)[0].price, '49');
 });
 
 test('Harness catalog scorer authorizes each line independently of fixture expectations and amount lists', () => {

@@ -690,6 +690,7 @@ Page({
     const draft = this.draft;
     const choice = this.data.catalogChoices.find(item => item.lineId === lineId);
     if (!draft || !choice || this.data.busy || this.data.polling) return;
+    this.setData({ notice: '' });
     return this.run(async () => {
       try {
         const result = await this.request<CatalogChoiceResult>('/agent/catalog-choice',
@@ -697,7 +698,8 @@ Page({
         await this.reload();
         const updates = (result.priceUpdates ?? []).map(update => update.text).filter(Boolean);
         if (updates.length) this.setData({ notice: `已选定规格：${updates.join('；')}` });
-        else if (typeof wx.showToast === 'function') wx.showToast({ title: '已选定规格', icon: 'success' });
+        else if (typeof wx.showToast === 'function') wx.showToast({
+          title: selection.choice === 'external' ? '已按库外新货保留' : '已选定规格', icon: 'success' });
       } catch (error) {
         await this.reloadAfterConflict(error, catalogConflicts);
         throw error;

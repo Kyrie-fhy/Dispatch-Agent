@@ -32,8 +32,12 @@
           <block wx:if="{{catalogSummary && catalogSummary.productCount > 0}}">
             <view class="row-main num">{{catalogSummary.productCount}} 种</view>
             <view class="row-detail num">{{catalogSummary.variantCount}} 规格 · 在售 {{catalogSummary.activeVariantCount}}{{catalogSummary.discontinuedVariantCount ? ' · 已下架 ' + catalogSummary.discontinuedVariantCount : ''}}</view>
+            <view wx:if="{{catalogError}}" class="row-detail">{{catalogError}}</view>
           </block>
-          <view wx:elif="{{catalogSummary}}" class="row-main">尚未导入</view>
+          <block wx:elif="{{catalogSummary}}">
+            <view class="row-main">尚未导入</view>
+            <view wx:if="{{catalogError}}" class="row-detail">{{catalogError}}</view>
+          </block>
           <view wx:elif="{{catalogError}}" class="row-main">{{catalogError}}</view>
           <view wx:else class="row-main">正在同步…</view>
         </view>

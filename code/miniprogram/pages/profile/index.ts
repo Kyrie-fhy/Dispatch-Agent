@@ -107,7 +107,8 @@ Page({
     if (aliasResult.aliases) this.setData({ aliases: aliasResult.aliases.map(({ alias, canonicalName }) =>
       ({ alias, canonicalName })), aliasesLoaded: true, aliasError: '' });
     else this.setData({ aliasError: aliasResult.error });
-    this.setData({ catalogSummary: catalogResult.summary, catalogError: catalogResult.error });
+    if (catalogResult.summary) this.setData({ catalogSummary: catalogResult.summary, catalogError: '' });
+    else this.setData({ catalogError: catalogResult.error });
   },
 
   login(): Promise<void> | undefined {

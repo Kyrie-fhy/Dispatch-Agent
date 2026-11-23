@@ -1410,12 +1410,14 @@ test('6.5-2 catalog cards choose a variant or keep external with idempotent post
   assert.equal(toasts.length, 0, '有价格更新说明时不再重复弹成功提示');
   assert.equal(page.data.error, '');
 
+  page.setData({ notice: '旧的选款提示' });
   await page.keepExternalCatalog(tap({ line: line.id }));
   const externalPost = posts.at(-1);
   assert.equal(externalPost.choice, 'external');
   assert.equal(externalPost.variantId, undefined);
   assert.ok(externalPost.requestId);
-  assert.deepEqual(toasts, [{ title: '已选定规格', icon: 'success' }]);
+  assert.equal(page.data.notice, '', '发起选款前清理上一轮提示');
+  assert.deepEqual(toasts, [{ title: '已按库外新货保留', icon: 'success' }]);
 
   mode = 'conflict';
   page.setData({ notice: '', error: '' });
@@ -1503,7 +1505,8 @@ test('6.5-2 profile shows the read-only catalog summary and degrades quietly whe
 
   mode = 'failed';
   await profile.reload();
-  assert.equal(profile.data.catalogSummary, null);
+  assert.deepEqual(profile.data.catalogSummary, { productCount: 12, variantCount: 20, activeVariantCount: 18,
+    discontinuedVariantCount: 2, missingUnitVariantCount: 1 }, '刷新失败时保留上一次货品库概览');
   assert.equal(profile.data.catalogError, '货品库信息没加载出来');
   assert.equal(profile.data.loaded, true);
   assert.equal(profile.data.tripMode, '晚间录单中');

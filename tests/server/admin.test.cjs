@@ -179,6 +179,34 @@ function adminAuth(token) {
   return `Bearer ${token}`;
 }
 
+async function importCatalogRows(db, accountId, rows) {
+  const importId = randomUUID();
+  await db.owner.query('INSERT INTO dispatch.catalog_imports (account_id, id, sha256) VALUES ($1, $2, $3)',
+    [accountId, importId, randomBytes(32)]);
+  const productIds = new Map();
+  for (const row of rows) {
+    let productId = productIds.get(row.productCode);
+    if (!productId) {
+      productId = randomUUID();
+      productIds.set(row.productCode, productId);
+      await db.owner.query(`INSERT INTO dispatch.catalog_products
+        (account_id, id, product_code, category, product, brand, import_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [accountId, productId, row.productCode, row.category, row.product, row.brand, importId]);
+    }
+    await db.owner.query(`INSERT INTO dispatch.catalog_variants
+      (account_id, id, product_id, variant_code, packaging, flavor_or_grade, canonical_spec, unit, price_cents, status, import_id)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+    [accountId, randomUUID(), productId, row.variantCode, row.packaging ?? '', row.flavorOrGrade ?? null,
+      row.specification, row.unit ?? null, row.priceCents, row.status, importId]);
+    for (const alias of row.aliases ?? []) {
+      await db.owner.query(`INSERT INTO dispatch.catalog_aliases (account_id, product_id, normalized_alias, alias)
+        VALUES ($1, $2, $3, $4)`, [accountId, productId, `product:${alias}`, alias]);
+    }
+  }
+  return importId;
+}
+
 test('admin token configuration requires at least 16 characters', () => {
   assert.equal(configuredAdminToken({}), undefined);
   assert.equal(configuredAdminToken({ DISPATCH_ADMIN_TOKEN: '   ' }), undefined);
@@ -509,6 +537,89 @@ test('admin reads two accounts, images, prompts and full harness events without 
     }
     assert.equal(prompts.data.prompts.find(entry => entry.id === 'text-order').prompts[0].text, textPrompt);
     assert.deepEqual(prompts.data.prompts.find(entry => entry.id === 'a2-candidate').tools, deliveryTools);
+
+    assert.deepEqual(await writeSnapshot(db), before);
+  } finally {
+    await api.stop();
+  }
+});
+
+test('admin catalog snapshot keeps read-only token protection and account isolation', { timeout: 60_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const adminToken = 'admin-catalog-snapshot-0123456789';
+  const api = await start(db, { adminToken });
+  try {
+    await login(api, 'a');
+    await login(api, 'b');
+    const { rows: [accountA] } = await db.owner.query(
+      "SELECT id FROM dispatch.accounts WHERE identity_provider = 'development' AND identity_subject = 'a'");
+    const { rows: [accountB] } = await db.owner.query(
+      "SELECT id FROM dispatch.accounts WHERE identity_provider = 'development' AND identity_subject = 'b'");
+    const auth = adminAuth(adminToken);
+
+    const empty = await api.request(`/admin/api/accounts/${accountB.id}/catalog`, { authorization: auth });
+    assert.equal(empty.status, 200, JSON.stringify(empty.data));
+    assert.deepEqual(empty.data.summary, { productCount: 0, variantCount: 0, activeVariantCount: 0,
+      discontinuedVariantCount: 0, missingUnitVariantCount: 0 });
+    assert.equal(empty.data.importedAt, null);
+    assert.deepEqual(empty.data.items, []);
+
+    await importCatalogRows(db, accountA.id, [
+      { productCode: 'P001', category: '冻品', product: '水饺', brand: '安井', variantCode: 'V001',
+        packaging: '袋装', specification: '500g', unit: '箱', priceCents: 8200, status: 'active', aliases: ['饺子'] },
+      { productCode: 'P002', category: '冻品', product: '鸭血', brand: '甲牌', variantCode: 'V002',
+        packaging: '盒装', specification: '300g', unit: null, priceCents: 700, status: 'discontinued' },
+    ]);
+    await importCatalogRows(db, accountB.id, [
+      { productCode: 'P900', category: '冻品', product: '带鱼', brand: '海牌', variantCode: 'V900',
+        packaging: '箱装', specification: '1kg', unit: '箱', priceCents: 12000, status: 'active' },
+    ]);
+
+    const before = await writeSnapshot(db);
+    const path = `/admin/api/accounts/${accountA.id}/catalog`;
+    assert.equal((await api.request(path)).status, 401);
+    assert.equal((await api.request(path, { authorization: adminAuth('wrong-catalog-token-0123456789') })).status, 401);
+    assert.equal((await api.request(path, { authorization: auth, method: 'POST', body: {} })).status, 405);
+    assert.equal((await api.request('/admin/api/accounts/not-a-uuid/catalog', { authorization: auth })).status, 400);
+
+    const catalogA = await api.request(path, { authorization: auth });
+    assert.equal(catalogA.status, 200, JSON.stringify(catalogA.data));
+    assert.deepEqual(catalogA.data.summary, { productCount: 2, variantCount: 2, activeVariantCount: 1,
+      discontinuedVariantCount: 1, missingUnitVariantCount: 1 });
+    assert.equal(typeof catalogA.data.importedAt, 'string');
+    assert.equal(Number.isNaN(Date.parse(catalogA.data.importedAt)), false);
+    assert.deepEqual(catalogA.data.items.map(item => item.productCode), ['P001', 'P002']);
+    const dumpling = catalogA.data.items.find(item => item.variantCode === 'V001');
+    assert.deepEqual(dumpling, { productCode: 'P001', variantCode: 'V001', category: '冻品', product: '水饺',
+      brand: '安井', specification: '500g', unit: '箱', priceCents: 8200, status: 'active', aliases: ['饺子'] });
+    assert.equal('productId' in dumpling, false);
+    assert.equal('brandAliases' in dumpling, false);
+    const duckBlood = catalogA.data.items.find(item => item.variantCode === 'V002');
+    assert.equal(duckBlood.unit, null);
+    assert.equal(duckBlood.priceCents, 700);
+    assert.equal(duckBlood.status, 'discontinued');
+    assert.deepEqual(duckBlood.aliases, []);
+
+    const catalogB = await api.request(`/admin/api/accounts/${accountB.id}/catalog`, { authorization: auth });
+    assert.equal(catalogB.status, 200, JSON.stringify(catalogB.data));
+    assert.deepEqual(catalogB.data.items.map(item => item.productCode), ['P900']);
+    assert.equal(JSON.stringify(catalogB.data).includes('水饺'), false);
+    assert.equal(JSON.stringify(catalogB.data).includes('饺子'), false);
+
+    const overviewA = await api.request(`/admin/api/accounts/${accountA.id}/overview`, { authorization: auth });
+    assert.equal(overviewA.status, 200);
+    assert.deepEqual(overviewA.data.catalogSummary, catalogA.data.summary);
+
+    const page = await api.request('/admin');
+    assert.equal(page.status, 200);
+    for (const token of ['货品库', 'data-left="catalog"', 'catalog-search', 'npm run catalog:import',
+      '熟客价', '库内价', '?catalog=1']) {
+      assert.ok(page.data.includes(token), `后台缺少货品库结构 ${token}`);
+    }
+    const scriptStart = page.data.indexOf('<script>') + 8;
+    const scriptEnd = page.data.lastIndexOf('</script>');
+    assert.ok(scriptStart > 7 && scriptEnd > scriptStart);
+    new vm.Script(page.data.slice(scriptStart, scriptEnd));
 
     assert.deepEqual(await writeSnapshot(db), before);
   } finally {

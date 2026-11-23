@@ -1,9 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { Pool, PoolClient } from 'pg';
+import { resolveCustomerMention } from '../miniprogram/core/memory';
 import { emptyItem, isObject, ItemInput } from '../miniprogram/core/orders';
 import { textFields, textOrderLimit, validTextField } from '../miniprogram/core/text-order';
 import { CustomerDraft, TripDraft } from '../miniprogram/core/trips';
 import { missingDraft, readAccount, readAccountResult, readParties, readWorkspace, Workspace, workspaceDraft, writeAccount } from './account-workspace';
+import { applyCatalogToDraft, loadCatalog } from './catalog';
+import { clearCatalogIdentity, itemIdentityChanged } from './draft-input';
+import { readDirectory } from './memory';
 import { HttpError } from './http-error';
 import { readOrderImage } from './materials';
 import { readId, readPreviewInput, validRevision } from './request-input';
@@ -47,8 +51,8 @@ export function targetRows(draft: TripDraft) {
 }
 
 function fieldsOf(item: ItemInput): Fields {
-  const { id: _id, ...fields } = item;
-  return fields;
+  const { product, brand, specification, unit, quantity, price } = item;
+  return { product, brand, specification, unit, quantity, price };
 }
 
 export function isPlaceholder(item: ItemInput) {
@@ -146,10 +150,22 @@ function prepareOrder(draft: TripDraft, output: unknown, partyNames: Set<string>
         const incoming = fields[field];
         if (!incoming) continue;
         const existing = row.item[field]?.trim();
+        if (field === 'price' && (row.item.priceSource === 'catalog' || row.item.priceSource === 'customer_history')) {
+          row.item.price = incoming;
+          row.item.priceSource = 'spoken';
+          continue;
+        }
         if (existing && normalized(existing) !== normalized(incoming)) {
           needsReview('这段文字与草稿已填内容冲突，请在对应明细中手动核对。');
         }
         if (!existing) row.item[field] = incoming;
+      }
+      if (itemIdentityChanged(row.item, selected.item)) {
+        clearCatalogIdentity(row.item);
+        if (!fields.price && (row.item.priceSource === 'catalog' || row.item.priceSource === 'customer_history')) {
+          row.item.price = null;
+          row.item.priceSource = null;
+        }
       }
     } else {
       if (op.target !== undefined && op.target !== null) invalidModel();
@@ -294,7 +310,27 @@ export class TextOrders {
         hooks?.signal.throwIfAborted();
         checkBasis(latest, input);
         if (textDigest) await checkDuplicate(client, account, input.draftId, textDigest);
-        const draft = hooks ? await hooks.prepare(client, candidate, workspaceDraft(latest)) : candidate;
+        const before = workspaceDraft(latest);
+        const draft = hooks ? await hooks.prepare(client, candidate, before) : candidate;
+        if (!hooks) {
+          const catalog = await loadCatalog(client, account);
+          if (catalog.length) {
+            const directory = await readDirectory(client, account);
+            const previous = new Map(before.customers.map(customer => [customer.id, customer]));
+            for (const customer of draft.customers) {
+              if (!customer.customer || customer.partyId || previous.get(customer.id)?.customer === customer.customer) continue;
+              const mention = resolveCustomerMention(directory, customer.customer);
+              if (mention.status !== 'resolved') continue;
+              if (draft.customers.some(sibling => sibling !== customer && sibling.partyId === mention.customerId)) {
+                delete customer.partyId;
+                continue;
+              }
+              customer.customer = mention.canonicalName;
+              customer.partyId = mention.customerId;
+            }
+            await applyCatalogToDraft(client, account, draft, before, catalog, image ? undefined : input.text);
+          }
+        }
         await client.query('UPDATE dispatch.workspaces SET draft_revision = $2, draft_customers = $3 WHERE account_id = $1',
           [account, draft.revision, JSON.stringify(draft.customers)]);
         if (picture) {

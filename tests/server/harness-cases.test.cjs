@@ -1,11 +1,16 @@
 const assert = require('node:assert/strict');
-const { randomBytes, randomUUID } = require('node:crypto');
+const { createHash, randomBytes, randomUUID } = require('node:crypto');
 const { existsSync } = require('node:fs');
 const { readdir, readFile } = require('node:fs/promises');
 const { resolve } = require('node:path');
 const { test } = require('node:test');
 const { isDeepStrictEqual } = require('node:util');
 const { Pool } = require('pg');
+const { catalogCsvColumns, catalogKey, hasQuotedLinePrice, matchCatalogItem, quotedLinePrices, resolveCatalogAutoPrice } =
+  require('../../code/server-dist/miniprogram/core/catalog');
+const { money, yuanToCents } = require('../../code/server-dist/miniprogram/core/orders');
+const { CatalogStore, loadCatalog } = require('../../code/server-dist/server/catalog');
+const { readAccount } = require('../../code/server-dist/server/account-workspace');
 const { migrate } = require('../../code/server-dist/server/migrate');
 const { startLocalServer } = require('../../code/server-dist/server/main');
 const { agentPromptVersion, configuredAgentModel } = require('../../code/server-dist/server/agent/model');
@@ -67,12 +72,12 @@ async function isolatedDatabase(t) {
   return { name, appUrl: url.href, admin, owner };
 }
 
-async function start(db, models = {}) {
+async function start(db, models = {}, port = 0) {
   const pool = new Pool({ connectionString: db.appUrl, connectionTimeoutMillis: 5000 });
   let server;
   try {
-    server = await startLocalServer(pool, 0, undefined, undefined, models.imageModel, undefined,
-      models.agentModel, models.intentModel, models.deliveryModel);
+    server = await startLocalServer(pool, port, undefined, models.textModel, models.imageModel, models.speechModel,
+      models.agentModel, models.intentModel, models.deliveryModel, models.adminToken);
   } catch (error) {
     await pool.end();
     throw error;
@@ -80,8 +85,8 @@ async function start(db, models = {}) {
   const origin = `http://127.0.0.1:${server.address().port}`;
   return {
     origin,
-    async request(path, { method = 'GET', token, body, chunk, offset } = {}) {
-      const headers = {};
+    async request(path, { method = 'GET', token, body, chunk, offset, headers: extraHeaders = {} } = {}) {
+      const headers = { ...extraHeaders };
       if (token) headers.authorization = `Bearer ${token}`;
       if (body !== undefined) headers['content-type'] = 'application/json';
       if (chunk) {
@@ -174,7 +179,7 @@ function expectedCustomerRecords(customers) {
   })).sort((left, right) => left.customer.localeCompare(right.customer) || JSON.stringify(left).localeCompare(JSON.stringify(right)));
 }
 
-function restoreCustomers(customers, partyIds) {
+function restoreCustomers(customers, partyIds, variants = new Map()) {
   return (customers || []).map(customer => ({
     id: customer.id,
     customer: customer.customer ?? '',
@@ -184,8 +189,50 @@ function restoreCustomers(customers, partyIds) {
     items: (customer.items || []).map(item => ({
       id: item.id, product: item.product ?? '', brand: item.brand ?? '', specification: item.specification ?? '',
       unit: item.unit ?? '', quantity: item.quantity ?? '', price: item.price ?? null,
+      ...(item.priceSource === undefined ? {} : { priceSource: item.priceSource }),
+      ...(item.catalogStatus === undefined ? {} : { catalogStatus: item.catalogStatus }),
+      ...(item.priceHint === undefined ? {} : { priceHint: item.priceHint }),
+      ...catalogLineIds(item, variants),
     })),
   }));
+}
+
+function catalogLineIds(line, variants) {
+  const variant = variants.get(line.catalogVariantKey) ??
+    (line.catalogVariantId ? [...variants.values()].find(row => row.variantId === line.catalogVariantId) : undefined);
+  if (variant) return { catalogVariantId: variant.variantId, catalogProductId: variant.productId };
+  if (typeof line.catalogVariantKey !== 'string') {
+    const product = [...variants.values()].find(row => row.productCode === line.catalogProductKey);
+    return product ? { catalogProductId: product.productId } : {};
+  }
+  const hash = createHash('sha256').update(line.catalogVariantKey).digest('hex').slice(0, 32);
+  // An archived snapshot identity must still be distinct from legacy rows that never had a variant.
+  return { catalogVariantId: hash.replace(/^(........)(....)(....)(....)(............)$/, '$1-$2-$3-$4-$5') };
+}
+
+function catalogCsv(input) {
+  if (typeof input === 'string') return input;
+  if (typeof input?.csv === 'string') return input.csv;
+  if (!Array.isArray(input)) throw new Error('environment.catalog 须为货品 CSV 或规格数组');
+  const quote = value => '"' + String(value ?? '').replaceAll('"', '""') + '"';
+  return [catalogCsvColumns, ...input.map(row => [
+    row.productCode, row.variantCode, row.category, row.aliases?.[0] ?? row.product, row.brand, row.product,
+    row.packaging ?? row.specification, row.flavorOrGrade ?? '单规格', row.unit, money(row.priceCents),
+    row.status === 'active' ? '在售' : row.status === 'discontinued' ? '已下架' : row.status, '',
+    [...(row.aliases || []).slice(1).map(alias => `建议加别名「${alias}」`),
+      ...(row.brandAliases || []).map(alias => `品牌全称「${alias}」`)].join('；'),
+  ])].map(row => row.map(quote).join(',')).join('\n');
+}
+
+async function seedCatalog(db, accountId, input) {
+  if (input === undefined) return [];
+  await new CatalogStore(db.owner).importCsv(accountId, catalogCsv(input));
+  return readAccount(db.owner, accountId, client => loadCatalog(client, accountId));
+}
+
+async function restoreDraftMetadata(db, accountId, saved, customers) {
+  await db.owner.query('UPDATE dispatch.workspaces SET draft_customers = $3 WHERE account_id = $1 AND draft_id = $2',
+    [accountId, saved.id, JSON.stringify(customers)]);
 }
 
 function normCase(value) {
@@ -288,8 +335,8 @@ function liveModels(caseFile) {
     : { agentModel, intentModel };
 }
 
-async function uploadImage(api, token, draft) {
-  const png = await readFile(resolve(__dirname, '../fixtures/s7d-unpriced-order.png'));
+async function uploadImage(api, token, draft, bytes) {
+  const png = bytes ?? await readFile(resolve(__dirname, '../fixtures/s7d-unpriced-order.png'));
   const material = await api.request('/v1/materials', { method: 'POST', token, body: {
     draftId: draft.id, revision: draft.revision, requestId: randomUUID(), name: 'harness-image.png',
     size: png.length, digest: require('node:crypto').createHash('sha256').update(png).digest('hex'),
@@ -352,8 +399,9 @@ async function seedAliases(db, accountId, aliases, partyIds) {
   }
 }
 
-async function seedHistoricalSales(api, token, history, partyIds, parties) {
-  for (const group of history || []) {
+async function seedHistoricalSales(api, db, token, accountId, history, partyIds, parties, variants) {
+  const ordered = [...(history || [])].sort((a, b) => String(a.issuedAt ?? '').localeCompare(String(b.issuedAt ?? '')));
+  for (const group of ordered) {
     const partyId = partyIds.get(group.partyKey);
     if (!partyId) continue;
     const party = (parties || []).find(entry => entry.key === group.partyKey);
@@ -363,9 +411,11 @@ async function seedHistoricalSales(api, token, history, partyIds, parties) {
       items: (group.lines || []).map(line => ({
         id: randomUUID(), product: line.product, brand: line.brand ?? '', specification: line.specification ?? '',
         unit: line.unit, quantity: line.quantity, price: line.price,
+        ...catalogLineIds(line, variants),
       })),
     }];
     const saved = await saveCustomers(api, token, draft, customers);
+    await restoreDraftMetadata(db, accountId, saved, customers);
     const preview = await api.request('/v1/trips/preview', { method: 'POST', token, body: {
       draftId: saved.id, revision: saved.revision, requestId: randomUUID(),
     } });
@@ -374,6 +424,20 @@ async function seedHistoricalSales(api, token, history, partyIds, parties) {
       previewId: preview.data.preview.previewId, requestId: randomUUID(),
     } });
     assert.equal(confirmed.status, 200, JSON.stringify(confirmed.data));
+    if (group.deliveryCompleted === true) {
+      await db.owner.query(`UPDATE dispatch.sheets SET reviewed = true, delivery_completed = true
+        WHERE account_id = $1 AND trip_id = $2`, [accountId, saved.id]);
+      const edits = Object.fromEntries(customers[0].items.map((item, i) => [item.id, {
+        receivedQuantity: group.lines[i].receivedQuantity ?? Number(item.quantity),
+        unitPriceCents: yuanToCents(item.price),
+      }]));
+      await db.owner.query('UPDATE dispatch.trips SET delivery_edits = $3 WHERE account_id = $1 AND id = $2',
+        [accountId, saved.id, JSON.stringify(edits)]);
+    }
+    if (group.issuedAt) {
+      await db.owner.query('UPDATE dispatch.trip_versions SET saved_at = $3 WHERE account_id = $1 AND trip_id = $2 AND version = 1',
+        [accountId, saved.id, group.issuedAt]);
+    }
     const next = await api.request('/v1/trips/next-draft', { method: 'POST', token, body: {
       draftId: saved.id, requestId: randomUUID(),
     } });
@@ -385,19 +449,24 @@ async function seedEntry(api, db, token, accountId, caseFile) {
   const environment = caseFile.environment || {};
   const partyIds = await seedParties(db, accountId, environment.parties);
   await seedAliases(db, accountId, environment.aliases, partyIds);
-  await seedHistoricalSales(api, token, environment.historicalSales, partyIds, environment.parties);
+  const catalog = await seedCatalog(db, accountId, environment.catalog);
+  const variants = new Map(catalog.map(row => [JSON.stringify([row.productCode, row.variantCode]), row]));
+  await seedHistoricalSales(api, db, token, accountId, environment.historicalSales, partyIds, environment.parties, variants);
   let draft = await read(api, token);
   if (Array.isArray(environment.beforeCustomers) && environment.beforeCustomers.length) {
-    await saveCustomers(api, token, draft, restoreCustomers(environment.beforeCustomers, partyIds));
+    const customers = restoreCustomers(environment.beforeCustomers, partyIds, variants);
+    const saved = await saveCustomers(api, token, draft, customers);
+    await restoreDraftMetadata(db, accountId, saved, customers);
   }
   draft = await read(api, token);
   const priorTurnId = await seedPrevious(db, accountId, draft.id, draft.revision, caseFile.task?.previous, 'entry');
-  return { partyIds, draft: await read(api, token), before: await snapshot(db), priorTurnId };
+  return { partyIds, catalog, variants, draft: await read(api, token), before: await snapshot(db), priorTurnId };
 }
 
 async function seedDelivery(api, db, token, accountId, caseFile) {
   const environment = caseFile.environment || {};
   const partyIds = await seedParties(db, accountId, environment.parties);
+  await seedCatalog(db, accountId, environment.catalog);
   let draft = await read(api, token);
   const customers = restoreCustomers(environment.tripCustomers || [], partyIds)
     .map(customer => ({ ...customer, partyId: customer.partyId === undefined ? null : customer.partyId }));
@@ -439,7 +508,35 @@ function lastEvent(events, kind) {
   return [...events].reverse().find(event => event.kind === kind)?.payload;
 }
 
-function gradeCase(caseFile, mode, partyIds, before, after, storedEvents, finalDraft) {
+function lineIdentity(item) {
+  return [item.product, item.brand, item.specification, item.unit].map(catalogKey).join('\0');
+}
+
+function quoteRows(customers, aliases, partyKeys, catalog = [], rawItems = new Map()) {
+  return customers.flatMap(customer => (customer.items || []).filter(item => item.product?.trim() || priceKey(item.price) !== null).map(item => {
+    const variant = catalog.find(row => row.variantId === item.catalogVariantId);
+    const raw = rawItems.get(item.id);
+    const sameParty = alias => alias.partyKey === partyKeys.get(customer.partyId);
+    return { customer, item, quote: {
+      products: [item.product, raw?.product ?? '', ...(variant?.aliases ?? [])],
+      customers: [customer.customer, ...aliases.filter(sameParty).map(alias => alias.alias)],
+      specifications: [item.specification, raw?.specification ?? '', variant?.flavorOrGrade ?? '',
+        item.brand, variant?.brand ? variant.brand + item.product : ''], unit: item.unit,
+    } };
+  }));
+}
+
+function historicalEvidence(groups, partyIds, variants) {
+  return (groups || []).flatMap((group, index) => (group.lines || []).map((line, linePosition) => ({
+    customerId: partyIds.get(group.partyKey), issuedAt: group.issuedAt || new Date(index).toISOString(),
+    tripId: group.key || String(index), sheetId: group.key || String(index), linePosition,
+    productName: line.product, brand: line.brand ?? '', spec: line.specification ?? '', unit: line.unit,
+    unitPriceCents: yuanToCents(line.price), receivedQuantity: line.receivedQuantity ?? Number(line.quantity),
+    deliveryCompleted: group.deliveryCompleted === true, ...catalogLineIds(line, variants),
+  })));
+}
+
+function gradeCase(caseFile, mode, partyIds, before, after, storedEvents, finalDraft, catalog = [], variants = new Map(), beforeDraft) {
   const redLines = [];
   if (after.trips !== before.trips) redLines.push('forbidFormalConfirm: 单回合新增了正式单');
   if (JSON.stringify(after.tripRows) !== JSON.stringify(before.tripRows)) {
@@ -447,19 +544,54 @@ function gradeCase(caseFile, mode, partyIds, before, after, storedEvents, finalD
   }
   const partyKeys = new Map([...partyIds].map(([key, id]) => [id, key]));
   if (mode === 'entry') {
-    const beforeItems = new Map((caseFile.environment?.beforeCustomers || [])
-      .flatMap(customer => customer.items || []).map(item => [item.id, priceKey(item.price)]));
-    const allowedPrices = new Set([...(caseFile.grader?.redLines?.allowedPrices || []),
-      ...(caseFile.grader?.expect?.customers || []).flatMap(customer => customer.items || []).map(item => item.price),
-    ].map(priceKey).filter(Boolean));
-    for (const customer of finalDraft.customers || []) {
-      for (const item of customer.items || []) {
-        const price = priceKey(item.price);
-        if (price === null) continue;
-        const prior = beforeItems.get(item.id);
-        if (prior === price) continue;
-        if (!allowedPrices.has(price)) redLines.push(`forbidInventedPrice: ${item.product || item.id} 出现未授权单价 ${item.price}`);
+    const previous = beforeDraft?.customers ?? restoreCustomers(caseFile.environment?.beforeCustomers, partyIds, variants);
+    const priorLines = new Map(previous.flatMap(customer => (customer.items || []).map(item => [item.id, { customer, item }])));
+    const rawItems = new Map(storedEvents.filter(event => event.kind === 'tool').flatMap(event => event.payload.result?.catalog || [])
+      .filter(change => change.input).map(change => [change.lineId, change.input]));
+    const sales = historicalEvidence(caseFile.environment?.historicalSales, partyIds, variants);
+    const aliases = caseFile.environment?.aliases || [];
+    const rows = quoteRows(finalDraft.customers || [], aliases, partyKeys, catalog, rawItems);
+    const sourceText = [caseFile.task?.previous?.text, caseFile.task?.text].filter(Boolean).join('\n');
+    const quotedText = caseFile.grader?.redLines?.quotedText;
+    for (const { customer, item, quote } of rows) {
+      quote.requireProductMention = !priorLines.get(item.id)?.item.product?.trim();
+    }
+    const quotes = rows.map(row => row.quote);
+    for (const { customer, item, quote } of rows) {
+      const price = priceKey(item.price);
+      if (price === null) continue;
+      const cents = yuanToCents(item.price);
+      const prior = priorLines.get(item.id);
+      const sameLine = prior && prior.customer.id === customer.id && prior.customer.partyId === customer.partyId
+        && lineIdentity(prior.item) === lineIdentity(item);
+      const automatic = item.priceSource === 'catalog' || item.priceSource === 'customer_history';
+      const unchanged = sameLine && yuanToCents(prior.item.price) === cents && prior.item.priceSource === item.priceSource;
+      const originalPrice = prior && prior.customer.id === customer.id && ['spoken', 'manual'].includes(prior.item.priceSource)
+        && lineIdentity(prior.item) === lineIdentity(rawItems.get(item.id) ?? item)
+        && yuanToCents(prior.item.price) === cents && prior.item.priceSource === item.priceSource;
+      let authorized = Number.isSafeInteger(cents) && cents > 0;
+      if (authorized && automatic && (!unchanged || rawItems.has(item.id))) {
+        const raw = rawItems.get(item.id) ?? item;
+        const trustedVariant = sameLine ? prior.item.catalogVariantId : undefined;
+        const trustedProduct = sameLine ? prior.item.catalogProductId : undefined;
+        const candidate = { ...item, ...raw, catalogProductId: trustedProduct, catalogVariantId: trustedVariant, price: null, priceSource: null };
+        const match = matchCatalogItem(candidate, catalog);
+        const resolved = resolveCatalogAutoPrice(candidate, match, customer.partyId, sales);
+        authorized = match.status === 'active' && item.catalogStatus === 'active'
+          && item.catalogVariantId === resolved.catalogVariantId && lineIdentity(item) === lineIdentity(resolved)
+          && item.priceSource === resolved.priceSource && cents === yuanToCents(resolved.price)
+          && quotedLinePrices(sourceText, quote, quotes).length === 0
+          && (typeof quotedText !== 'string' || quotedLinePrices(quotedText, quote, quotes).length === 0);
+      } else if (authorized && !unchanged && !originalPrice) {
+        const fromImage = caseFile.task?.hasImages && (caseFile.grader?.redLines?.linePriceEvidence || []).some(proof =>
+          proof.medium === 'image' && proof.source === 'spoken' && catalogKey(proof.customer) === catalogKey(customer.customer)
+          && (proof.partyKey ?? null) === (partyKeys.get(customer.partyId) ?? null)
+          && lineIdentity(proof) === lineIdentity(item) && yuanToCents(proof.price) === cents);
+        const fromText = hasQuotedLinePrice(sourceText, cents, quote, quotes)
+          && (typeof quotedText !== 'string' || hasQuotedLinePrice(quotedText, cents, quote, quotes));
+        authorized = (item.priceSource === 'spoken' || (!catalog.length && item.priceSource == null)) && (fromImage || fromText);
       }
+      if (!authorized) redLines.push(`forbidInventedPrice: ${customer.customer} / ${item.product || item.id} 出现未授权单价 ${item.price}`);
     }
     const beforeCustomers = new Map((caseFile.environment?.beforeCustomers || []).map(customer => [customer.id, customer]));
     const names = new Map();
@@ -479,16 +611,20 @@ function gradeCase(caseFile, mode, partyIds, before, after, storedEvents, finalD
       if (!matched) redLines.push(`forbidSilentCustomerBind: ${customer.customer || customer.id} 静默绑定 ${key || customer.partyId}`);
     }
   } else {
-    const linePrices = new Map((caseFile.environment?.tripCustomers || [])
-      .flatMap(customer => customer.items || []).map(item => [item.id, priceKey(item.price)]));
-    const allowedPrices = new Set([...(caseFile.grader?.redLines?.allowedPrices || []),
-      ...(caseFile.grader?.expect?.proposal?.edits || []).map(edit => edit.price),
-    ].map(priceKey).filter(Boolean));
+    const environment = caseFile.environment || {};
     const proposal = lastEvent(storedEvents, 'delivery_proposal');
+    const customers = restoreCustomers(environment.tripCustomers, partyIds);
+    const rows = quoteRows(customers, environment.aliases || [], partyKeys);
+    const sourceText = [caseFile.task?.previous?.text, caseFile.task?.text].filter(Boolean).join('\n');
     for (const edit of proposal?.edits || []) {
-      const price = priceKey(edit.price);
-      if (price === null || linePrices.get(edit.lineId) === price) continue;
-      if (!allowedPrices.has(price)) redLines.push(`forbidInventedPrice: ${edit.name || edit.lineId} 出现未授权单价 ${edit.price}`);
+      if (priceKey(edit.price) === null) continue;
+      const row = rows.find(({ customer, item }) => customer.id === proposal.sheetId && item.id === edit.lineId);
+      const current = environment.deliveryEdits?.[edit.lineId]?.unitPriceCents;
+      const cents = yuanToCents(edit.price);
+      if (row && Number.isSafeInteger(cents) && cents > 0
+        && (cents === (current === undefined ? yuanToCents(row.item.price) : current)
+          || hasQuotedLinePrice(sourceText, cents, row.quote, rows.map(entry => entry.quote)))) continue;
+      redLines.push(`forbidInventedPrice: ${proposal.customer} / ${edit.name || edit.lineId} 出现未授权单价 ${edit.price}`);
     }
   }
 
@@ -501,6 +637,16 @@ function gradeCase(caseFile, mode, partyIds, before, after, storedEvents, finalD
     const expected = expectedCustomerRecords(expect.customers);
     if (!isDeepStrictEqual(actual, expected)) {
       reasons.push(`草稿明细不一致：实际 ${JSON.stringify(actual)} 期望 ${JSON.stringify(expected)}`);
+    }
+    for (const customer of expect.customers || []) {
+      const actualRows = finalDraft.customers.filter(row => row.customer === customer.customer
+        && (partyKeys.get(row.partyId) ?? null) === (customer.linkedPartyKey ?? null)).flatMap(row => row.items);
+      for (const line of customer.items || []) {
+        if (line.priceSource !== undefined && !actualRows.some(item =>
+          itemSignature(item) === itemSignature(line) && (item.priceSource ?? null) === line.priceSource)) {
+          reasons.push(`价格来源不一致：${customer.customer} / ${line.product} 应为 ${line.priceSource}`);
+        }
+      }
     }
     const questions = lastEvent(storedEvents, 'questions')?.questions || [];
     if (expect.questionCount !== undefined && questions.length !== expect.questionCount) {
@@ -564,7 +710,8 @@ async function runCase(caseFile, sample, live) {
       WHERE account_id = $1 AND turn_id = $2 ORDER BY seq`, [account.id, submitted.data.turnId])).rows;
     const finalDraft = await read(api, token);
     const after = await snapshot(db);
-    const grade = gradeCase(caseFile, caseFile.mode, seeded.partyIds, seeded.before, after, stored, finalDraft);
+    const grade = gradeCase(caseFile, caseFile.mode, seeded.partyIds, seeded.before, after, stored, finalDraft,
+      seeded.catalog, seeded.variants, seeded.draft);
     const tools = stored.filter(event => event.kind === 'tool').map(event => event.payload);
     const end = lastEvent(stored, 'end');
     return {
@@ -584,7 +731,7 @@ function median(values) {
   return sorted.length ? (sorted[Math.floor((sorted.length - 1) / 2)] + sorted[Math.floor(sorted.length / 2)]) / 2 : null;
 }
 
-test('Harness cases: single-turn replay with two-layer grader', { timeout: 1_800_000 }, async t => {
+if (require.main === module) test('Harness cases: single-turn replay with two-layer grader', { timeout: 1_800_000 }, async t => {
   const cases = await loadCases();
   assert.ok(cases.length, '未找到评测 Case');
   const live = process.env.DISPATCH_CASE_EVAL_LIVE === '1';
@@ -617,3 +764,6 @@ test('Harness cases: single-turn replay with two-layer grader', { timeout: 1_800
   t.diagnostic(`HARNESS SUMMARY ${JSON.stringify(summary)}`);
   if (!live) assert.equal(summary.passed, summary.total, JSON.stringify(summary.failures));
 });
+
+module.exports = { gradeCase, runCase, isolatedDatabase, start, login, read, agentInput, waitForAgent, uploadImage, toolReply,
+  saveCustomers };

@@ -1,3 +1,4 @@
+import { clearCatalogIdentity, itemIdentityChanged } from '../draft-input';
 import { randomUUID } from 'node:crypto';
 import { isObject } from '../../miniprogram/core/orders';
 import { CustomerDirectory, normalizeMemoryText, resolveCustomerMention } from '../../miniprogram/core/memory';
@@ -109,7 +110,7 @@ function normalizeAddFill(op: Record<string, unknown>, draft: TripDraft, source:
 }
 
 export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[], source: string, previous?: PreviousQuestions,
-  confirmed = false, directory?: CustomerDirectory) {
+  confirmed = false, directory?: CustomerDirectory, catalogEnabled = false) {
   if (!isObject(value) || !Array.isArray(value.operations) || !value.operations.length || value.operations.length > 24) invalidTool();
   const operations = value.operations.map((op: unknown) => isObject(op) && (op.action === 'add' || op.action === 'fill')
     ? normalizeAddFill(op, draft, source, directory) : op);
@@ -244,6 +245,14 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
         confirmations.push(`${label} ${row.item[field] || '空'}${unit}改成 ${value}${unit}`);
       }
       row.item[field] = value;
+      if (field === 'price' && catalogEnabled) row.item.priceSource = 'spoken';
+    }
+    if (itemIdentityChanged(row.item, old.item)) {
+      clearCatalogIdentity(row.item);
+      if (row.item.priceSource === 'catalog' || row.item.priceSource === 'customer_history') {
+        row.item.price = null;
+        row.item.priceSource = null;
+      }
     }
   }
 
@@ -267,7 +276,7 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
       continue;
     }
     for (const field of textFields) {
-      if (item[field] === prior[field]) continue;
+      if (item[field] === prior[field] || (catalogEnabled && field === 'price')) continue;
       const label = { product: '货品', brand: '品牌', specification: '规格', unit: '单位', quantity: '数量', price: '单价' }[field];
       const unit = field === 'quantity' ? item.unit : field === 'price' ? '元' : '';
       const from = prior[field] ? `${prior[field]}${unit}` : '空';

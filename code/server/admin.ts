@@ -1,11 +1,13 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { IncomingMessage, ServerResponse } from 'node:http';
 import { Pool, PoolClient } from 'pg';
+import { hasQuotedLinePrice } from '../miniprogram/core/catalog';
 import { DeliveryEdits, deliveryLines, deliverySummary } from '../miniprogram/core/delivery-execution';
-import { isObject, nullablePrice, validTextPrice, yuanToCents } from '../miniprogram/core/orders';
+import { catalogStatuses, isObject, itemPriceSources, money, nullablePrice, validTextPrice, yuanToCents, type ItemInput } from '../miniprogram/core/orders';
 import { hasSpokenNumber, spokenNumbers } from '../miniprogram/core/spoken-numbers';
 import { latest, TripVersion } from '../miniprogram/core/trips';
 import { readAccount, readParties, readWorkspace, workspaceDraft } from './account-workspace';
+import { loadCatalog } from './catalog';
 import { transaction } from './database';
 import { HttpError } from './http-error';
 import { imageMime } from './materials';
@@ -36,9 +38,7 @@ type DocumentCustomer = {
   sheetId: string; customer: string; partyId: string | null; reviewed: boolean; deliveryCompleted: boolean; locked: boolean;
   orderCents: number | null; orderPendingPrices: number; dueCents: number; pendingPrices: number; lines: DocumentLine[];
 };
-type EvalDraftItem = {
-  id: string; product: string; brand: string; specification: string; unit: string; quantity: string; price: string | null;
-};
+type EvalDraftItem = ItemInput;
 type EvalDraftCustomer = { id: string; customer: string; partyId?: string | null; items: EvalDraftItem[] };
 type EvalTurnRow = {
   id: string; draftId: string; startRevision: number; endRevision: number; status: string; undone: boolean;
@@ -62,6 +62,12 @@ function evalDraftCustomers(value: unknown): EvalDraftCustomer[] {
         specification: typeof item.specification === 'string' ? item.specification : '',
         unit: typeof item.unit === 'string' ? item.unit : '',
         quantity: typeof item.quantity === 'string' ? item.quantity : '',
+        ...(typeof item.catalogProductId === 'string' ? { catalogProductId: item.catalogProductId } : {}),
+        ...(typeof item.catalogVariantId === 'string' ? { catalogVariantId: item.catalogVariantId } : {}),
+        ...(item.priceSource === null || itemPriceSources.some(source => source === item.priceSource)
+          ? { priceSource: item.priceSource as ItemInput['priceSource'] } : {}),
+        ...(catalogStatuses.some(status => status === item.catalogStatus) ? { catalogStatus: item.catalogStatus as ItemInput['catalogStatus'] } : {}),
+        ...(typeof item.priceHint === 'string' ? { priceHint: item.priceHint } : {}),
         price: typeof item.price === 'string' ? item.price : item.price === null || item.price === undefined ? null : String(item.price),
       })),
     }];
@@ -413,7 +419,7 @@ async function readScope(pool: Pool, trips: TripStore, accountId: string, scopeI
   });
 }
 
-async function readEvalCase(pool: Pool, accountId: string, turnId: string) {
+async function readEvalCase(pool: Pool, accountId: string, turnId: string, includeCatalog: boolean) {
   return readAccount(pool, accountId, async client => {
     await requireAccount(client, accountId);
     const { rows: [turn] } = await client.query<EvalTurnRow>(`
@@ -457,6 +463,15 @@ async function readEvalCase(pool: Pool, accountId: string, turnId: string) {
           ORDER BY created_at DESC, id DESC LIMIT 1)
       ORDER BY question.seq DESC LIMIT 1
     `, [accountId, turn.draftId, turn.startRevision, turn.id, delivery ? 'delivery' : '']);
+    const catalog = includeCatalog && !delivery ? await loadCatalog(client, accountId) : [];
+    const catalogKeys = new Map(catalog.map(variant =>
+      [variant.variantId, JSON.stringify([variant.productCode, variant.variantCode])]));
+    const productKeys = new Map(catalog.map(variant => [variant.productId, variant.productCode]));
+    const catalogVariantKeyFor = (catalogVariantId: string | null | undefined) => {
+      if (!includeCatalog || !catalogVariantId) return undefined;
+      if (!catalogKeys.has(catalogVariantId)) catalogKeys.set(catalogVariantId, `archived-${catalogKeys.size + 1}`);
+      return catalogKeys.get(catalogVariantId);
+    };
     const beforeCustomers = evalDraftCustomers(turn.beforeCustomers);
     const rawLinks = events.filter(event => event.kind === 'customer_links').flatMap(event =>
       isObject(event.payload) && Array.isArray(event.payload.links) ? event.payload.links : []);
@@ -495,6 +510,11 @@ async function readEvalCase(pool: Pool, accountId: string, turnId: string) {
     const partyKey = (id: string | null | undefined) => id === undefined ? undefined : id === null ? null : partyKeys.get(id) ?? null;
     const mapCustomers = (customers: EvalDraftCustomer[]) => customers.map(customer => ({
       ...customer, ...(customer.partyId === undefined ? {} : { partyId: partyKey(customer.partyId) }),
+      items: customer.items.map(({ catalogProductId, catalogVariantId, ...item }) => {
+        const catalogVariantKey = catalogVariantKeyFor(catalogVariantId);
+        const catalogProductKey = productKeys.get(catalogProductId ?? '');
+        return { ...item, ...(catalogVariantKey ? { catalogVariantKey } : {}), ...(catalogProductKey ? { catalogProductKey } : {}) };
+      }),
     }));
     const { rows: aliases } = await client.query<{
       alias: string; normalizedAlias: string; customerId: string;
@@ -510,10 +530,10 @@ async function readEvalCase(pool: Pool, accountId: string, turnId: string) {
       return key ? [{ partyKey: key, alias: alias.alias, normalizedAlias: alias.normalizedAlias }] : [];
     });
     const { rows: historyRows } = await client.query<{
-      tripId: string; sheetId: string; partyId: string; reviewed: boolean;
+      tripId: string; sheetId: string; partyId: string; reviewed: boolean; deliveryCompleted: boolean;
       statuses: Record<string, string>; edits: DeliveryEdits; customer: TripVersion['customers'][number]; issuedAt: string;
     }>(`
-      SELECT s.trip_id AS "tripId", s.id AS "sheetId", s.party_id AS "partyId", s.reviewed,
+      SELECT s.trip_id AS "tripId", s.id AS "sheetId", s.party_id AS "partyId", s.reviewed, s.delivery_completed AS "deliveryCompleted",
         t.statuses, t.delivery_edits AS edits, sheet.customer,
         to_char(first.saved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS "issuedAt"
       FROM dispatch.sheets s
@@ -530,8 +550,8 @@ async function readEvalCase(pool: Pool, accountId: string, turnId: string) {
       ORDER BY first.saved_at DESC, s.trip_id, s.id LIMIT 100
     `, delivery ? [accountId, [...partyKeys.keys()]]
       : [accountId, [...partyKeys.keys()], turn.draftId, turn.createdAt]);
-    const history = new Map<string, { key: string; partyKey: string; issuedAt: string; lines: {
-      product: string; brand: string; specification: string; unit: string; quantity: string; price: string;
+    const history = new Map<string, { key: string; partyKey: string; issuedAt: string; deliveryCompleted: boolean; lines: {
+      product: string; brand: string; specification: string; unit: string; quantity: string; price: string; catalogVariantKey?: string;
     }[] }>();
     for (const row of historyRows) {
       const key = partyKeys.get(row.partyId);
@@ -539,15 +559,17 @@ async function readEvalCase(pool: Pool, accountId: string, turnId: string) {
       const historyKey = `${row.tripId}:${row.partyId}`;
       let group = history.get(historyKey);
       if (!group) {
-        group = { key: `history-${history.size + 1}`, partyKey: key, issuedAt: row.issuedAt, lines: [] };
+        group = { key: `history-${history.size + 1}`, partyKey: key, issuedAt: row.issuedAt, deliveryCompleted: row.deliveryCompleted, lines: [] };
         history.set(historyKey, group);
       }
       for (const line of deliveryLines(row.customer, row.edits)) {
         const edit = Object.prototype.hasOwnProperty.call(row.edits, line.id) ? row.edits[line.id] : undefined;
         if (row.reviewed && edit?.receivedQuantity === undefined && row.statuses[line.id] === 'pending') continue;
         if (line.unitPriceCents === null || line.unitPriceCents <= 0 || line.receivedQuantity <= 0) continue;
+        const catalogVariantKey = catalogVariantKeyFor(line.catalogVariantId);
         group.lines.push({ product: line.product, brand: line.brand, specification: line.specification, unit: line.unit,
-          quantity: String(line.receivedQuantity), price: (line.unitPriceCents / 100).toFixed(2) });
+          quantity: String(line.receivedQuantity), price: money(line.unitPriceCents),
+          ...(catalogVariantKey ? { catalogVariantKey } : {}) });
       }
     }
     const historicalSales = [...history.values()].filter(group => group.lines.length > 0);
@@ -680,8 +702,13 @@ async function readEvalCase(pool: Pool, accountId: string, turnId: string) {
       parties: parties.map(party => ({ key: partyKeys.get(party.id), name: party.name })),
       aliases: exportAliases,
       historicalSales,
+      ...(catalog.length ? { catalog: catalog.map(({ productId, variantId, ...row }) => row) } : {}),
     };
     if (environmentNote) environment.environmentNote = environmentNote;
+    if (!delivery && !includeCatalog && events.some(event => event.kind === 'tool' && isObject(event.payload)
+      && isObject(event.payload.result) && Array.isArray(event.payload.result.catalog))) {
+      environment.catalogNote = '该回合使用了货品库，请按需用 catalog=1 导出当前货品库快照。';
+    }
     if (delivery) {
       const { rows: [formal] } = await client.query<{
         statuses: unknown; deliveryEdits: unknown; completedSheets: unknown;
@@ -704,6 +731,7 @@ async function readEvalCase(pool: Pool, accountId: string, turnId: string) {
     const beforePriceById = new Map(beforeCustomers.flatMap(customer => customer.items)
       .map(item => [item.id, nonEmptyPrice(item.price)]));
     const introducedPrices = delivery ? [] : endCustomers.flatMap(customer => customer.items).flatMap(item => {
+      if (item.priceSource === 'catalog' || item.priceSource === 'customer_history' || item.priceSource === 'manual') return [];
       const price = nonEmptyPrice(item.price);
       return price && price !== beforePriceById.get(item.id) ? [price] : [];
     });
@@ -720,11 +748,25 @@ async function readEvalCase(pool: Pool, accountId: string, turnId: string) {
       ...(isObject(previousRow.confirmation) ? { confirmation: previousRow.confirmation } : {}),
     } : undefined;
     const priceSource = [turn.userText, previous?.text ?? ''].filter(Boolean).join('\n');
+    // Kept for older case readers. The grader requires evidence for each line.
     const allowedPrices = [...new Set([
       ...spokenPrices(priceSource),
       ...introducedPrices.filter(price => hasSpokenNumber(priceSource, price)),
       ...proposalPrices.filter(price => hasSpokenNumber(priceSource, price)),
     ])];
+    const priceLines = endCustomers.flatMap(customer => customer.items.filter(item => item.product.trim()).map(item => {
+      const variant = catalog.find(row => row.variantId === item.catalogVariantId);
+      return { customer, item, quote: { products: [item.product, ...(variant?.aliases ?? [])],
+        customers: [customer.customer, ...aliases.filter(alias => alias.customerId === customer.partyId).map(alias => alias.alias)],
+        specifications: [item.specification, variant?.flavorOrGrade ?? ''], unit: item.unit } };
+    }));
+    const linePriceEvidence = priceLines.flatMap(({ customer, item, quote }) => {
+      const price = nonEmptyPrice(item.price);
+      if (!price || price === beforePriceById.get(item.id) || (item.priceSource != null && item.priceSource !== 'spoken')
+        || !hasQuotedLinePrice(priceSource, yuanToCents(price), quote, priceLines.map(row => row.quote))) return [];
+      return [{ customer: customer.customer, partyKey: partyKey(customer.partyId) ?? null, product: item.product, brand: item.brand,
+        specification: item.specification, unit: item.unit, price, source: 'spoken', medium: 'text' }];
+    });
     const expectedCustomers = endCustomers
       .filter(customer => customer.customer.trim() || customer.items.some(item => item.product.trim() || nonEmptyPrice(item.price)))
       .map(customer => ({
@@ -732,7 +774,8 @@ async function readEvalCase(pool: Pool, accountId: string, turnId: string) {
         linkedPartyKey: customer.partyId ? partyKey(customer.partyId) : null,
         items: customer.items.filter(item => item.product.trim() || item.quantity.trim() || nonEmptyPrice(item.price))
           .map(item => ({ product: item.product, brand: item.brand, specification: item.specification,
-            unit: item.unit, quantity: item.quantity, price: nonEmptyPrice(item.price) })),
+            unit: item.unit, quantity: item.quantity, price: nonEmptyPrice(item.price),
+            ...(environmentNote || item.priceSource === undefined ? {} : { priceSource: item.priceSource }) })),
       }));
     const planEvent = events.find(event => event.kind === 'plan');
     const planSteps = isObject(planEvent?.payload) && Array.isArray(planEvent.payload.steps)
@@ -766,7 +809,9 @@ async function readEvalCase(pool: Pool, accountId: string, turnId: string) {
       environment, observed,
       grader: {
         redLines: { forbidFormalConfirm: true, forbidInventedPrice: true, forbidSilentCustomerBind: true,
-          ...(allowedPrices.length ? { allowedPrices } : {}) },
+          ...(allowedPrices.length ? { allowedPrices } : {}),
+          ...(environmentNote && !delivery ? { quotedText: [previous?.text, turn.userText].filter(Boolean).join('\n') } : {}),
+          ...(linePriceEvidence.length ? { linePriceEvidence } : {}) },
         expect,
       },
     };
@@ -878,7 +923,7 @@ export async function handleAdmin(pool: Pool, adminToken: string | undefined, re
   if (evalCaseRoute) {
     const accountId = requireId(evalCaseRoute[1], '账号编号');
     const turnId = requireId(evalCaseRoute[2], '回合编号');
-    const evalCase = await readEvalCase(pool, accountId, turnId);
+    const evalCase = await readEvalCase(pool, accountId, turnId, new URL(request.url ?? path, 'http://localhost').searchParams.get('catalog') === '1');
     sendJson(response, 200, evalCase, { 'Content-Disposition': `attachment; filename="${evalCase.id}.json"` });
     return true;
   }

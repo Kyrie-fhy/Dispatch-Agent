@@ -1,6 +1,14 @@
+export const catalogStatuses = ['active', 'discontinued', 'unmatched', 'ambiguous', 'unit_mismatch', 'external'] as const;
+export const itemPriceSources = ['spoken', 'manual', 'customer_history', 'catalog'] as const;
+
 export interface ItemInput {
   id: string; product: string; brand: string; specification: string;
   unit: string; quantity: string; price: string | null;
+  catalogProductId?: string | null;
+  catalogVariantId?: string | null;
+  catalogStatus?: typeof catalogStatuses[number] | null;
+  priceSource?: typeof itemPriceSources[number] | null;
+  priceHint?: string | null;
 }
 export interface Draft { id: string; revision: number; customer: string; items: ItemInput[] }
 export interface OrderLine extends ItemInput { amountCents: number | null; unitPriceCents?: number | null }

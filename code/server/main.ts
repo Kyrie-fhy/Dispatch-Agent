@@ -10,6 +10,7 @@ import { Pool } from 'pg';
 import { databaseOptions, requireApplicationRole, trialMode } from './database';
 import { readAmendmentInput, readSaveDraft } from './draft-input';
 import { AmendmentStore } from './amendments';
+import { CatalogStore } from './catalog';
 import { DraftStore } from './drafts';
 import { DeliveryStore, readDeliveryApply } from './delivery';
 import { LedgerStore } from './ledger';
@@ -71,7 +72,7 @@ function resourceId(path: string, collection: 'drafts' | 'trips'): string | null
 }
 
 async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery: DeliveryStore, ledger: LedgerStore, amendments: AmendmentStore,
-  materials: MaterialStore, textOrders: TextOrders, agent: AgentRuntime, memory: MemoryStore, request: IncomingMessage, response: ServerResponse,
+  materials: MaterialStore, textOrders: TextOrders, agent: AgentRuntime, memory: MemoryStore, catalog: CatalogStore, request: IncomingMessage, response: ServerResponse,
   wechat?: WechatLogin, speechModel?: SpeechModel, adminToken?: string): Promise<void> {
   const host = request.headers.host ?? '';
   if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host)) {
@@ -137,6 +138,14 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
       throw new HttpError(400, 'invalid_id', '请提供有效的草稿编号');
     }
     sendJson(response, 200, await memory.agentMemory(account, id));
+    return;
+  }
+  if (method === 'GET' && path === '/v1/catalog/summary') {
+    sendJson(response, 200, await catalog.summary(account));
+    return;
+  }
+  if (method === 'POST' && path === '/v1/agent/catalog-choice') {
+    sendJson(response, 200, await catalog.chooseDraftCatalog(account, await readJson(request, response)));
     return;
   }
   if (method === 'POST' && path === '/v1/agent/customer-choice') {
@@ -350,11 +359,12 @@ export async function startLocalServer(pool: Pool, port: number, wechat?: Wechat
   const amendments = new AmendmentStore(pool);
   const materials = new MaterialStore(pool);
   const memory = new MemoryStore(pool);
+  const catalog = new CatalogStore(pool);
   const textOrders = new TextOrders(pool, textModel, imageModel);
   const agent = new AgentRuntime(pool, trips, textOrders, agentModel, intentModel, deliveryModel);
   await agent.store.interrupt();
   const server = createServer({ requestTimeout: 15_000 }, (request, response) => {
-    void handle(pool, store, trips, delivery, ledger, amendments, materials, textOrders, agent, memory, request, response,
+    void handle(pool, store, trips, delivery, ledger, amendments, materials, textOrders, agent, memory, catalog, request, response,
       wechat, speechModel, adminToken).catch(error => {
       if (response.destroyed) return;
       if (error instanceof HttpError) {

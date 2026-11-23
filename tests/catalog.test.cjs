@@ -1,0 +1,237 @@
+const assert = require('node:assert/strict');
+const { test } = require('node:test');
+const {
+  catalogCsvColumns, extractCatalogAliases, hasQuotedLinePrice, matchCatalogChoice, matchCatalogItem, parseCatalogCsv, resolveCatalogAutoPrice,
+} = require('../code/dist/core/catalog');
+const { lookupDeliveredPrice, lookupHistoricalPrice, collectHistoricalSales } = require('../code/dist/core/memory');
+const { isDraft, preview } = require('../code/dist/core/orders');
+const { pickingList, previewTrip } = require('../code/dist/core/trips');
+
+const record = (overrides = {}) => ({
+  code: 'P1', variant: '1', category: '冻品', original: '禾味丸120克', brand: '禾味', product: '鱼肉丸',
+  packaging: '120g(原写120)', spec: '单规格', unit: '箱', price: '6.01', status: '在售', verified: '已核实',
+  remarks: '', ...overrides,
+});
+const escapeCsv = value => '"' + value.replaceAll('"', '""') + '"';
+const csv = rows => '\uFEFF' + [catalogCsvColumns, ...rows.map(row => Object.values(row))]
+  .map(row => row.map(escapeCsv).join(',')).join('\r\n');
+const variants = rows => parseCatalogCsv(csv(rows)).map(row => ({
+  ...row, productId: row.productCode, variantId: row.productCode + '/' + row.variantCode,
+}));
+const line = (overrides = {}) => ({
+  id: 'line-a', product: '鱼肉丸', brand: '', specification: '', unit: '箱', quantity: '2', price: null, ...overrides,
+});
+const priceFor = (item, rows, customerId, sales) =>
+  resolveCatalogAutoPrice(item, matchCatalogItem(item, rows), customerId, sales);
+
+test('catalog CSV validates shape, decimal cents, status, duplicate variants, and quoted cells before import', () => {
+  const [row] = parseCatalogCsv(csv([record({ remarks: '包装印「海味鱼丸」\n说明："冷冻",已核实' })]));
+  assert.equal(row.priceCents, 601);
+  assert.equal(row.specification, '120g');
+  assert.ok(row.aliases.includes('海味鱼丸'));
+  assert.equal(parseCatalogCsv(csv([record({ price: '90071992547409.91' })]))[0].priceCents, Number.MAX_SAFE_INTEGER);
+  for (const price of ['0', '0.00', '6.001', '6e2', '¥6', '-1', '01', '90071992547409.92']) {
+    assert.throws(() => parseCatalogCsv(csv([record({ price })])), /挂牌价/);
+  }
+  assert.throws(() => parseCatalogCsv(csv([record(), record({ price: '7' })])), /重复/);
+  assert.throws(() => parseCatalogCsv(csv([record({ status: '待上架' })])), /销售状态/);
+  assert.throws(() => parseCatalogCsv(csv([record()]).replace('详情核实状态', '核实')), /表头/);
+  assert.throws(() => parseCatalogCsv(csv([record()]).replace(/,""$/, '')), /13 列/);
+  assert.throws(() => parseCatalogCsv(csv([record()]).slice(0, -1)), /引号未闭合/);
+});
+
+test('catalog aliases use packaging and correction cues without treating negative remarks as aliases', () => {
+  const patterns = [
+    '包装全称「词」', '包装印「词」', '包装实印「词」', '包装实际印「词」', '包装上印有「词」',
+    '包装品名「词」', '包装名称「词」', '包装标注「词」', '包装写着「词」', '包装印着「词」',
+    '建议加别名「词」', '建议添加别名「词」', '建议补充别名「词」', '可增加别名「词」', '新增别名「词」',
+    '设为别名「词」', '记为别名「词」', '用作别名「词」', '别名为「词」', '原名写「词」',
+    '原商品名标为「词」', '原名叫「词」', '原写词', '原标：词', '原记词（旧称）', '原称词',
+    '实际「词」', '实为「词」', '应为「词」', '更正为「词」', '又称「词」', '简称「词」',
+  ];
+  patterns.forEach((pattern, index) => {
+    const alias = '示例别称' + index;
+    assert.deepEqual(extractCatalogAliases(' 原商品 ', '管理页无「坏别名」；' + pattern.replace('词', alias)), ['原商品', alias], pattern);
+  });
+  assert.deepEqual(extractCatalogAliases(' Ａ丸 ', '建议加别名「a丸」；原写120；包装印「禾味丸」'), ['Ａ丸', '禾味丸']);
+});
+
+test('catalog differentiates brand clues from product aliases and matches qualified forms only', () => {
+  const rows = variants([
+    record({ brand: '海湾', remarks: '包装全称「海湾食品厂」；包装印「海味鱼丸」；包装全称「海湾牌鱼肉丸」' }),
+    record({ code: 'P2', brand: '', product: '素馅丸', original: '素丸120g', remarks: '包装品牌似为「绿田」；厂牌「新绿田」' }),
+    record({ code: 'P3', brand: '北湾', product: '虾肉丸', original: '湾虾丸', remarks: '品牌全称「北湾食品」' }),
+  ]);
+  assert.deepEqual(rows[0].brandAliases, ['海湾食品厂']);
+  for (const input of [
+    { brand: '海湾食品厂' }, { product: '海湾食品厂鱼肉丸' }, { product: '海湾食品厂海味鱼丸' },
+    { product: '海味鱼丸' }, { product: '海湾牌鱼肉丸' },
+  ]) assert.equal(matchCatalogItem(line(input), rows).status, 'active');
+  assert.equal(matchCatalogItem(line({ product: '素馅丸', brand: '绿田' }), rows).status, 'active');
+  assert.equal(matchCatalogItem(line({ product: '新绿田素馅丸' }), rows).status, 'active');
+  assert.equal(matchCatalogItem(line({ product: '虾肉丸', brand: '北湾食品' }), rows).status, 'active');
+  for (const input of [
+    { product: '海湾食品厂' }, { product: '绿田' }, { product: '北湾食品' }, { brand: '北湾食品' },
+  ]) assert.equal(matchCatalogItem(line(input), rows).status, 'unmatched');
+});
+
+test('catalog matching aligns aliases and exact specs, preserves distinct flavors and grades in picking', () => {
+  const rows = variants([
+    record({ remarks: '包装印「海味鱼丸」' }),
+    record({ code: 'P2', original: '脆皮饺', product: '饺子', packaging: '500g（原写500克）', spec: '韭菜鸡蛋' }),
+    record({ code: 'P2', variant: '2', original: '脆皮饺', product: '饺子', packaging: '500克', spec: '芹菜猪肉' }),
+    record({ code: 'P2', variant: '3', original: '脆皮饺', product: '饺子', packaging: '500克', spec: '芹菜猪肉', unit: '袋' }),
+    record({ code: 'P3', original: '生虾仁', product: '虾仁', packaging: '10公斤', spec: '40–50' }),
+    record({ code: 'P3', variant: '2', original: '生虾仁', product: '虾仁', packaging: '10kg', spec: '110-130' }),
+    record({ code: 'P4', product: '金汤包', packaging: '200g', spec: '20盒 / 箱' }),
+  ]);
+  const aligned = priceFor(line({ product: '海味鱼丸' }), rows);
+  assert.deepEqual([aligned.product, aligned.brand, aligned.specification, aligned.price, aligned.priceSource],
+    ['鱼肉丸', '禾味', '120g', '6.01', 'catalog']);
+  assert.equal(rows.at(-1).flavorOrGrade, null);
+  assert.equal(matchCatalogItem(line({ product: '饺子', specification: '500g' }), rows).status, 'ambiguous');
+  assert.equal(matchCatalogItem(line({ product: '饺子', unit: '袋' }), rows).status, 'ambiguous');
+  assert.equal(matchCatalogItem(line({ product: '虾仁', specification: '10kg' }), rows).status, 'ambiguous');
+  const input = [
+    line({ id: 'A', product: '脆皮饺', specification: '500克韭菜鸡蛋' }),
+    line({ id: 'B', product: '禾味饺子芹菜猪肉' }),
+    line({ id: 'C', product: '虾仁', specification: '40-50' }),
+    line({ id: 'D', product: '虾仁', specification: '10kg·110-130' }),
+  ];
+  const items = input.map(item => priceFor(item, rows));
+  assert.deepEqual(items.map(item => item.specification), ['500g·韭菜鸡蛋', '500g·芹菜猪肉', '10kg·40-50', '10kg·110-130']);
+  const draft = { id: 'draft', revision: 1, customers: [{ id: 'customer', customer: '新店', items }] };
+  const result = previewTrip(draft, true);
+  assert.equal(pickingList(result.customers).length, 4);
+  assert.equal(result.totalCents, 4808);
+});
+
+test('catalog leaves missing units, cross-unit prices, ambiguous products, discontinued items and external products unpriced', () => {
+  const rows = variants([
+    ...Array.from({ length: 26 }, (_, index) => record({ code: 'U' + index, product: '无单位冻品' + index, unit: '' })),
+    record({ code: 'P1', price: '15', spec: '20盒/箱' }),
+    record({ code: 'P1', variant: '2', unit: '盒', price: '0.80', spec: '1盒' }),
+    record({ code: 'P2', original: '旧鱼肉丸', brand: '回味', status: '已下架' }),
+  ]);
+  assert.equal(rows.filter(row => row.unit === null).length, 26);
+  rows.slice(0, 26).forEach(row => {
+    const actual = priceFor(line({ product: row.product }), rows);
+    assert.equal(actual.catalogStatus, 'unit_mismatch');
+    assert.equal(actual.price, null);
+    assert.match(actual.priceHint, /¥6.01（未标箱价）/);
+  });
+  const input = line();
+  const ambiguous = matchCatalogItem(input, rows);
+  assert.equal(ambiguous.status, 'ambiguous');
+  assert.deepEqual(ambiguous.candidates.map(row => row.status), ['active', 'active', 'discontinued']);
+  assert.equal(priceFor(input, rows).price, null);
+  const mismatched = priceFor(line({ brand: '禾味', unit: '件' }), rows);
+  assert.equal(mismatched.price, null);
+  assert.equal(mismatched.priceHint, '库内仅记 箱 ¥15.00 / 盒 ¥0.80');
+  const discontinued = priceFor(line({ brand: '回味' }), rows);
+  assert.equal(discontinued.catalogStatus, 'discontinued');
+  assert.equal(discontinued.price, null);
+  assert.match(discontinued.priceHint, /已下架/);
+  assert.equal(priceFor(line({ product: '临时新品' }), rows).catalogStatus, 'unmatched');
+  const external = priceFor(line({ catalogStatus: 'external' }), rows);
+  assert.deepEqual([external.catalogStatus, external.price, external.catalogVariantId], ['external', null, null]);
+  for (const item of [input, line({ brand: '回味' }), line({ unit: '桶' }), line({ product: '临时新品' })]) {
+    for (const source of ['spoken', 'manual']) {
+      const priced = priceFor({ ...item, price: '5.50', priceSource: source }, rows);
+      assert.deepEqual([priced.price, priced.priceSource], ['5.50', source]);
+    }
+  }
+  assert.ok(isDraft({ id: 'draft', revision: 1, customer: '试验店', items: [mismatched] }));
+  assert.equal(preview({ id: 'draft', revision: 1, customer: '试验店', items: [mismatched] }, true).items[0].amountCents, null);
+});
+
+test('picked products with absent or different units keep their alignment and never use another price', () => {
+  const rows = variants([
+    record({ code: 'P1', brand: '', unit: '箱', price: '9' }),
+    record({ code: 'P1', variant: '2', brand: '', unit: '盒', price: '3' }),
+    record({ code: 'P2', brand: '', unit: '', price: '2.50' }),
+    record({ code: 'P3', brand: '西味', unit: '盒', price: '5', status: '已下架' }),
+  ]);
+  const draft = line();
+  assert.equal(matchCatalogItem(draft, rows).status, 'ambiguous');
+  for (const [variant, status, hint] of [
+    [rows[1], 'unit_mismatch', '库内仅记 盒 ¥3.00'],
+    [rows[2], 'unit_mismatch', '库内仅记 ¥2.50（未标箱价）'],
+    [rows[3], 'discontinued', '已下架，请核实库存。 库内仅记 盒 ¥5.00'],
+  ]) {
+    const selected = resolveCatalogAutoPrice(draft, matchCatalogChoice(draft, variant));
+    assert.deepEqual([selected.product, selected.brand, selected.specification, selected.unit],
+      [variant.product, variant.brand, variant.specification, draft.unit]);
+    assert.deepEqual([selected.catalogProductId, selected.catalogVariantId, selected.catalogStatus, selected.price, selected.priceSource, selected.priceHint],
+      [variant.productId, null, status, null, null, hint]);
+    const updated = priceFor({ ...selected, quantity: '4' }, rows);
+    assert.deepEqual([updated.catalogProductId, updated.catalogStatus, updated.price, updated.priceHint],
+      [variant.productId, status, null, hint]);
+    for (const priceSource of ['spoken', 'manual']) {
+      const priced = resolveCatalogAutoPrice({ ...draft, price: '8.80', priceSource }, matchCatalogChoice(draft, variant));
+      assert.deepEqual([priced.price, priced.priceSource], ['8.80', priceSource]);
+    }
+  }
+  assert.equal(matchCatalogItem({ ...draft, catalogProductId: rows[2].productId }, rows).status, 'unit_mismatch');
+});
+
+test('catalog history uses completed delivery, actual receipt, strict variant/unit and latest sheet conflict', () => {
+  const rows = variants([record()]);
+  const variant = rows[0];
+  const sale = (extra = {}) => ({
+    customerId: 'one', tripId: 'trip-one', sheetId: 'sheet-one', issuedAt: '2026-01-01T00:00:00.000001Z',
+    linePosition: 0, productName: variant.product, brand: variant.brand, spec: '120克', unit: '箱',
+    receivedQuantity: 2, unitPriceCents: 501, deliveryCompleted: true, ...extra,
+  });
+  const sales = [
+    sale(), sale({ customerId: 'two', unitPriceCents: 200, issuedAt: '2026-01-05T00:00:00Z' }),
+    sale({ deliveryCompleted: false, unitPriceCents: 300, issuedAt: '2026-01-06T00:00:00Z' }),
+    sale({ receivedQuantity: 0, unitPriceCents: 310, issuedAt: '2026-01-07T00:00:00Z' }),
+    sale({ catalogVariantId: 'other', unitPriceCents: 400, issuedAt: '2026-01-08T00:00:00Z' }),
+    sale({ unit: '盒', unitPriceCents: 410, issuedAt: '2026-01-09T00:00:00Z' }),
+  ];
+  assert.equal(priceFor(line(), rows, 'one', sales).price, '5.01');
+  assert.equal(priceFor(line(), rows, 'one', sales).priceSource, 'customer_history');
+  assert.equal(priceFor(line(), rows, null, sales).price, '6.01');
+  assert.equal(priceFor(line({ price: '9', priceSource: 'spoken' }), rows, 'one', sales).price, '9');
+  const modern = sale({ catalogVariantId: variant.variantId, productName: '改名前的旧货名', tripId: 'newer',
+    issuedAt: '2026-01-02T00:00:00Z', unitPriceCents: 480 });
+  assert.equal(priceFor(line(), rows, 'one', [...sales, modern]).price, '4.80');
+  const conflict = [modern, { ...modern, linePosition: 1, unitPriceCents: 470 }];
+  const noPrice = priceFor(line(), rows, 'one', [...sales, ...conflict]);
+  assert.equal(noPrice.price, null);
+  assert.match(noPrice.priceHint, /多个成交价/);
+  const request = { productName: variant.product, brand: variant.brand, spec: '120克', unit: '箱', catalogVariantId: variant.variantId };
+  assert.equal(lookupDeliveredPrice(sales, 'one', request).unitPriceCents, 501);
+  assert.equal(lookupHistoricalPrice(sales.slice(0, 3), 'one', request).unitPriceCents, 300);
+
+  const item = { ...line({ price: '5.01', catalogVariantId: variant.variantId }), unitPriceCents: 501 };
+  const historical = { tripId: 'trip', sheetId: 'sheet', issuedAt: sale().issuedAt, customerId: 'one', reviewed: true,
+    deliveryCompleted: true, customer: { items: [item, { ...item, id: 'zero' }, { ...item, id: 'pending' }] },
+    statuses: { pending: 'pending' }, edits: { zero: { receivedQuantity: 0 } } };
+  assert.deepEqual(collectHistoricalSales([historical]).map(row => [row.catalogVariantId, row.receivedQuantity]), [[variant.variantId, 2]]);
+});
+
+test('quoted price evidence belongs to the specified item, customer and unit', () => {
+  const carrot = { products: ['香菇丸'], customers: ['甲店'], unit: '箱' };
+  const duplicate = { ...carrot, customers: ['乙店'] };
+  const other = { products: ['荠菜饺'], customers: ['甲店'], unit: '盒' };
+  const candidates = [carrot, duplicate, other];
+  const source = '甲店香菇丸2箱，八十二一箱，荠菜饺2盒按六块；乙店香菇丸3箱，90元';
+  assert.equal(hasQuotedLinePrice(source, 8200, carrot, candidates), true);
+  assert.equal(hasQuotedLinePrice(source, 8200, duplicate, candidates), false);
+  assert.equal(hasQuotedLinePrice(source, 8200, other, candidates), false);
+  assert.equal(hasQuotedLinePrice(source, 600, other, candidates), true);
+  assert.equal(hasQuotedLinePrice(source, 9000, duplicate, candidates), true);
+  assert.equal(hasQuotedLinePrice('甲店香菇丸要82箱', 8200, carrot), false);
+  assert.equal(hasQuotedLinePrice('甲店香菇丸80元/盒', 8000, carrot), false);
+});
+
+test('the complete brand-qualified mention owns a quote ahead of a product-name suffix', () => {
+  const earlier = { products: ['鱼肉丸', '禾味鱼肉丸'], customers: ['试验店'], unit: '箱' };
+  const later = { products: ['水湾鱼肉丸', '鱼肉丸'], customers: ['试验店'], unit: '箱' };
+  for (const text of ['试验店水湾鱼肉丸两箱每箱12元', '试验店每箱12元水湾鱼肉丸两箱']) {
+    assert.equal(hasQuotedLinePrice(text, 1200, later, [earlier, later]), true);
+    assert.equal(hasQuotedLinePrice(text, 1200, earlier, [earlier, later]), false);
+  }
+});

@@ -2,7 +2,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
 import { emptyTrip, TripDraft } from '../miniprogram/core/trips';
 import { setAccount, transaction } from './database';
-import { SaveDraftInput } from './draft-input';
+import { reconcileManualItem, SaveDraftInput } from './draft-input';
 import { missingDraft, readAccount, readParties, readWorkspace, workspaceDraft, writeAccount } from './account-workspace';
 import { HttpError } from './http-error';
 
@@ -95,7 +95,13 @@ export class DraftStore {
           throw new HttpError(400, 'invalid_customer', '未找到所选客户，请重新选择');
         }
       }
-      const saved = workspaceDraft({ ...draft, revision: current.revision + 1, currentTripId: current.currentTripId });
+      const oldLines = new Map(current.customers.flatMap(customer => customer.items.map(item =>
+        [item.id, { item, partyId: customer.partyId, customerId: customer.id }] as const)));
+      const customers = draft.customers.map(customer => ({ ...customer, items: customer.items.map(item => {
+        const prior = oldLines.get(item.id);
+        return reconcileManualItem(item, prior?.item, prior?.partyId === customer.partyId && prior?.customerId === customer.id);
+      }) }));
+      const saved = workspaceDraft({ ...draft, customers, revision: current.revision + 1, currentTripId: current.currentTripId });
       await client.query(`UPDATE dispatch.workspaces SET draft_revision = $2, draft_customers = $3
         WHERE account_id = $1`, [accountId, saved.revision, JSON.stringify(saved.customers)]);
       return saved;

@@ -12,6 +12,7 @@
     "check:docs": "node scripts/check-docs.cjs",
     "check": "npm run typecheck && npm run build:s4 && npm test && npm run check:docs",
     "build:server": "tsc -p tsconfig.server.json",
+    "catalog:import": "npm run build:server && node code/server-dist/server/import-catalog.js",
     "db:migrate": "npm run build:server && node code/server-dist/server/migrate.js",
     "serve:local": "npm run build:server && node code/server-dist/server/main.js",
     "test:server": "npm run build:server && node --test tests/server/*.test.cjs",

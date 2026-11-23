@@ -131,6 +131,9 @@ export interface HistoricalSale extends VariantPrice {
   customerId: string;
   productName: string;
   linePosition: number;
+  deliveryCompleted?: boolean;
+  receivedQuantity?: number;
+  catalogVariantId?: string | null;
 }
 
 export interface HistoricalSheet {
@@ -142,6 +145,7 @@ export interface HistoricalSheet {
   statuses: Trip['statuses'];
   edits: Record<string, Partial<DeliveryEdit> | undefined>;
   reviewed: boolean;
+  deliveryCompleted?: boolean;
 }
 
 export type HistoricalPrice =
@@ -150,7 +154,7 @@ export type HistoricalPrice =
   | { status: 'no_match' };
 
 export function collectHistoricalSales(sheets: readonly HistoricalSheet[]): HistoricalSale[] {
-  return sheets.flatMap(({ tripId, sheetId, issuedAt, customerId, customer, statuses, edits, reviewed }) => {
+  return sheets.flatMap(({ tripId, sheetId, issuedAt, customerId, customer, statuses, edits, reviewed, deliveryCompleted }) => {
     if (!customerId) return [];
     return customer.items.flatMap((item, linePosition) => {
       const edit = Object.prototype.hasOwnProperty.call(edits, item.id) ? edits[item.id] : undefined;
@@ -162,6 +166,8 @@ export function collectHistoricalSales(sheets: readonly HistoricalSheet[]): Hist
         || (reviewed && edit?.receivedQuantity === undefined && statuses[item.id] === 'pending')) return [];
       return [{
         customerId, tripId, sheetId, issuedAt, linePosition, unitPriceCents,
+        ...(deliveryCompleted === undefined ? {} : { deliveryCompleted, receivedQuantity }),
+        ...(item.catalogVariantId === undefined ? {} : { catalogVariantId: item.catalogVariantId }),
         productName: item.product, brand: item.brand ?? '', spec: item.specification ?? '', unit: item.unit,
       }];
     });
@@ -217,6 +223,27 @@ export function lookupHistoricalPrice(sales: readonly HistoricalSale[], customer
     ...variantPrice(latest), status: exact ? 'exact_match' : 'unique_variant_match',
     previousDistinctPrice: previous ? priceSource(previous) : null,
   };
+}
+
+export function lookupDeliveredPrice(sales: readonly HistoricalSale[], customerId: string,
+  product: ProductMention & { catalogVariantId: string }): ({ status: 'matched' } & PriceSource)
+  | { status: 'no_match' | 'conflict' } {
+  const key = (text: string | null | undefined) =>
+    normalizeMemoryText(text?.normalize('NFKC')).replace(/\s+/g, '').replace(/[‐‑–—－]/g, '-')
+      .replace(/(\d)(千克|公斤|克)/g, (_, number: string, unit: string) => number + (unit === '克' ? 'g' : 'kg'));
+  const unit = key(product.unit);
+  if (!unit) return { status: 'no_match' };
+  const matches = sales.filter(sale => sale.customerId === customerId && sale.deliveryCompleted === true
+    && (sale.receivedQuantity === undefined || (Number.isSafeInteger(sale.receivedQuantity) && sale.receivedQuantity > 0))
+    && Number.isSafeInteger(sale.unitPriceCents) && sale.unitPriceCents > 0 && key(sale.unit) === unit
+    && (sale.catalogVariantId ? sale.catalogVariantId === product.catalogVariantId
+      : key(sale.productName) === key(product.productName) && key(sale.brand) === key(product.brand) && key(sale.spec) === key(product.spec)))
+    .sort(laterSaleFirst);
+  const latest = matches[0];
+  if (!latest) return { status: 'no_match' };
+  if (matches.some(sale => sale.tripId === latest.tripId && sale.sheetId === latest.sheetId
+    && sale.unitPriceCents !== latest.unitPriceCents)) return { status: 'conflict' };
+  return { status: 'matched', ...priceSource(latest) };
 }
 
 export interface DraftPriceLine extends ProductMention {

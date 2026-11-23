@@ -79,19 +79,41 @@ export function suggestCatalogChoices(draft: TripDraft, catalog: readonly Catalo
 }
 
 function groundedCatalogDetails(item: ItemInput, previous: ItemInput | undefined, source: string,
-  catalog: readonly CatalogVariant[]): ItemInput {
+  catalog: readonly CatalogVariant[]): { item: ItemInput; unitGrounded: boolean } {
   const brand = catalogKey(item.brand);
   const specification = catalogKey(normalizeCatalogSpec(item.specification));
   const brandMentioned = (name: string) => Boolean(name && source.includes(name));
-  const hasBrand = !brand || item.brand === previous?.brand || brandMentioned(brand) || catalog.some(variant => {
-    const names = [variant.brand, ...(variant.brandAliases ?? [])].map(catalogKey);
-    return names.includes(brand) && names.some(brandMentioned);
+  const brandFamilyMentioned = (target: string) => brandMentioned(target) || catalog.some(variant => {
+    const names = [variant.brand, ...(variant.brandAliases ?? [])].map(catalogKey).filter(Boolean);
+    return names.includes(target) && names.some(brandMentioned);
   });
+  const hasBrand = !brand || item.brand === previous?.brand || brandFamilyMentioned(brand);
+  // Strip an ungrounded catalog brand prefix glued onto product (e.g. "秋丰鸭血" when source only says "鸭血").
+  let product = item.product;
+  if (product && product !== previous?.product) {
+    const productKey = catalogKey(product);
+    const catalogBrands = [...new Set(catalog.flatMap(variant => [variant.brand, ...(variant.brandAliases ?? [])])
+      .filter(Boolean))].sort((a, b) => b.length - a.length);
+    for (const candidateBrand of catalogBrands) {
+      const candidateKey = catalogKey(candidateBrand);
+      if (!candidateKey || brandFamilyMentioned(candidateKey) || !productKey.startsWith(candidateKey)) continue;
+      const stripped = product.trim().replace(new RegExp(`^${candidateBrand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*`, 'i'), '').trim();
+      if (stripped && stripped.length < product.trim().length && source.includes(catalogKey(stripped))) {
+        product = stripped;
+        break;
+      }
+    }
+  }
   // A package such as 500g must not match the tail of 1500g or 1.500g.
   const escapedSpec = specification.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const hasSpec = !specification || item.specification === previous?.specification ||
     new RegExp((/^\d/.test(specification) ? '(?<![\\d.])' : '') + escapedSpec).test(source);
-  return { ...item, brand: hasBrand ? item.brand : '', specification: hasSpec ? item.specification : '' };
+  const unitKey = catalogKey(item.unit);
+  const unitGrounded = !unitKey || item.unit === previous?.unit || source.includes(unitKey);
+  return {
+    item: { ...item, product, brand: hasBrand ? item.brand : '', specification: hasSpec ? item.specification : '' },
+    unitGrounded,
+  };
 }
 
 export async function applyCatalogToDraft(client: PoolClient, accountId: string, draft: TripDraft, before: TripDraft,
@@ -120,9 +142,14 @@ export async function applyCatalogToDraft(client: PoolClient, accountId: string,
   const targets = draft.customers.flatMap(customer => customer.items.filter(item => item.product.trim() || changedItems.has(item)).map(item => {
     const previous = previously.get(item.id);
     const aliases = directory?.aliases.filter(alias => alias.customerId === customer.partyId) ?? [];
-    const input = normalizedSource !== undefined && changedItems.has(item)
-      ? groundedCatalogDetails(item, previous?.item, normalizedSource, variants) : item;
-    const match = matchCatalogItem(input, variants);
+    const grounded = normalizedSource !== undefined && changedItems.has(item)
+      ? groundedCatalogDetails(item, previous?.item, normalizedSource, variants)
+      : { item, unitGrounded: true };
+    const input = grounded.item;
+    const rawMatch = matchCatalogItem(input, variants);
+    const match: CatalogMatch = !grounded.unitGrounded && 'variant' in rawMatch
+      ? { status: 'unit_mismatch', candidates: [rawMatch.variant], hint: '原话未提到该计价单位，请核对单位后再配价' }
+      : rawMatch;
     const matchedVariants = 'variant' in match ? [match.variant] : match.candidates;
     return { item, input, match, quote: {
       products: [input.product, previous?.item.product ?? '', ...matchedVariants.flatMap(variant => variant.aliases)],
@@ -153,10 +180,6 @@ export async function applyCatalogToDraft(client: PoolClient, accountId: string,
         && (previous.priceSource == null || previous.priceSource === 'manual' || previous.priceSource === 'spoken');
       candidate = { ...input, price: protectPrevious ? previous.price : null,
         priceSource: protectPrevious ? previous.priceSource : null };
-    }
-    if ((candidate.priceSource === 'catalog' || candidate.priceSource === 'customer_history' || !candidate.price)
-      && quoted.length === 1) {
-      candidate = { ...candidate, price: money(quoted[0]), priceSource: 'spoken' };
     }
     const next = resolveCatalogAutoPrice(candidate, match, customer.partyId, sales);
     if (imagePrice && next.price === null && yuanToCents(incomingPrice) > 0) {

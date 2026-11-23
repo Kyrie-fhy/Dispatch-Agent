@@ -104,7 +104,7 @@ test('catalog migration, import, pricing and choices through isolated PostgreSQL
         add('称呼未匹配', '喻记馄饨'),
       ] });
       if (text.includes('临时冻品')) return toolReply('edit_draft', { operations: [
-        add('口述店', '春蔬饺'), add('口述店', '临时冻品'),
+        add('口述店', '春蔬饺'), add('口述店', '临时冻品', { price: '22.50' }),
         add('口述店', '南原鸭血', { brand: '南原', price: '12.00' }),
       ] });
       if (text.includes('口述店')) return toolReply('edit_draft', { operations: [add('口述店', '鸭血')] });
@@ -449,22 +449,44 @@ test('catalog draft writes distinguish raw quotes, guarded model output and cata
   const before = { id: 'draft', revision: 0, customers: [] };
   const customer = { id: 'customer', customer: '小店', items: [
     item('虾圆仔', { price: '81', quantity: '81' }),
-    item('春蔬饺'), item('香酥卷', { price: '7' }),
-    item('临时品', { unit: '袋' }),
+    item('春蔬饺', { price: '50' }), item('香酥卷', { price: '7' }),
+    item('临时品', { unit: '袋', price: '5' }),
+    item('临时肠'),
   ] };
   const draft = { ...before, revision: 1, customers: [customer] };
   const result = await applyCatalogToDraft(client, 'account', draft, before, catalog,
-    '小店要81箱虾圆仔，两箱春蔬饺，单价50元；两箱香酥卷，单价7元；临时品2袋每袋5元。');
+    '小店要81箱虾圆仔，两箱春蔬饺，单价50元；两箱香酥卷，单价7元；临时品2袋每袋5元；临时肠两箱，这两箱加起来80元。');
   assert.deepEqual(state(draft).map(line => [line.product, line.price, line.catalogStatus, line.priceSource]), [
     ['虾丸', '130.00', 'active', 'catalog'],
-    ['春蔬饺', '50.00', 'ambiguous', 'spoken'],
+    ['春蔬饺', '50', 'ambiguous', 'spoken'],
     ['香酥卷', '7', 'unit_mismatch', 'spoken'],
-    ['临时品', '5.00', 'unmatched', 'spoken'],
+    ['临时品', '5', 'unmatched', 'spoken'],
+    ['临时肠', null, 'unmatched', null],
   ]);
-  assert.deepEqual(result.changes.map(row => row.input.product), ['虾圆仔', '春蔬饺', '香酥卷', '临时品']);
+  assert.deepEqual(result.changes.map(row => row.input.product), ['虾圆仔', '春蔬饺', '香酥卷', '临时品', '临时肠']);
   const copy = structuredClone(draft);
   assert.deepEqual(await applyCatalogToDraft(client, 'account', draft, before, []), { lines: [], changes: [] });
   assert.deepEqual(draft, copy);
+});
+
+test('catalog strips ungrounded brand prefixes, guards ungrounded units, and clears price when swapping product', async () => {
+  const catalog = variants(original);
+  const client = { query: async () => ({ rows: [] }) };
+  const duckDraft = draftWith(item('秋丰鸭血'));
+  await applyCatalogToDraft(client, 'account', duckDraft, draftWith(), catalog, '甲店要两箱鸭血');
+  assert.deepEqual([state(duckDraft)[0].product, state(duckDraft)[0].catalogStatus, state(duckDraft)[0].price],
+    ['鸭血', 'ambiguous', null]);
+
+  const unitDraft = draftWith(item('虾丸', { unit: '箱' }));
+  await applyCatalogToDraft(client, 'account', unitDraft, draftWith(), catalog, '甲店要两袋虾丸');
+  assert.deepEqual([state(unitDraft)[0].catalogStatus, state(unitDraft)[0].price], ['unit_mismatch', null]);
+
+  const swapBefore = draftWith(item('虾丸', { brand: '北禾', specification: '1kg', price: '40', priceSource: 'spoken' }));
+  const swapped = prepareEdits(swapBefore, { operations: [{ action: 'update', target: 1, product: '临时肠' }] },
+    [], '虾丸换成临时肠', undefined, false, undefined, true);
+  await applyCatalogToDraft(client, 'account', swapped.draft, swapBefore, catalog, '虾丸换成临时肠');
+  assert.deepEqual([state(swapped.draft)[0].product, state(swapped.draft)[0].price, state(swapped.draft)[0].priceSource],
+    ['临时肠', null, null]);
 });
 
 test('catalog matches changed brand and spec only when the utterance supports them', async () => {

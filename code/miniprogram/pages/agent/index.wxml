@@ -196,8 +196,10 @@
                       <view class="inline-customer-line">
                         <input class="inline-customer-input" value="{{inlineCustomerDrafts[unnamed.id]}}" placeholder="输入客户店名"
                           data-customer="{{unnamed.id}}" bindinput="editInlineCustomerName" />
-                        <button class="card-btn-primary inline-customer-save" disabled="{{busy || polling}}"
-                          data-customer="{{unnamed.id}}" bindtap="saveInlineCustomerName">保存店名</button>
+                        <button class="inline-customer-save" aria-label="保存店名" disabled="{{busy || polling}}"
+                          data-customer="{{unnamed.id}}" bindtap="saveInlineCustomerName">
+                          <image class="inline-customer-save-icon" src="/pages/agent/icons/check.svg" />
+                        </button>
                       </view>
                       <view wx:if="{{quickCustomers.length}}" class="quick-customers">
                         <text class="quick-customers-label">点选常用熟客</text>

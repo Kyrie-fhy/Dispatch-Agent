@@ -163,20 +163,39 @@ page {
   border-radius: var(--radius-md);
 }
 .inline-customer-label { color: var(--ink-2); font-size: 28rpx; font-weight: 600; }
-.inline-customer-line { display: flex; align-items: center; gap: 14rpx; }
+.inline-customer-line { display: flex; align-items: center; gap: 14rpx; width: 100%; }
 .inline-customer-input {
-  flex: 1;
+  flex: 1 1 0;
+  width: 0;
   min-width: 0;
   box-sizing: border-box;
   height: 80rpx;
-  padding: 0 18rpx;
+  padding: 0 20rpx;
   background: var(--surface-sunken);
   border: 1rpx solid var(--hairline-strong);
   border-radius: var(--radius-md);
   font-size: 30rpx;
   line-height: 80rpx;
 }
-.inline-customer-save { flex: none; width: 200rpx; height: 80rpx; font-size: 30rpx; }
+.inline-customer-save {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 80rpx;
+  width: 80rpx;
+  min-width: 80rpx;
+  max-width: 80rpx;
+  height: 80rpx;
+  margin: 0;
+  padding: 0;
+  background: var(--primary);
+  border-radius: var(--radius-md);
+  line-height: 1;
+}
+.inline-customer-save::after { border: 0; }
+.inline-customer-save:active { background: var(--primary-pressed); }
+.inline-customer-save[disabled] { opacity: 0.4; background: var(--primary); }
+.inline-customer-save-icon { width: 38rpx; height: 38rpx; }
 .quick-customers { display: flex; flex-direction: column; gap: 10rpx; }
 .quick-customers-label { color: var(--ink-3); font-size: 28rpx; }
 .quick-customers-list { display: flex; flex-wrap: wrap; gap: 12rpx; }
@@ -492,5 +511,5 @@ page {
 .sheet-actions { display: flex; gap: 16rpx; }
 .sheet-actions .sheet-btn { flex: 1 1 0; min-width: 0; height: 88rpx; }
 .sheet-name-input { height: 80rpx; }
-.sheet-save { width: 100%; height: 88rpx; margin-top: 4rpx; }
-.sheet-cancel { width: 100%; height: 80rpx; }
+.sheet-save { flex: none; width: 100%; height: 88rpx; margin-top: 4rpx; }
+.sheet-cancel { flex: none; width: 100%; height: 80rpx; }

@@ -2133,9 +2133,12 @@ test('6.5-10 keeps the new sheets native, equal-width and reachable', () => {
   for (const token of ['openPriceDrawer', 'savePriceDrawer', 'applyRefPrice', 'saveInlineCustomerName',
     'pickQuickCustomer', 'openCustomerSheet', 'saveCustomerSheet', '改单位/规格',
     '也可直接发语音一次报多行单价', '待填价货品', 'scroll-into-view="{{priceDrawerFocusId}}"',
-    'id="pf-{{row.lineId}}"', '保存全部', '保存店名', 'drawer-price-input num']) {
+    'id="pf-{{row.lineId}}"', '保存全部', '保存店名', 'drawer-price-input num',
+    '/pages/agent/icons/check.svg', 'class="inline-customer-save"']) {
     assert.ok(agentWxml.includes(token), `缺少速填抽屉结构 ${token}`);
   }
+  assert.equal(agentWxml.includes('card-btn-primary inline-customer-save'), false,
+    '就地填店名保存图标按钮不得继承全宽 card-btn-primary');
   for (const token of ['z-index: 100', 'env(safe-area-inset-bottom)', 'height: 88rpx', 'height: 80rpx',
     '.drawer-price-input', '.sheet-mask']) {
     assert.ok(agentWxss.includes(token), `缺少抽屉样式 ${token}`);

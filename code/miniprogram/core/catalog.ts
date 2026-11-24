@@ -34,7 +34,7 @@ export function catalogKey(value: string | null | undefined): string {
 }
 
 export function normalizeCatalogSpec(value: string): string {
-  return value.trim().normalize('NFKC').replace(/\s*\(\s*(?:原写|原标|原记)[^()]*\)/g, '').trim()
+  return value.trim().normalize('NFKC').replace(/\s*\(\s*(?:原写|原标|原记|详情页标)[^()]*\)/g, '').trim()
     .replace(/(\d)\s*(千克|公斤|克|kg|g|ml|l)(?![a-z])/gi,
       (_, number: string, unit: string) => number + ({ 千克: 'kg', 公斤: 'kg', 克: 'g' }[unit] ?? unit.toLowerCase()))
     .replace(/[‐‑–—－]/g, '-');

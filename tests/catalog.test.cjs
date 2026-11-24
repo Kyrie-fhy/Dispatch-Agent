@@ -394,10 +394,13 @@ test('catalog crosses soft spec slots but locks weight, flavor and unit hard slo
   assert.deepEqual(parseSpecTokens('9寸披萨'), {
     fullDetail: '9寸披萨', hardSpecs: ['9寸'], textSpecs: ['披萨'], tokens: ['9寸', '披萨'],
   });
-  // Parenthetical notes in catalog packaging still expose the hard weight for matching.
+  // Parenthetical notes in catalog packaging normalize cleanly and still match the hard weight.
   const notedRows = variants([record({ code: 'N1', brand: '甲厂', product: '锁鲜鱼籽包', packaging: '240g(详情页标240克)', unit: '袋', price: '9.80' })]);
+  assert.equal(notedRows[0].specification, '240g');
   const noted = priceFor(line({ brand: '甲厂', product: '鱼籽包', specification: '锁鲜装 240g', unit: '袋' }), notedRows);
   assert.deepEqual([noted.catalogStatus, noted.price], ['active', '9.80']);
+  const legacyNoted = priceFor(line({ brand: '甲厂', product: '锁鲜鱼籽包', specification: '240g(详情页标240g)', unit: '袋' }), notedRows);
+  assert.deepEqual([legacyNoted.catalogStatus, legacyNoted.price], ['active', '9.80']);
 });
 
 test('quoted price evidence belongs to the specified item, customer and unit', () => {

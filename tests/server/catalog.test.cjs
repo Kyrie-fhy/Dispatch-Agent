@@ -880,3 +880,80 @@ test('catalog Harness replays CSV and structured snapshots against isolated Post
     });
   }
 });
+
+test('catalog re-prices unit and specification edits on draft save while keeping manual prices', { timeout: 90_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const api = await start(db, {}, Number(process.env.DISPATCH_API_PORT || 0));
+  try {
+    const token = await login(api, 'a');
+    const catalog = new CatalogStore(db.owner);
+    await catalog.importCsv('dev:a', csv(original));
+    const unitLine = randomUUID();
+    const specLine = randomUUID();
+    let draft = await read(api, token);
+    draft = await saveCustomers(api, token, draft, [{ id: randomUUID(), customer: '甲店', partyId: null, items: [
+      item('虾丸', { id: unitLine, brand: '北禾', specification: '1kg', unit: '盒' }),
+      item('虾丸', { id: specLine, brand: '北禾', specification: '', unit: '箱' }),
+    ] }]);
+    let [boxLine, specGap] = state(draft);
+    assert.deepEqual([boxLine.price, boxLine.priceSource, boxLine.catalogStatus], [null, undefined, undefined],
+      '全新明细保持既有行为，保存时不自动配价');
+    assert.deepEqual([specGap.price, specGap.catalogStatus], [null, undefined]);
+
+    draft = await saveCustomers(api, token, draft, [{ id: draft.customers[0].id, customer: '甲店', partyId: null,
+      items: [{ ...boxLine, unit: '箱' }, specGap] }]);
+    let lines = state(draft);
+    assert.deepEqual([lines[0].unit, lines[0].price, lines[0].priceSource, lines[0].catalogStatus],
+      ['箱', '130.00', 'catalog', 'active'], '改单位保存后自动带出库内价');
+    assert.ok(lines[0].catalogVariantId, '改单位保存后记录命中的库内规格');
+    assert.equal(lines[0].priceHint, null);
+
+    draft = await saveCustomers(api, token, draft, [{ id: draft.customers[0].id, customer: '甲店', partyId: null,
+      items: [lines[0], { ...lines[1], specification: '1kg' }] }]);
+    lines = state(draft);
+    assert.deepEqual([lines[1].specification, lines[1].price, lines[1].priceSource, lines[1].catalogStatus],
+      ['1kg', '130.00', 'catalog', 'active'], '补齐规格保存后自动带出库内价');
+
+    draft = await saveCustomers(api, token, draft, [{ id: draft.customers[0].id, customer: '甲店', partyId: null,
+      items: [{ ...lines[0], unit: '袋', price: '99.50' }, lines[1]] }]);
+    lines = state(draft);
+    assert.deepEqual([lines[0].unit, lines[0].price, lines[0].priceSource], ['袋', '99.50', 'manual'],
+      '同时改单位并手填单价时严格保留手填价');
+
+    draft = await saveCustomers(api, token, draft, [{ id: draft.customers[0].id, customer: '甲店', partyId: null,
+      items: [lines[0], { ...lines[1], unit: '袋' }] }]);
+    lines = state(draft);
+    assert.deepEqual([lines[1].unit, lines[1].price, lines[1].catalogStatus],
+      ['袋', null, 'unit_mismatch'], '仍不匹配的单位继续留空');
+    assert.match(lines[1].priceHint, /库内仅记 箱 ¥130\.00/);
+  } finally {
+    await api.stop();
+  }
+});
+
+test('catalog re-prices a unit edit from a delivered customer price', { timeout: 90_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const api = await start(db, {}, Number(process.env.DISPATCH_API_PORT || 0));
+  try {
+    const token = await login(api, 'a');
+    const catalog = new CatalogStore(db.owner);
+    const { accountId } = await catalog.importCsv('dev:a', csv(original));
+    await confirmSale(api, token, '熟客店', [canonical('125')], { completed: true });
+    const { rows: [party] } = await db.owner.query(
+      "SELECT id FROM dispatch.parties WHERE account_id = $1 AND name = '熟客店'", [accountId]);
+    assert.ok(party, '正式单生成后应有熟客档案');
+    let draft = await read(api, token);
+    draft = await saveCustomers(api, token, draft, [{ id: randomUUID(), customer: '熟客店', partyId: party.id, items: [
+      item('虾丸', { brand: '北禾', specification: '1kg', unit: '盒' }),
+    ] }]);
+    const [pending] = state(draft);
+    assert.equal(pending.price, null);
+    draft = await saveCustomers(api, token, draft, [{ id: draft.customers[0].id, customer: '熟客店', partyId: party.id,
+      items: [{ ...pending, unit: '箱' }] }]);
+    const [priced] = state(draft);
+    assert.deepEqual([priced.unit, priced.price, priced.priceSource, priced.catalogStatus],
+      ['箱', '125.00', 'customer_history', 'active'], '改单位保存后自动带出熟客价');
+  } finally {
+    await api.stop();
+  }
+});

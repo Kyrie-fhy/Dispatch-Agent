@@ -1,6 +1,6 @@
-import type { AgentEvent, AgentStatus, AgentTurn, DeliveryCardState, DeliveryProgress, DeliveryProposal, DirectIntent, PlanStep, StepState } from '../../core/agent';
+import type { AgentEvent, AgentStatus, AgentTurn, DeliveryCardState, DeliveryProgress, DeliveryProposal, DirectIntent, PlanStep, Question, StepState } from '../../core/agent';
 import type { CustomerMention, DraftPriceSuggestion } from '../../core/memory';
-import { money } from '../../core/orders';
+import { money, nullablePrice, validTextPrice } from '../../core/orders';
 import type { ItemInput } from '../../core/orders';
 import { materialImagePattern, Material, MaterialSource } from '../../core/materials';
 import { textOrderLimit, textOrderQuestions } from '../../core/text-order';
@@ -11,7 +11,7 @@ import { chooseMaterial, forgetStaged, materialInfo, sameMaterial, stagedMateria
   transferMaterial } from '../../services/materials';
 import { readVoiceFile, startVoiceRecording, transcribeVoice, VoiceFileError } from '../../services/voice';
 import { revokeSession, wechatCode, WorkspaceError, workspaceRequest } from '../../services/workspace';
-import { errorMessage, catalogHintText, lineMetaLabel, lineNameOnly, priceSourceLabel, productLabel, tripView } from '../order-view';
+import { errorMessage, catalogHintText, catalogReferencePrices, lineMetaLabel, lineNameOnly, priceSourceLabel, productLabel, tripView } from '../order-view';
 
 type Conversation = { draft: TripDraft; draftConfirmed: boolean; confirmedPreviewId?: string | null; turns: AgentTurn[]; delivery?: DeliveryProgress | null };
 type PollResult = { status: AgentStatus; events: AgentEvent[] };
@@ -41,6 +41,12 @@ type PriceOption = { cents: number; text: string; brand?: string; spec?: string 
 type PriceHint = { draftCustomerId: string; lineId: string; text: string; options: PriceOption[]; adoptable: boolean };
 type PriceAdoptLine = { draftCustomerId: string; lineId: string; unitPriceCents: number;
   variant?: { brand: string; spec: string } };
+type QuestionView = Question & { missingCustomer: boolean };
+type PriceDrawerRow = { lineId: string; draftCustomerId: string; customerName: string; showCustomer: boolean;
+  productName: string; quantity: string; unit: string; price: string; metaLabel: string; discontinued: boolean;
+  refButtons: { value: string; label: string }[]; showSpec: boolean;
+  inputUnit: string; inputSpecification: string; originalUnit: string; originalSpecification: string };
+type CustomerSheet = { id: string; label: string; value: string };
 const draftConflicts = ['draft_changed', 'draft_confirmed', 'draft_not_found', 'preview_not_found', 'material_draft_changed'];
 const choiceConflicts = ['draft_changed', 'draft_confirmed', 'draft_not_found', 'agent_busy', 'customer_already_linked',
   'customer_not_linked', 'draft_customer_not_found'];
@@ -107,7 +113,7 @@ function view(turn: AgentTurn, revision: number, confirmed: boolean, last: boole
   let undone = false;
   let end: Extract<AgentEvent, { kind: 'end' }>['payload'] | undefined;
   let preview: Extract<AgentEvent, { kind: 'preview' }>['payload']['preview'] | undefined;
-  let questions: Extract<AgentEvent, { kind: 'questions' }>['payload']['questions'] = [];
+  let questions: Question[] = [];
   let proposal: DeliveryProposal | undefined;
   let deliveryState: DeliveryCardState | undefined;
   let links: { draftCustomerId: string; spoken: string; label: string }[] = [];
@@ -140,6 +146,11 @@ function view(turn: AgentTurn, revision: number, confirmed: boolean, last: boole
   if (!(last && !confirmed && !undone && turn.status === 'completed')) links = [];
   questions = questions.filter(question => !draft || !question.text.includes('是哪家熟客？')
     || draft.customers.some(customer => customer.partyId === undefined && customer.customer.trim() === (question.customer || '').trim()));
+  // 补好店名后旧追问立即消失，仍在缺口时再给出就地填写入口。
+  questions = questions.filter(question => !draft || !question.text.includes('客户名称')
+    || draft.customers.some(customer => !customer.customer.trim()));
+  const questionViews: QuestionView[] = questions.map(question =>
+    ({ ...question, missingCustomer: question.text.includes('客户名称') }));
   const showChoices = Boolean(last && !confirmed && turn.status === 'completed');
   const issued = Boolean(latestPreview && confirmed && preview && preview.previewId === confirmedPreviewId);
   const skipped = Boolean(preview && !issued &&
@@ -192,7 +203,7 @@ function view(turn: AgentTurn, revision: number, confirmed: boolean, last: boole
   const draftHasLines = Boolean(draft?.customers.some(customer => customer.items.some(line =>
     line.product || line.quantity || line.price || line.brand || line.specification)));
   const showChangeList = Boolean(changes.length) && !(showDraftSummary && draftHasLines && !undone);
-  return { id: turn.id, text: turn.text, pictures: turn.materialIds.length, checklist, questions, changes, undone, issued, links, showChoices,
+  return { id: turn.id, text: turn.text, pictures: turn.materialIds.length, checklist, questions: questionViews, changes, undone, issued, links, showChoices,
     status: turn.status, runningStepText, summaryText, showChangeList,
     reply: changes.length && end?.text === '草稿已更新。' ? '' : end?.text ?? '',
     elapsed: end?.elapsedMs === undefined ? '' : `用时 ${Math.max(1, Math.round(end.elapsedMs / 1000))} 秒`,
@@ -220,9 +231,9 @@ function draftSummary(draft: TripDraft, pending: number) {
   type SummaryLine = { id: string; product: string; nameOnly: string; metaLabel: string; quantity: string; unit: string;
     price: string; pending: boolean; priceSource: string; priceSourceLabel: string; discontinued: boolean;
     priceHint: string; catalogHint: string; secondaryText: string };
-  type SummaryCustomer = { id: string; name: string; lines: SummaryLine[] };
+  type SummaryCustomer = { id: string; name: string; unnamed: boolean; lines: SummaryLine[] };
   const customers: SummaryCustomer[] = draft.customers.map(customer => ({
-    id: customer.id, name: customer.customer || '未命名客户',
+    id: customer.id, name: customer.customer || '未命名客户', unnamed: !customer.customer.trim(),
     lines: customer.items.filter(line => line.product || line.quantity || line.price || line.brand || line.specification)
       .map(line => {
         const metaLabel = lineMetaLabel(line);
@@ -252,8 +263,10 @@ function draftSummary(draft: TripDraft, pending: number) {
   }
   const alertText = [pendingCount ? `${pendingCount} 样待填价` : '',
     discontinuedCount ? `${discontinuedCount} 样已下架，请查库存` : ''].filter(Boolean).join(' · ');
+  const unnamedCustomers = draft.customers.flatMap((customer, index) => customer.customer.trim()
+    ? [] : [{ id: customer.id, label: `第 ${index + 1} 位客户` }]);
   return { customers, hasLines: lines > 0, lineCount: lines, pendingCount, discontinuedCount, overLimit,
-    hiddenCount: Math.max(0, lines - 8), previewCustomers, alertText,
+    hiddenCount: Math.max(0, lines - 8), previewCustomers, alertText, unnamedCustomers,
     label: `当前整单 · ${customers.length} 家 ${lines} 样${issues ? `，${issues} 处待确认` : ''}` };
 }
 
@@ -273,6 +286,9 @@ Page({
     choices: [] as ChoiceView[], memoryNames: [] as string[], rememberOff: {} as Record<string, boolean>,
     memoryFailed: false, notice: '', priceHints: {} as Record<string, PriceHint>, adoptableCount: 0,
     catalogChoices: [] as CatalogChoiceView[],
+    memoryCustomers: [] as { id: string; name: string }[], quickCustomers: [] as { id: string; name: string }[],
+    priceDrawerOpen: false, priceDrawerRows: [] as PriceDrawerRow[], priceDrawerError: '', priceDrawerFocusId: '',
+    customerSheet: null as CustomerSheet | null, inlineCustomerDrafts: {} as Record<string, string>,
   },
   draft: null as TripDraft | null,
   turns: [] as AgentTurn[],
@@ -334,7 +350,8 @@ Page({
       scrollTo: '', draftSummary: null, deliverySummary: null, navTitle: '录单助手', focusInput: false, draftExpanded: false,
       issuedCard: false, voiceRetry: false, inputMode: 'text', revokeFailed: !!this.retiredToken,
       voiceCorrectionHint: '', choices: [], memoryNames: [], rememberOff: {}, memoryFailed: false, notice: '', priceHints: {}, adoptableCount: 0,
-      catalogChoices: [] });
+      catalogChoices: [], memoryCustomers: [], quickCustomers: [], priceDrawerOpen: false, priceDrawerRows: [],
+      priceDrawerError: '', priceDrawerFocusId: '', customerSheet: null, inlineCustomerDrafts: {} });
     applyNavTitle('录单助手');
   },
 
@@ -449,6 +466,8 @@ Page({
             : resolution.status === 'candidate_only' ? '像下面这几家' : '熟客里没有这个叫法' });
     }
     const memoryNames = memory ? memory.customers.map(customer => customer.name) : [];
+    const memoryCustomers = memory ? memory.customers.map(customer => ({ id: customer.id, name: customer.name })) : [];
+    const quickCustomers = memoryCustomers.slice(0, 8);
     const catalogChoices: CatalogChoiceView[] = [];
     if (memory && this.draft) for (const choice of memory.catalogChoices ?? []) {
       const customer = this.draft.customers.find(entry => entry.id === choice.draftCustomerId);
@@ -480,7 +499,7 @@ Page({
         : '送货助手');
     this.setData({ turns, scrollTo: '', issuedCard: turns.some(turn => turn.issued),
       deliverySummary, draftSummary: draftInfo, navTitle, choices, memoryNames, priceHints, adoptableCount,
-      catalogChoices });
+      catalogChoices, memoryCustomers, quickCustomers });
     this.setData({ scrollTo: 'latest' });
     applyNavTitle(navTitle);
   },
@@ -547,6 +566,26 @@ Page({
       if (error instanceof WorkspaceError && error.status < 500) this.pending.delete(key);
       throw error;
     });
+  },
+
+  putRequest<T>(path: string, input: object) {
+    const key = JSON.stringify(['PUT', path, input]);
+    let requestId = this.pending.get(key);
+    if (!requestId) {
+      requestId = newId();
+      this.pending.set(key, requestId);
+    }
+    return workspaceRequest<T>('PUT', path, agentSession.token, { ...input, requestId }).then(result => {
+      this.pending.delete(key);
+      return result;
+    }, error => {
+      if (error instanceof WorkspaceError && error.status < 500) this.pending.delete(key);
+      throw error;
+    });
+  },
+
+  notify(text: string) {
+    if (typeof wx.showToast === 'function') wx.showToast({ title: text, icon: 'none' });
   },
 
   card(action: string) {
@@ -756,6 +795,229 @@ Page({
       } catch (error) {
         await this.reloadAfterConflict(error, choiceConflicts);
         throw error;
+      }
+    });
+  },
+
+  openCustomerSheet(event: WechatMiniprogram.TouchEvent): void {
+    if (this.data.confirmed || this.data.busy || this.data.polling) return;
+    const id = String(event.currentTarget.dataset.customer ?? '');
+    const customer = this.draft?.customers.find(entry => entry.id === id);
+    if (!customer) return;
+    this.setData({ error: '', customerSheet: { id, label: customer.customer.trim() || '未命名客户',
+      value: this.data.inlineCustomerDrafts[id] ?? customer.customer } });
+  },
+
+  closeCustomerSheet(): void {
+    this.setData({ customerSheet: null });
+  },
+
+  editInlineCustomerName(event: WechatMiniprogram.Input) {
+    const id = String(event.currentTarget.dataset.customer ?? '');
+    if (!id) return;
+    this.setData({ inlineCustomerDrafts: { ...this.data.inlineCustomerDrafts, [id]: event.detail.value } });
+  },
+
+  editSheetCustomerName(event: WechatMiniprogram.Input) {
+    if (!this.data.customerSheet) return;
+    this.setData({ customerSheet: { ...this.data.customerSheet, value: event.detail.value } });
+  },
+
+  saveInlineCustomerName(event: WechatMiniprogram.TouchEvent): Promise<void> | undefined {
+    const id = String(event.currentTarget.dataset.customer ?? '');
+    if (!id) return;
+    return this.saveCustomerName(id, this.data.inlineCustomerDrafts[id] ?? '', () => {
+      const rest = { ...this.data.inlineCustomerDrafts };
+      delete rest[id];
+      this.setData({ inlineCustomerDrafts: rest });
+    });
+  },
+
+  saveCustomerSheet(): Promise<void> | undefined {
+    const sheet = this.data.customerSheet;
+    if (!sheet) return;
+    return this.saveCustomerName(sheet.id, sheet.value, () => this.setData({ customerSheet: null }));
+  },
+
+  pickQuickCustomer(event: WechatMiniprogram.TouchEvent): Promise<void> | undefined {
+    const draftCustomerId = String(event.currentTarget.dataset.customer ?? '');
+    const customerId = String(event.currentTarget.dataset.party ?? '');
+    if (!draftCustomerId || !customerId) return;
+    return this.associateCustomer(draftCustomerId, customerId);
+  },
+
+  pickCustomerForUnnamed(event: WechatMiniprogram.PickerChange): Promise<void> | undefined {
+    const draftCustomerId = String(event.currentTarget.dataset.customer ?? '');
+    const customer = this.memory?.customers[Number(event.detail.value)];
+    if (!draftCustomerId || !customer) return;
+    return this.associateCustomer(draftCustomerId, customer.id);
+  },
+
+  async associateCustomer(draftCustomerId: string, customerId: string): Promise<void> {
+    await this.choose({ draftCustomerId, choice: 'existing', customerId, remember: false });
+    if (this.data.error) return;
+    const rest = { ...this.data.inlineCustomerDrafts };
+    delete rest[draftCustomerId];
+    this.setData({ customerSheet: null, inlineCustomerDrafts: rest });
+  },
+
+  async saveCustomerName(draftCustomerId: string, raw: string, onSaved: () => void): Promise<void> {
+    const trimmed = (raw ?? '').trim();
+    if (!trimmed) {
+      this.setData({ notice: '请先输入客户名称' });
+      this.notify('请先输入客户名称');
+      return;
+    }
+    const draft = this.draft;
+    if (!draft || !agentSession.token || this.data.busy) return;
+    const matched = (this.memory?.customers ?? []).find(customer => sameName(customer.name, trimmed));
+    if (matched) {
+      await this.choose({ draftCustomerId, choice: 'existing', customerId: matched.id, remember: false });
+      if (this.data.error) return;
+      onSaved();
+      if (typeof wx.showToast === 'function') wx.showToast({ title: '已保存店名', icon: 'success' });
+      return;
+    }
+    await this.run(async () => {
+      try {
+        const customers = draft.customers.map(customer => customer.id === draftCustomerId
+          ? { ...customer, customer: trimmed } : customer);
+        await this.putRequest(`/drafts/${draft.id}`, { revision: draft.revision, customers });
+        onSaved();
+        await this.reload();
+        if (typeof wx.showToast === 'function') wx.showToast({ title: '已保存店名', icon: 'success' });
+      } catch (error) {
+        await this.reloadAfterConflict(error, draftConflicts);
+        throw error;
+      }
+    });
+  },
+
+  buildPriceRows(): PriceDrawerRow[] {
+    const draft = this.draft;
+    if (!draft) return [];
+    const rows: PriceDrawerRow[] = draft.customers.flatMap(customer => customer.items
+      .filter(line => Boolean(line.product.trim()) && nullablePrice(line.price) === null).map(line => {
+        const discontinued = line.catalogStatus === 'discontinued';
+        return { lineId: line.id, draftCustomerId: customer.id,
+          customerName: customer.customer.trim() || '未命名客户', showCustomer: false,
+          productName: lineNameOnly(line), quantity: line.quantity, unit: line.unit, price: '',
+          metaLabel: [lineMetaLabel(line), catalogHintText(line.priceHint, discontinued)].filter(Boolean).join(' · '),
+          discontinued, refButtons: catalogReferencePrices(line.priceHint),
+          showSpec: false, inputUnit: line.unit, inputSpecification: line.specification,
+          originalUnit: line.unit, originalSpecification: line.specification };
+      }));
+    const customerCount = new Set(rows.map(row => row.draftCustomerId)).size;
+    return rows.map(row => ({ ...row, showCustomer: customerCount > 1 }));
+  },
+
+  openPriceDrawer(event?: WechatMiniprogram.TouchEvent): void {
+    if (!this.draft || this.data.confirmed || this.data.busy || this.data.polling) return;
+    const rows = this.buildPriceRows();
+    if (!rows.length) {
+      this.setData({ priceDrawerOpen: false, priceDrawerRows: [], priceDrawerFocusId: '', priceDrawerError: '' });
+      this.notify('当前没有待填价货品');
+      return;
+    }
+    const lineId = String(event?.currentTarget.dataset.line ?? '');
+    this.setData({ priceDrawerOpen: true, priceDrawerRows: rows, priceDrawerError: '',
+      priceDrawerFocusId: lineId && rows.some(row => row.lineId === lineId) ? `pf-${lineId}` : '' });
+  },
+
+  closePriceDrawer(): void {
+    this.setData({ priceDrawerOpen: false, priceDrawerRows: [], priceDrawerError: '', priceDrawerFocusId: '' });
+  },
+
+  editPriceDrawerPrice(event: WechatMiniprogram.Input) {
+    const lineId = String(event.currentTarget.dataset.line ?? '');
+    this.setData({ priceDrawerRows: this.data.priceDrawerRows.map(row =>
+      row.lineId === lineId ? { ...row, price: event.detail.value } : row) });
+  },
+
+  applyRefPrice(event: WechatMiniprogram.TouchEvent) {
+    const lineId = String(event.currentTarget.dataset.line ?? '');
+    const value = String(event.currentTarget.dataset.value ?? '');
+    if (!value) return;
+    this.setData({ priceDrawerRows: this.data.priceDrawerRows.map(row =>
+      row.lineId === lineId ? { ...row, price: value } : row) });
+  },
+
+  toggleDrawerSpec(event: WechatMiniprogram.TouchEvent) {
+    const lineId = String(event.currentTarget.dataset.line ?? '');
+    this.setData({ priceDrawerRows: this.data.priceDrawerRows.map(row =>
+      row.lineId === lineId ? { ...row, showSpec: !row.showSpec } : row) });
+  },
+
+  editPriceDrawerField(event: WechatMiniprogram.Input) {
+    const lineId = String(event.currentTarget.dataset.line ?? '');
+    const field = String(event.currentTarget.dataset.field ?? '');
+    if (field !== 'unit' && field !== 'specification') return;
+    this.setData({ priceDrawerRows: this.data.priceDrawerRows.map(row => row.lineId !== lineId
+      ? row : { ...row, [field === 'unit' ? 'inputUnit' : 'inputSpecification']: event.detail.value }) });
+  },
+
+  validatePriceDrawer(rows: PriceDrawerRow[]): string {
+    for (const row of rows) {
+      const price = row.price.trim();
+      if (price && !validTextPrice(price)) return `${row.productName}：单价需大于 0，最多两位小数`;
+      if (row.inputUnit.trim() !== row.originalUnit.trim() && !row.inputUnit.trim()) {
+        return `${row.productName}：单位不能为空`;
+      }
+    }
+    return '';
+  },
+
+  priceDrawerCustomers(): TripDraft['customers'] | null {
+    const draft = this.draft;
+    if (!draft) return null;
+    const rows = new Map(this.data.priceDrawerRows.map(row => [row.lineId, row]));
+    let changed = false;
+    const customers = draft.customers.map(customer => ({ ...customer, items: customer.items.map(item => {
+      const row = rows.get(item.id);
+      if (!row) return item;
+      const price = row.price.trim() || null;
+      const unit = row.inputUnit.trim();
+      const specification = row.inputSpecification.trim();
+      if (price !== nullablePrice(item.price) || unit !== item.unit || specification !== item.specification) {
+        changed = true;
+      }
+      return { ...item, price, unit, specification };
+    }) }));
+    return changed ? customers : null;
+  },
+
+  savePriceDrawer(): Promise<void> | undefined {
+    const draft = this.draft;
+    if (!draft || this.data.busy) return;
+    const invalid = this.validatePriceDrawer(this.data.priceDrawerRows);
+    if (invalid) {
+      this.setData({ priceDrawerError: invalid });
+      return;
+    }
+    const customers = this.priceDrawerCustomers();
+    if (!customers) {
+      this.closePriceDrawer();
+      return;
+    }
+    this.setData({ priceDrawerError: '' });
+    return this.run(async () => {
+      try {
+        await this.putRequest(`/drafts/${draft.id}`, { revision: draft.revision, customers });
+        this.closePriceDrawer();
+        await this.reload();
+        if (typeof wx.showToast === 'function') wx.showToast({ title: '已保存修改', icon: 'success' });
+      } catch (error) {
+        if (error instanceof WorkspaceError && error.code === 'draft_confirmed') {
+          this.closePriceDrawer();
+          await this.reloadAfterConflict(error, draftConflicts);
+          return;
+        }
+        if (error instanceof WorkspaceError && error.code === 'draft_changed') {
+          await this.reloadAfterConflict(error, draftConflicts);
+          this.setData({ priceDrawerError: '草稿已更新，请核对后再保存' });
+          return;
+        }
+        this.setData({ priceDrawerError: errorMessage(error) });
       }
     });
   },

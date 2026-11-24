@@ -65,6 +65,44 @@ export function catalogHintText(priceHint: string | null | undefined, discontinu
   return plainHint(text);
 }
 
+// 「库内仅记 …」里的参考价只拆成可点按钮；配送员亲手点按后才填本地输入框，绝不自动提交。
+export function catalogReferencePrices(priceHint: string | null | undefined): { value: string; label: string }[] {
+  const text = (priceHint ?? '').replace(/已下架，请核实库存[。.]?\s*/g, '').trim();
+  if (!text) return [];
+  const amountValue = (raw: string) => {
+    const value = raw.replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '');
+    return /^\d+(?:\.\d+)?$/.test(value) && Number(value) > 0 ? value : '';
+  };
+  const found: { value: string; unit?: string }[] = [];
+  let inCatalogRun = false;
+  for (const raw of text.split(/ \/ | · /)) {
+    const segment = raw.trim();
+    if (!segment) continue;
+    const start = /^库内仅记\s*(.+)$/.exec(segment);
+    if (start) {
+      inCatalogRun = true;
+      const priced = /^([^\s¥]+)\s*¥([\d.]+)/.exec(start[1]);
+      if (priced) { found.push({ value: amountValue(priced[2]), unit: priced[1] }); continue; }
+      const bare = /^¥([\d.]+)/.exec(start[1]);
+      if (bare) { found.push({ value: amountValue(bare[1]) }); continue; }
+      inCatalogRun = false;
+      continue;
+    }
+    if (!inCatalogRun) continue;
+    const priced = /^([^\s¥]+)\s*¥([\d.]+)/.exec(segment);
+    if (!priced) { inCatalogRun = false; continue; }
+    found.push({ value: amountValue(priced[2]), unit: priced[1] });
+  }
+  const valid = found.filter(entry => entry.value);
+  const withUnit = valid.length > 1;
+  const prices: { value: string; label: string }[] = [];
+  for (const entry of valid) {
+    const label = withUnit && entry.unit ? `用 ¥${entry.value}（${entry.unit}）` : `用 ¥${entry.value}`;
+    if (!prices.some(item => item.value === entry.value && item.label === label)) prices.push({ value: entry.value, label });
+  }
+  return prices.slice(0, 4);
+}
+
 export function editLines(items: ItemInput[], id: string, field: string, value: string): ItemInput[] {
   if (!fields.some(entry => entry.key === field)) return items;
   return items.map(item => item.id === id ? { ...item, [field]: value } : item);

@@ -1829,3 +1829,321 @@ test('6.5-8 copies a user bubble back into the composer and asks before replacin
   assert.equal(page.data.focusInput, true);
   assert.deepEqual(writes, ['老王两箱水饺', '老王两箱水饺'], '确认后覆盖回填并写入剪贴板');
 });
+
+test('6.5-10 extracts only catalog reference prices as one-tap buttons', () => {
+  const { catalogReferencePrices } = require('../code/dist/pages/order-view');
+  assert.deepEqual(catalogReferencePrices('库内仅记 ¥8.00（未标袋价）'), [{ value: '8', label: '用 ¥8' }]);
+  assert.deepEqual(catalogReferencePrices('库内仅记 ¥6.00（未标计价单位）'), [{ value: '6', label: '用 ¥6' }]);
+  assert.deepEqual(catalogReferencePrices('已下架，请核实库存。 库内仅记 袋 ¥3.50'), [{ value: '3.5', label: '用 ¥3.5' }]);
+  assert.deepEqual(catalogReferencePrices('库内仅记 包 ¥10.00'), [{ value: '10', label: '用 ¥10' }]);
+  assert.deepEqual(catalogReferencePrices('库内仅记 袋 ¥3.50 / 箱 ¥80.00'), [
+    { value: '3.5', label: '用 ¥3.5（袋）' },
+    { value: '80', label: '用 ¥80（箱）' },
+  ]);
+  assert.deepEqual(catalogReferencePrices('原话有多个单价，请核对'), []);
+  assert.deepEqual(catalogReferencePrices('图片疑似标价 ¥49.00（未自动填入，请核对）'), []);
+  assert.deepEqual(catalogReferencePrices(''), []);
+  assert.deepEqual(catalogReferencePrices(null), []);
+});
+
+test('6.5-10 fills a missing customer name inline and drops the stale prompt', async t => {
+  const { page, event, handle, setDraft, setTurns } = setup(t, order());
+  const draft = order();
+  Object.assign(draft.customers[0], { customer: '', partyId: null });
+  const customerId = draft.customers[0].id;
+  setDraft(draft);
+  const toasts = [];
+  global.wx.showToast = spec => toasts.push(spec);
+  const writes = [];
+  const turn = { id: 'turn-name', text: '水饺两箱', materialIds: [], revision: draft.revision, status: 'completed',
+    events: [event('questions', { questions: [{ customer: '第 1 位客户', text: '请填写客户名称', options: [] }] }),
+      event('end', { text: '还差客户名', status: 'completed', revision: draft.revision })] };
+  handle(request => {
+    if (request.path === '/agent/memory') {
+      request.ok({ draftId: draft.id, revision: draft.revision, confirmed: false,
+        customers: [{ id: 'p-strong', name: '强记面馆' }], mentions: [], prices: [] });
+      return true;
+    }
+    if (request.path === `/drafts/${draft.id}`) {
+      assert.equal(request.method, 'PUT');
+      writes.push(request.data);
+      const updated = { ...draft, revision: draft.revision + 1, customers: request.data.customers };
+      setDraft(updated);
+      request.ok({ draft: updated });
+      return true;
+    }
+    return false;
+  });
+  setTurns([turn]);
+  await page.onShow();
+  await page.login();
+  assert.equal(page.data.draftSummary.unnamedCustomers.length, 1);
+  assert.deepEqual(page.data.draftSummary.unnamedCustomers[0], { id: customerId, label: '第 1 位客户' });
+  assert.equal(page.data.draftSummary.customers[0].unnamed, true);
+  assert.equal(page.data.turns[0].questions.length, 1);
+  assert.equal(page.data.turns[0].questions[0].missingCustomer, true);
+  assert.deepEqual(page.data.memoryCustomers, [{ id: 'p-strong', name: '强记面馆' }]);
+
+  page.editInlineCustomerName({ ...tap({ customer: customerId }), detail: { value: '新发商店' } });
+  assert.equal(page.data.inlineCustomerDrafts[customerId], '新发商店');
+  await page.saveInlineCustomerName(tap({ customer: customerId }));
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].revision, draft.revision);
+  assert.ok(writes[0].requestId);
+  assert.equal(writes[0].customers[0].customer, '新发商店');
+  assert.equal(page.data.draftSummary.unnamedCustomers.length, 0);
+  assert.equal(page.data.turns[0].questions.length, 0, '补好后旧追问不再显示');
+  assert.equal(page.data.inlineCustomerDrafts[customerId], undefined);
+  assert.deepEqual(toasts.at(-1), { title: '已保存店名', icon: 'success' });
+});
+
+test('6.5-10 pins a quick customer and saves sheet names without leaving the sheet', async t => {
+  const { page, handle, setDraft } = setup(t, order());
+  let current = order();
+  Object.assign(current.customers[0], { customer: '', partyId: null });
+  setDraft(current);
+  const choices = [];
+  const writes = [];
+  const save = () => { setDraft(current); };
+  handle(request => {
+    if (request.path === '/agent/memory') {
+      request.ok({ draftId: current.id, revision: current.revision, confirmed: false,
+        customers: [{ id: 'p-strong', name: '强记面馆' }], mentions: [], prices: [] });
+      return true;
+    }
+    if (request.path === '/agent/customer-choice') {
+      choices.push(request.data);
+      current = { ...current, revision: current.revision + 1, customers: current.customers.map(customer =>
+        ({ ...customer, customer: '强记面馆', partyId: request.data.customerId })) };
+      save();
+      request.ok({ revision: current.revision, remembered: null });
+      return true;
+    }
+    if (request.path === `/drafts/${current.id}`) {
+      writes.push(request.data);
+      current = { ...current, revision: current.revision + 1, customers: request.data.customers };
+      save();
+      request.ok({ draft: current });
+      return true;
+    }
+    return false;
+  });
+  await page.onShow();
+  await page.login();
+  assert.equal(page.data.draftSummary.unnamedCustomers.length, 1);
+
+  const customerId = current.customers[0].id;
+  await page.pickQuickCustomer(tap({ customer: customerId, party: 'p-strong' }));
+  assert.equal(choices.length, 1);
+  assert.equal(choices[0].draftCustomerId, customerId);
+  assert.equal(choices[0].choice, 'existing');
+  assert.equal(choices[0].customerId, 'p-strong');
+  assert.equal(choices[0].remember, false);
+  assert.ok(choices[0].requestId);
+  assert.equal(page.data.draftSummary.unnamedCustomers.length, 0);
+
+  current = order();
+  Object.assign(current.customers[0], { customer: '', partyId: null });
+  save();
+  await page.reload();
+  const secondId = current.customers[0].id;
+  page.openCustomerSheet(tap({ customer: secondId }));
+  assert.equal(page.data.customerSheet.id, secondId);
+  page.editSheetCustomerName({ detail: { value: '强记面馆' } });
+  assert.equal(page.data.customerSheet.value, '强记面馆');
+  await page.saveCustomerSheet();
+  assert.equal(page.data.customerSheet, null);
+  assert.equal(choices.at(-1).customerId, 'p-strong');
+  assert.equal(choices.at(-1).remember, false);
+
+  current = order();
+  Object.assign(current.customers[0], { customer: '', partyId: null });
+  save();
+  await page.reload();
+  const thirdId = current.customers[0].id;
+  page.openCustomerSheet(tap({ customer: thirdId }));
+  page.editSheetCustomerName({ detail: { value: '新发商店' } });
+  await page.saveCustomerSheet();
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].customers[0].customer, '新发商店');
+  assert.equal(page.data.customerSheet, null);
+});
+
+test('6.5-10 fills only pending prices in the drawer and keeps typed input on failure', async t => {
+  const draft = order();
+  const customer = draft.customers[0];
+  const base = customer.items[0];
+  customer.items[0] = { ...base, product: '水饺', price: '82' };
+  customer.items.push({ ...base, id: 'line-ref', product: '蛋挞皮', quantity: '5', unit: '盒', price: null,
+    catalogStatus: 'unit_mismatch', priceHint: '已下架，请核实库存。 库内仅记 袋 ¥3.50 / 箱 ¥80.00' });
+  customer.items.push({ ...base, id: 'line-plain', product: '烧卖', quantity: '2', unit: '箱', price: null,
+    catalogStatus: null, priceHint: null });
+  const { page, requests, handle, setDraft } = setup(t, draft);
+  const toasts = [];
+  const puts = [];
+  let failOnce = true;
+  let current = draft;
+  global.wx.showToast = spec => toasts.push(spec);
+  handle(request => {
+    if (request.path === `/drafts/${draft.id}`) {
+      puts.push(request.data);
+      if (failOnce) {
+        failOnce = false;
+        request.ok({ error: 'server_error', message: '服务暂时不可用，请重试' }, 500);
+        return true;
+      }
+      current = { ...current, revision: current.revision + 1, customers: request.data.customers };
+      setDraft(current);
+      request.ok({ draft: current });
+      return true;
+    }
+    return false;
+  });
+  await page.onShow();
+  await page.login();
+
+  page.openPriceDrawer(tap({}));
+  assert.equal(page.data.priceDrawerOpen, true);
+  assert.equal(page.data.priceDrawerFocusId, '');
+
+  page.closePriceDrawer();
+  page.openPriceDrawer(tap({ line: 'line-ref' }));
+  assert.equal(page.data.priceDrawerFocusId, 'pf-line-ref');
+  assert.deepEqual(page.data.priceDrawerRows.map(row => row.lineId), ['line-ref', 'line-plain']);
+  assert.deepEqual(page.data.priceDrawerRows[0].refButtons, [
+    { value: '3.5', label: '用 ¥3.5（袋）' },
+    { value: '80', label: '用 ¥80（箱）' },
+  ]);
+  assert.equal(page.data.priceDrawerRows[0].customerName, '老王');
+  assert.equal(page.data.priceDrawerRows[0].showCustomer, false);
+  assert.match(page.data.priceDrawerRows[0].metaLabel, /已下架|库里只有|库内仅记/);
+
+  const before = requests.length;
+  page.applyRefPrice(tap({ line: 'line-ref', value: '3.5' }));
+  assert.equal(page.data.priceDrawerRows[0].price, '3.5');
+  assert.equal(requests.length, before, '点参考价只填本地输入框，绝不自动提交');
+
+  page.toggleDrawerSpec(tap({ line: 'line-ref' }));
+  assert.equal(page.data.priceDrawerRows[0].showSpec, true);
+  page.editPriceDrawerField({ ...tap({ line: 'line-ref', field: 'unit' }), detail: { value: '袋' } });
+  page.editPriceDrawerField({ ...tap({ line: 'line-ref', field: 'specification' }), detail: { value: '1kg' } });
+  assert.equal(page.data.priceDrawerRows[0].inputUnit, '袋');
+  assert.equal(page.data.priceDrawerRows[0].inputSpecification, '1kg');
+
+  page.editPriceDrawerPrice({ ...tap({ line: 'line-ref' }), detail: { value: '0' } });
+  await page.savePriceDrawer();
+  assert.equal(puts.length, 0);
+  assert.equal(page.data.priceDrawerOpen, true);
+  assert.match(page.data.priceDrawerError, /蛋挞皮/);
+  assert.match(page.data.priceDrawerError, /单价/);
+  assert.equal(page.data.priceDrawerRows[0].price, '0', '校验失败保留已填内容');
+
+  page.editPriceDrawerPrice({ ...tap({ line: 'line-ref' }), detail: { value: 'abc' } });
+  await page.savePriceDrawer();
+  assert.equal(puts.length, 0);
+  assert.match(page.data.priceDrawerError, /蛋挞皮/);
+
+  page.editPriceDrawerField({ ...tap({ line: 'line-ref', field: 'unit' }), detail: { value: '' } });
+  page.editPriceDrawerPrice({ ...tap({ line: 'line-ref' }), detail: { value: '8' } });
+  await page.savePriceDrawer();
+  assert.equal(puts.length, 0);
+  assert.match(page.data.priceDrawerError, /单位不能为空/);
+  page.editPriceDrawerField({ ...tap({ line: 'line-ref', field: 'unit' }), detail: { value: '袋' } });
+
+  page.editPriceDrawerPrice({ ...tap({ line: 'line-ref' }), detail: { value: '8' } });
+  page.editPriceDrawerPrice({ ...tap({ line: 'line-plain' }), detail: { value: '12' } });
+  await page.savePriceDrawer();
+  assert.equal(puts.length, 1);
+  assert.ok(puts[0].requestId);
+  assert.equal(puts[0].revision, draft.revision);
+  assert.equal(page.data.priceDrawerOpen, true, '5xx 失败不关闭抽屉');
+  assert.equal(page.data.priceDrawerRows[0].price, '8', '5xx 失败保留用户输入');
+  assert.match(page.data.priceDrawerError, /服务暂时不可用/);
+
+  await page.savePriceDrawer();
+  assert.equal(puts.length, 2);
+  assert.equal(puts[1].requestId, puts[0].requestId, '同一份输入复用幂等请求号');
+  assert.equal(page.data.priceDrawerOpen, false);
+  assert.deepEqual(page.data.priceDrawerRows, []);
+  assert.equal(page.data.draftSummary.pendingCount, 0);
+  assert.deepEqual(toasts.at(-1), { title: '已保存修改', icon: 'success' });
+  const refLine = puts[1].customers[0].items.find(line => line.id === 'line-ref');
+  const plainLine = puts[1].customers[0].items.find(line => line.id === 'line-plain');
+  assert.deepEqual([refLine.price, refLine.unit, refLine.specification], ['8', '袋', '1kg']);
+  assert.deepEqual([plainLine.price, plainLine.unit], ['12', '箱']);
+  assert.equal(puts[1].customers[0].items[0].price, '82', '已定价的行保持原价');
+
+  page.openPriceDrawer();
+  assert.equal(page.data.priceDrawerOpen, false);
+  assert.equal(toasts.at(-1).title, '当前没有待填价货品');
+});
+
+test('6.5-10 profile retries failed alias and catalog loads in place', async t => {
+  const draft = order();
+  const { pageFor, handle } = setup(t, draft);
+  const profile = pageFor('profile');
+  let mode = 'failed';
+  handle(request => {
+    if (request.path === '/workspace') {
+      request.ok({ draft, parties: [], draftConfirmed: false, currentTrip: null });
+      return true;
+    }
+    if (request.path === '/customer-aliases') {
+      if (mode === 'failed') request.fail();
+      else request.ok({ aliases: [{ alias: '老王', canonicalName: '王记餐饮' }] });
+      return true;
+    }
+    if (request.path === '/catalog/summary') {
+      if (mode === 'failed') request.fail();
+      else request.ok({ productCount: 12, variantCount: 20, activeVariantCount: 18,
+        discontinuedVariantCount: 2, missingUnitVariantCount: 1 });
+      return true;
+    }
+    return false;
+  });
+  await profile.onShow();
+  await profile.login();
+  assert.equal(profile.data.aliasError, '叫法列表没加载出来');
+  assert.equal(profile.data.catalogError, '货品库信息没加载出来');
+
+  mode = 'loaded';
+  await profile.retryLoad();
+  assert.equal(profile.data.aliasError, '');
+  assert.equal(profile.data.catalogError, '');
+  assert.equal(profile.data.aliasesLoaded, true);
+  assert.deepEqual(profile.data.aliases, [{ alias: '老王', canonicalName: '王记餐饮' }]);
+  assert.equal(profile.data.catalogSummary.productCount, 12);
+  assert.equal(profile.data.error, '');
+});
+
+test('6.5-10 keeps the new sheets native, equal-width and reachable', () => {
+  const read = file => fs.readFileSync(require.resolve(`../code/dist/${file}`), 'utf8');
+  const agentWxml = read('pages/agent/index.wxml');
+  const agentWxss = read('pages/agent/index.wxss');
+  const profileWxml = read('pages/profile/index.wxml');
+  const profileWxss = read('pages/profile/index.wxss');
+  const emoji = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{26FF}\u{FE0F}]/u;
+  for (const [name, source] of [['agent.wxml', agentWxml], ['agent.wxss', agentWxss],
+    ['profile.wxml', profileWxml], ['profile.wxss', profileWxss]]) {
+    assert.equal(source.includes('size="mini"'), false, `${name} 不得使用 mini 按钮`);
+    assert.equal(source.includes('cover-view'), false, `${name} 不得使用 cover-view`);
+    assert.equal(emoji.test(source), false, `${name} 不得出现 Emoji`);
+    assert.equal(source.includes('safe-area-inset-top'), false, `${name} 不得叠加顶部安全区`);
+  }
+  for (const token of ['openPriceDrawer', 'savePriceDrawer', 'applyRefPrice', 'saveInlineCustomerName',
+    'pickQuickCustomer', 'openCustomerSheet', 'saveCustomerSheet', '改单位/规格',
+    '也可直接发语音一次报多行单价', '待填价货品', 'scroll-into-view="{{priceDrawerFocusId}}"',
+    'id="pf-{{row.lineId}}"', '保存全部', '保存店名', 'drawer-price-input num']) {
+    assert.ok(agentWxml.includes(token), `缺少速填抽屉结构 ${token}`);
+  }
+  for (const token of ['z-index: 100', 'env(safe-area-inset-bottom)', 'height: 88rpx', 'height: 80rpx',
+    '.drawer-price-input', '.sheet-mask']) {
+    assert.ok(agentWxss.includes(token), `缺少抽屉样式 ${token}`);
+  }
+  for (const token of ['bindtap="retryLoad"', 'aliasError', 'catalogError', 'signedIn && !loaded && error']) {
+    assert.ok(profileWxml.includes(token), `缺少就地重试入口 ${token}`);
+  }
+  for (const token of ['.retry-inline-btn', 'height: 80rpx', '.error-row']) {
+    assert.ok(profileWxss.includes(token), `缺少重试样式 ${token}`);
+  }
+});

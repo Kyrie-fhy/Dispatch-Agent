@@ -1,10 +1,14 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
+import { matchCatalogItem, resolveCatalogAutoPrice } from '../miniprogram/core/catalog';
+import { nullablePrice } from '../miniprogram/core/orders';
 import { emptyTrip, TripDraft } from '../miniprogram/core/trips';
+import { loadCatalog } from './catalog';
 import { setAccount, transaction } from './database';
-import { reconcileManualItem, SaveDraftInput } from './draft-input';
+import { itemIdentityChanged, reconcileManualItem, SaveDraftInput } from './draft-input';
 import { missingDraft, readAccount, readParties, readWorkspace, workspaceDraft, writeAccount } from './account-workspace';
 import { HttpError } from './http-error';
+import { readHistoricalSales } from './memory';
 
 const developmentAccounts = new Set(['a', 'b']);
 const sessionLifetimeSeconds = 60 * 60 * 8;
@@ -101,6 +105,24 @@ export class DraftStore {
         const prior = oldLines.get(item.id);
         return reconcileManualItem(item, prior?.item, prior?.partyId === customer.partyId && prior?.customerId === customer.id);
       }) }));
+      // 改单位/规格后仍未手填单价的老明细，服务端再查一次货品库与熟客成交价，
+      // 唯一对上规格就自动带价；仍对不上则刷新最新的参考价提示。
+      const requery = customers.flatMap(customer => customer.items.flatMap((item, index) => {
+        const prior = oldLines.get(item.id);
+        if (!prior || !itemIdentityChanged(item, prior.item) || nullablePrice(item.price) !== null) return [];
+        return [{ customer, index }];
+      }));
+      if (requery.length) {
+        const catalog = await loadCatalog(client, accountId);
+        if (catalog.length) {
+          const partyIds = [...new Set(requery.flatMap(({ customer }) => customer.partyId ? [customer.partyId] : []))];
+          const sales = partyIds.length ? await readHistoricalSales(client, accountId, partyIds) : [];
+          for (const { customer, index } of requery) {
+            const item = customer.items[index];
+            customer.items[index] = resolveCatalogAutoPrice(item, matchCatalogItem(item, catalog), customer.partyId, sales);
+          }
+        }
+      }
       const saved = workspaceDraft({ ...draft, customers, revision: current.revision + 1, currentTripId: current.currentTripId });
       await client.query(`UPDATE dispatch.workspaces SET draft_revision = $2, draft_customers = $3
         WHERE account_id = $1`, [accountId, saved.revision, JSON.stringify(saved.customers)]);

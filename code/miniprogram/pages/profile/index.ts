@@ -79,6 +79,11 @@ Page({
     this.setData({ error: errorMessage(error) });
   },
 
+  retryLoad(): Promise<void> | undefined {
+    if (!agentSession.token || this.data.busy) return;
+    return this.run(() => this.reload());
+  },
+
   async reload(): Promise<void> {
     const token = agentSession.token;
     if (!token) return;
@@ -98,7 +103,7 @@ Page({
     const [aliasResult, catalogResult] = await Promise.all([
       workspaceRequest<{ aliases: AliasView[] }>('GET', '/customer-aliases', token).then(
         ({ aliases }) => ({ aliases, error: '' }),
-        () => ({ aliases: null, error: '叫法列表没加载出来，重进本页可重试。' })),
+        () => ({ aliases: null, error: '叫法列表没加载出来' })),
       workspaceRequest<CatalogSummary>('GET', '/catalog/summary', token).then(
         summary => ({ summary, error: '' }),
         () => ({ summary: null, error: '货品库信息没加载出来' })),

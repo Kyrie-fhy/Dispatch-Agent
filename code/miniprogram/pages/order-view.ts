@@ -39,10 +39,30 @@ export function priceSourceLabel(source: ItemInput['priceSource']): string {
   return '';
 }
 
+// 把「库内仅记 ¥6.00（未标箱价）」这类程序员提示换成配送员能直接读懂的大白话。
+function plainHint(text: string): string {
+  return text.split(' / ').map(segment => {
+    const item = segment.trim();
+    if (!item) return '';
+    const missingUnit = /^库内仅记\s*¥([\d.]+)（未标([^）]+)）$/.exec(item);
+    if (missingUnit) {
+      const price = `¥${missingUnit[1]}`;
+      const unit = missingUnit[2];
+      if (unit === '计价单位') return `库里只记 ${price}，没写单位`;
+      return `库里只有散价 ${price}，没${unit.replace(/价$/, '')}价`;
+    }
+    const printedUnit = /^库内仅记\s+([^\s¥]+)\s+¥([\d.]+)/.exec(item);
+    if (printedUnit) return `库里只有 ${printedUnit[1]} ¥${printedUnit[2]}`;
+    return item.replace(/^库内仅记\s*/, '库里只记 ');
+  }).filter(Boolean).join(' / ').replace(/¥(\d+)\.00(?!\d)/g, '¥$1');
+}
+
 export function catalogHintText(priceHint: string | null | undefined, discontinued: boolean): string {
-  const text = (priceHint ?? '').trim();
+  let text = (priceHint ?? '').trim();
   if (!text) return '';
-  return discontinued && text === '已下架，请核实库存' ? '' : text;
+  if (discontinued) text = text.replace(/已下架，请核实库存[。.]?\s*/g, '').trim();
+  if (!text) return '';
+  return plainHint(text);
 }
 
 export function editLines(items: ItemInput[], id: string, field: string, value: string): ItemInput[] {
@@ -54,12 +74,15 @@ export const deliveryLabel: Record<DeliveryStatus, string> = { pending: '未配�
 
 export function lineView(line: OrderLine) {
   const discontinued = line.catalogStatus === 'discontinued';
-  return { ...line, productLabel: productLabel(line), nameOnly: lineNameOnly(line), metaLabel: lineMetaLabel(line),
+  const metaLabel = lineMetaLabel(line);
+  const catalogHint = catalogHintText(line.priceHint, discontinued);
+  return { ...line, productLabel: productLabel(line), nameOnly: lineNameOnly(line), metaLabel,
     priceLabel: line.price === null ? '待补价' : `¥${line.price}`,
     amount: line.amountCents === null ? '待补价' : money(line.amountCents),
     amountLabel: line.amountCents === null ? '待补价' : `¥${money(line.amountCents)}`,
     priceSourceLabel: priceSourceLabel(line.priceSource), discontinued,
-    priceHint: line.priceHint ?? '', catalogHint: catalogHintText(line.priceHint, discontinued) };
+    priceHint: line.priceHint ?? '', catalogHint,
+    secondaryText: [metaLabel, catalogHint].filter(Boolean).join(' · ') };
 }
 
 function customerView(customer: CustomerOrder) {

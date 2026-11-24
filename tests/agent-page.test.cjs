@@ -401,7 +401,7 @@ test('A1 manual form uses the same session and detects an unsaved edit after cha
   const { page, pageFor, navigation, requests, setDraft } = setup(t, base);
   await page.onShow();
   await page.login();
-  assert.match(page.data.draftSummary.label, /1 家 1 行/);
+  assert.match(page.data.draftSummary.label, /当前整单 · 1 家 1 样/);
   page.toggleDraft();
   assert.equal(page.data.draftExpanded, true);
   page.openWorkspace();
@@ -642,7 +642,7 @@ test('Agent drops the top strip and keeps the next action only on the latest lin
   await page.login();
   assert.equal(page.data.turns.length, 0);
   assert.equal(page.data.draftSummary.hasLines, true);
-  assert.match(page.data.draftSummary.label, /1 家 1 行/);
+  assert.match(page.data.draftSummary.label, /当前整单 · 1 家 1 样/);
   assert.equal(page.data.navTitle, '录单助手');
   page.toggleDraft();
   assert.equal(page.data.draftExpanded, true);
@@ -1302,7 +1302,7 @@ test('6.5-2 tags draft and preview lines with price source, a discontinued flag 
   assert.equal(lines[1].priceSourceLabel, '库内价');
   assert.equal(lines[1].priceSource, 'catalog');
   assert.equal(lines[1].discontinued, true);
-  assert.equal(lines[1].catalogHint, '已下架，请核实库存。 库内仅记 ¥6.00（未标箱价）');
+  assert.equal(lines[1].catalogHint, '库里只有散价 ¥6，没箱价');
   assert.equal(lines[2].discontinued, true);
   assert.equal(lines[2].catalogHint, '', '黄牌已表达的下架文案不重复刷出');
   assert.equal(lines[3].priceSourceLabel, '');
@@ -1312,12 +1312,12 @@ test('6.5-2 tags draft and preview lines with price source, a discontinued flag 
   assert.equal(items[0].priceSourceLabel, '熟客价');
   assert.equal(items[1].priceSourceLabel, '库内价');
   assert.equal(items[1].discontinued, true);
-  assert.equal(items[1].catalogHint, '已下架，请核实库存。 库内仅记 ¥6.00（未标箱价）');
+  assert.equal(items[1].catalogHint, '库里只有散价 ¥6，没箱价');
   assert.equal(items[2].catalogHint, '');
   assert.equal(items[3].priceSourceLabel, '');
 
   const wxml = fs.readFileSync(require.resolve('../code/dist/pages/agent/index.wxml'), 'utf8');
-  for (const token of ['price-tag-history', 'price-tag-catalog', 'warn-tag', '已下架·核实库存', 'catalog-hint']) {
+  for (const token of ['price-tag-history', 'price-tag-catalog', 'warn-tag', '已下架']) {
     assert.ok(wxml.includes(token), `缺少价格来源结构 ${token}`);
   }
   const deliveryWxml = fs.readFileSync(require.resolve('../code/dist/pages/trip-delivery/index.wxml'), 'utf8');
@@ -1535,7 +1535,7 @@ test('6.5-2 catalog controls keep the native design baseline on both pages', () 
     assert.equal(wxml.includes('size="mini"'), false, `${name} 不得使用 mini 按钮`);
     assert.equal(emoji.test(wxml), false, `${name} 不得出现 Emoji`);
   }
-  for (const token of ['按库外新货保留', '已下架·核实库存', 'price-tag-history', 'price-tag-catalog']) {
+  for (const token of ['按库外新货保留', '已下架', 'price-tag-history', 'price-tag-catalog']) {
     assert.ok(agentWxml.includes(token), `缺少 ${token}`);
   }
   assert.ok(profileWxml.includes('货品库'));
@@ -1580,12 +1580,12 @@ test('6.5-5 collapses the finished checklist into one running line and one plain
   setTurns([changed, undone, failed, silent, previewed]);
   await page.onShow();
   assert.equal(page.data.turns[0].runningStepText, '');
-  assert.equal(page.data.turns[0].summaryText, '已整理入本趟草稿');
+  assert.equal(page.data.turns[0].summaryText, '已更新本单明细');
   assert.equal(page.data.turns[0].reply, '', '同一句结果不再重复出现在回复字段');
-  assert.equal(page.data.turns[1].summaryText, '这一步已撤销');
+  assert.equal(page.data.turns[1].summaryText, '这一步已撤回');
   assert.equal(page.data.turns[2].summaryText, '处理失败。草稿没有变化。');
   assert.equal(page.data.turns[3].summaryText, '这一步没跑完，可以把原消息放回输入框重试');
-  assert.equal(page.data.turns[4].summaryText, '已生成送货单预览，请核对后确认出单');
+  assert.equal(page.data.turns[4].summaryText, '送货单预览已准备好，核对后点确认出单');
 });
 
 test('6.5-5 splits draft and preview lines into nameOnly plus brand and specification', async t => {
@@ -1687,4 +1687,145 @@ test('6.5-5 shows a quiet voice correction hint and forwards voiceMeta only once
   assert.equal(page.data.voiceCorrectionHint, '', '删空输入框后清空纠偏提示');
   assert.equal(page.voiceMeta, null);
   assert.equal(requests.some(request => request.path === '/agent/turns' && request.data.voiceMeta && posts > 1), false);
+});
+
+test('6.5-8 ships a full-width receipt card without nested scrolling or mini controls', () => {
+  const wxml = fs.readFileSync(require.resolve('../code/dist/pages/agent/index.wxml'), 'utf8');
+  const wxss = fs.readFileSync(require.resolve('../code/dist/pages/agent/index.wxss'), 'utf8');
+  assert.equal(/<scroll-view[^>]*draft-inline-body/.test(wxml), false, '明细不再套卡片内滚动框');
+  assert.equal(wxss.includes('max-height: 360rpx'), false, '明细不再限高截断');
+  assert.equal(wxml.includes('avatar helper'), false, '取消左侧助手大头像');
+  assert.equal(wxml.includes('size="mini"'), false, '不得使用 mini 按钮');
+  assert.equal(/\benv\(safe-area-inset-top\)/.test(wxss), false, '页面根节点不得叠加顶部安全区');
+  for (const token of ['card-header', 'alert-strip', 'copy-bubble-btn', 'card-actions-pair',
+    '预览送货单', '手动改单', '撤回刚发的']) {
+    assert.ok(wxml.includes(token), `缺少全宽小票风结构 ${token}`);
+  }
+  const emoji = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{26FF}\u{FE0F}]/u;
+  assert.equal(emoji.test(wxml), false, '助手卡片必须是零 Emoji');
+});
+
+test('6.5-8 hides the duplicate change wall and spells out pending prices and discontinued lines', async t => {
+  const draft = order();
+  const customer = draft.customers[0];
+  customer.items[0].price = null;
+  const base = customer.items[0];
+  customer.items.push({ ...base, id: 'line-gone', product: '鸭血', quantity: '2', unit: '盒', price: '6',
+    priceSource: 'catalog', catalogStatus: 'discontinued',
+    priceHint: '已下架，请核实库存。 库内仅记 ¥6.00（未标箱价）' });
+  const { page, event, setTurns } = setup(t, draft);
+  setTurns([{ id: 'turn-receipt', text: '老王两箱水饺、两盒鸭血', materialIds: [], revision: draft.revision, status: 'completed',
+    events: [event('change', { lines: ['新增 2 行'] }),
+      event('end', { status: 'completed', text: '草稿已更新。', revision: draft.revision })] }]);
+  await page.onShow();
+  await page.login();
+
+  const card = page.data.turns[0];
+  assert.equal(card.summaryText, '已记上 2 样货');
+  assert.equal(card.showDraftSummary, true);
+  assert.equal(card.showChangeList, false, '整单明细已自然展开时不再重复显示本轮改动');
+  const summary = page.data.draftSummary;
+  assert.equal(summary.label, '当前整单 · 1 家 2 样');
+  assert.equal(summary.lineCount, 2);
+  assert.equal(summary.pendingCount, 1);
+  assert.equal(summary.discontinuedCount, 1);
+  assert.equal(summary.alertText, '1 样待填价 · 1 样已下架，请查库存');
+  const lines = summary.customers[0].lines;
+  assert.equal(lines[0].price, '待填价');
+  assert.equal(lines[1].catalogHint, '库里只有散价 ¥6，没箱价');
+  assert.equal(lines[1].secondaryText, '库里只有散价 ¥6，没箱价');
+
+  const { catalogHintText } = require('../code/dist/pages/order-view');
+  assert.equal(catalogHintText('已下架，请核实库存。 库内仅记 ¥6.00（未标箱价）', true), '库里只有散价 ¥6，没箱价');
+  assert.equal(catalogHintText('已下架，请核实库存', true), '', '已下架只用状态标签说一次');
+  assert.equal(catalogHintText('库内仅记 ¥6.00（未标计价单位）', false), '库里只记 ¥6，没写单位');
+  assert.equal(catalogHintText('库内仅记 袋 ¥15.00', false), '库里只有 袋 ¥15');
+  assert.equal(catalogHintText('库内仅记 ¥6.50（未标箱价）', false), '库里只有散价 ¥6.50，没箱价');
+  assert.equal(catalogHintText('最近一张已送达单据有多个成交价，请核对', true),
+    '最近一张已送达单据有多个成交价，请核对', '其它提示原样保留');
+});
+
+test('6.5-8 expands up to eight receipt lines naturally and folds only the overflow', async t => {
+  const linesOf = count => {
+    const draft = order();
+    const base = draft.customers[0].items[0];
+    draft.customers[0].items = Array.from({ length: count }, (_, index) => ({ ...base, id: `line-${index}`,
+      product: `货品${index + 1}`, quantity: '1', unit: '箱', price: '10' }));
+    return draft;
+  };
+  const short = setup(t, linesOf(8));
+  await short.page.onShow();
+  await short.page.login();
+  const shortSummary = short.page.data.draftSummary;
+  assert.equal(shortSummary.overLimit, false);
+  assert.equal(shortSummary.hiddenCount, 0);
+  assert.equal(shortSummary.previewCustomers.length, 1);
+  assert.equal(shortSummary.previewCustomers[0].lines.length, 8);
+
+  const long = setup(t, linesOf(10));
+  await long.page.onShow();
+  await long.page.login();
+  const summary = long.page.data.draftSummary;
+  assert.equal(summary.lineCount, 10);
+  assert.equal(summary.overLimit, true);
+  assert.equal(summary.hiddenCount, 2);
+  assert.equal(summary.previewCustomers.reduce((sum, customer) => sum + customer.lines.length, 0), 8);
+  assert.equal(summary.customers[0].lines.length, 10);
+  assert.equal(long.page.data.draftExpanded, false);
+  long.page.toggleDraft();
+  assert.equal(long.page.data.draftExpanded, true);
+  long.page.toggleDraft();
+  assert.equal(long.page.data.draftExpanded, false);
+
+  const wxml = fs.readFileSync(require.resolve('../code/dist/pages/agent/index.wxml'), 'utf8');
+  assert.ok(wxml.includes('draftSummary.previewCustomers'));
+  assert.ok(wxml.includes('展开其余 '));
+});
+
+test('6.5-8 copies a user bubble back into the composer and asks before replacing typed text', async t => {
+  const draft = order();
+  const { page, event, setTurns } = setup(t, draft);
+  const writes = [];
+  const toasts = [];
+  const modals = [];
+  Object.assign(global.wx, {
+    setClipboardData: spec => writes.push(spec.data),
+    showToast: spec => toasts.push(spec),
+    showModal: spec => modals.push(spec),
+  });
+  setTurns([{ id: 'turn-copy', text: '老王两箱水饺', materialIds: [], revision: draft.revision, status: 'completed',
+    events: [event('end', { status: 'completed', text: '已整理', revision: draft.revision })] }]);
+  await page.onShow();
+  await page.login();
+
+  page.setData({ text: '', inputMode: 'voice' });
+  page.copyTurnText(tap({ turn: 'turn-copy' }));
+  assert.equal(page.data.text, '老王两箱水饺');
+  assert.equal(page.data.inputMode, 'text');
+  assert.equal(page.data.focusInput, true);
+  assert.equal(page.data.voiceCorrectionHint, '');
+  assert.deepEqual(writes, ['老王两箱水饺']);
+  assert.deepEqual(toasts, [{ title: '已放回输入框，改完即可发', icon: 'none' }]);
+  assert.equal(modals.length, 0, '输入框为空时直接回填不弹框');
+
+  page.setData({ busy: true, text: '正在发送的原话' });
+  page.copyTurnText(tap({ turn: 'turn-copy' }));
+  assert.equal(page.data.text, '正在发送的原话', '忙碌时不得覆盖输入框');
+  page.setData({ busy: false });
+
+  page.setData({ text: '输入框里已有别的字' });
+  page.copyTurnText(tap({ turn: 'turn-copy' }));
+  assert.equal(modals.length, 1);
+  assert.equal(modals[0].content, '输入框里已有字，要换成这条原话重新编辑吗？');
+  assert.ok(modals[0].confirmText.length <= 4, 'showModal 确认按钮最多 4 个字');
+  assert.equal(page.data.text, '输入框里已有别的字');
+  modals[0].success({ confirm: false });
+  assert.equal(page.data.text, '输入框里已有别的字', '取消后保留原字');
+  assert.equal(writes.length, 1, '取消时不写剪贴板');
+
+  page.copyTurnText(tap({ turn: 'turn-copy' }));
+  modals.at(-1).success({ confirm: true });
+  assert.equal(page.data.text, '老王两箱水饺');
+  assert.equal(page.data.focusInput, true);
+  assert.deepEqual(writes, ['老王两箱水饺', '老王两箱水饺'], '确认后覆盖回填并写入剪贴板');
 });

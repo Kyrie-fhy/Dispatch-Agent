@@ -177,16 +177,23 @@ function view(turn: AgentTurn, revision: number, confirmed: boolean, last: boole
     : '';
   const endText = (end?.text ?? '').trim();
   let summaryText = '';
+  const addedCount = changes.reduce((sum, line) => {
+    const match = /^新增 (\d+) 行$/.exec(line);
+    return match ? sum + Number(match[1]) : sum;
+  }, 0);
   if (turn.status !== 'running') {
-    if (undone) summaryText = '这一步已撤销';
+    if (undone) summaryText = '这一步已撤回';
     else if (endText && !(endText === '草稿已更新。' && changes.length)) summaryText = endText;
-    else if (changes.length) summaryText = '已整理入本趟草稿';
-    else if (preview) summaryText = '已生成送货单预览，请核对后确认出单';
+    else if (changes.length) summaryText = addedCount > 0 ? `已记上 ${addedCount} 样货` : '已更新本单明细';
+    else if (preview) summaryText = '送货单预览已准备好，核对后点确认出单';
     else if (proposal) summaryText = '已整理门店送货核对卡';
     else if (turn.status === 'failed' || turn.status === 'interrupted') summaryText = '这一步没跑完，可以把原消息放回输入框重试';
   }
+  const draftHasLines = Boolean(draft?.customers.some(customer => customer.items.some(line =>
+    line.product || line.quantity || line.price || line.brand || line.specification)));
+  const showChangeList = Boolean(changes.length) && !(showDraftSummary && draftHasLines && !undone);
   return { id: turn.id, text: turn.text, pictures: turn.materialIds.length, checklist, questions, changes, undone, issued, links, showChoices,
-    status: turn.status, runningStepText, summaryText,
+    status: turn.status, runningStepText, summaryText, showChangeList,
     reply: changes.length && end?.text === '草稿已更新。' ? '' : end?.text ?? '',
     elapsed: end?.elapsedMs === undefined ? '' : `用时 ${Math.max(1, Math.round(end.elapsedMs / 1000))} 秒`,
     canAnswer, hasPendingQuestions, showDraftSummary, showDraftActions, showStandaloneUndo, showDeliveryFooter, allDelivered,
@@ -210,20 +217,44 @@ function deliverySummaryView(progress: DeliveryProgress) {
 }
 
 function draftSummary(draft: TripDraft, pending: number) {
-  const customers = draft.customers.map(customer => ({
+  type SummaryLine = { id: string; product: string; nameOnly: string; metaLabel: string; quantity: string; unit: string;
+    price: string; pending: boolean; priceSource: string; priceSourceLabel: string; discontinued: boolean;
+    priceHint: string; catalogHint: string; secondaryText: string };
+  type SummaryCustomer = { id: string; name: string; lines: SummaryLine[] };
+  const customers: SummaryCustomer[] = draft.customers.map(customer => ({
     id: customer.id, name: customer.customer || '未命名客户',
     lines: customer.items.filter(line => line.product || line.quantity || line.price || line.brand || line.specification)
-      .map(line => ({ id: line.id, product: productLabel(line) || '未命名货品', nameOnly: lineNameOnly(line),
-        metaLabel: lineMetaLabel(line), quantity: line.quantity, unit: line.unit,
-        price: line.price ? '¥' + line.price : '待补价', pending: !line.price,
-        priceSource: line.priceSource ?? '', priceSourceLabel: priceSourceLabel(line.priceSource),
-        discontinued: line.catalogStatus === 'discontinued', priceHint: line.priceHint ?? '',
-        catalogHint: catalogHintText(line.priceHint, line.catalogStatus === 'discontinued') })),
+      .map(line => {
+        const metaLabel = lineMetaLabel(line);
+        const discontinued = line.catalogStatus === 'discontinued';
+        const catalogHint = catalogHintText(line.priceHint, discontinued);
+        return { id: line.id, product: productLabel(line) || '未命名货品', nameOnly: lineNameOnly(line),
+          metaLabel, quantity: line.quantity, unit: line.unit,
+          price: line.price ? '¥' + line.price : '待填价', pending: !line.price,
+          priceSource: line.priceSource ?? '', priceSourceLabel: priceSourceLabel(line.priceSource),
+          discontinued, priceHint: line.priceHint ?? '', catalogHint,
+          secondaryText: [metaLabel, catalogHint].filter(Boolean).join(' · ') };
+      }),
   })).filter(customer => customer.lines.length);
   const lines = customers.reduce((sum, customer) => sum + customer.lines.length, 0);
   const issues = pending || (lines ? textOrderQuestions(draft).reduce((sum, customer) => sum + customer.issues.length, 0) : 0);
-  return { customers, hasLines: lines > 0,
-    label: `本趟草稿 · ${customers.length} 家 ${lines} 行${issues ? `，${issues} 处待确认` : ''}` };
+  const pendingCount = customers.reduce((sum, customer) => sum + customer.lines.filter(line => line.pending).length, 0);
+  const discontinuedCount = customers.reduce((sum, customer) => sum + customer.lines.filter(line => line.discontinued).length, 0);
+  const overLimit = lines > 8;
+  const previewCustomers: SummaryCustomer[] = [];
+  let shown = 0;
+  for (const customer of customers) {
+    if (shown >= 8) break;
+    const previewLines = customer.lines.slice(0, 8 - shown);
+    if (!previewLines.length) continue;
+    previewCustomers.push({ ...customer, lines: previewLines });
+    shown += previewLines.length;
+  }
+  const alertText = [pendingCount ? `${pendingCount} 样待填价` : '',
+    discontinuedCount ? `${discontinuedCount} 样已下架，请查库存` : ''].filter(Boolean).join(' · ');
+  return { customers, hasLines: lines > 0, lineCount: lines, pendingCount, discontinuedCount, overLimit,
+    hiddenCount: Math.max(0, lines - 8), previewCustomers, alertText,
+    label: `当前整单 · ${customers.length} 家 ${lines} 样${issues ? `，${issues} 处待确认` : ''}` };
 }
 
 function applyNavTitle(title: string) {
@@ -566,6 +597,30 @@ Page({
   },
 
   toggleDraft(): void { this.setData({ draftExpanded: !this.data.draftExpanded }); },
+
+  copyTurnText(event: WechatMiniprogram.TouchEvent): void {
+    const id = String(event.currentTarget.dataset.turn ?? '');
+    const text = (this.data.turns.find(turn => turn.id === id)?.text ?? '').trim();
+    if (!text || this.data.busy) return;
+    const apply = () => {
+      this.voiceMeta = null;
+      this.setData({ text, inputMode: 'text', focusInput: true, voiceCorrectionHint: '' });
+      if (typeof wx.setClipboardData === 'function') wx.setClipboardData({ data: text, fail: () => {} });
+      if (typeof wx.showToast === 'function') wx.showToast({ title: '已放回输入框，改完即可发', icon: 'none' });
+    };
+    const current = this.data.text.trim();
+    if (current && current !== text && typeof wx.showModal === 'function') {
+      wx.showModal({
+        title: '替换输入框内容',
+        content: '输入框里已有字，要换成这条原话重新编辑吗？',
+        confirmText: '替换原话',
+        success: ({ confirm }) => { if (confirm) apply(); },
+        fail: () => {},
+      });
+      return;
+    }
+    apply();
+  },
 
   submit(text: string, materialIds: string[], direct?: DirectIntent): Promise<void> | undefined {
     const draft = this.draft;

@@ -1087,6 +1087,47 @@ const adminPage = `<!doctype html>
   .event-list { margin: 10px 0 0; padding: 0; list-style: none; }
   .event-list li { padding: 5px 8px; border-left: 2px solid #cfe2d9; margin: 3px 0 3px 3px; font-size: 12px; }
   .event-list .kind { display: inline-block; min-width: 104px; color: var(--green); font: 600 11px var(--mono); }
+  .timeline-bar { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin: 2px 0 12px; }
+  .timeline-step { display: flex; gap: 8px; align-items: flex-start; min-width: 0; padding: 7px 9px;
+    border: 1px solid var(--line); border-radius: 9px; background: #fbfcfb; }
+  .timeline-step .dot { flex: 0 0 auto; width: 10px; height: 10px; margin-top: 5px; border-radius: 50%; background: #9aa8a0; }
+  .timeline-step.ok .dot { background: #16a34a; }
+  .timeline-step.warn .dot { background: #d97706; }
+  .timeline-step.bad .dot { background: #dc2626; }
+  .timeline-step.skip .dot { background: #9aa8a0; }
+  .timeline-step.ok { border-color: #bbf7d0; background: #f0fdf4; }
+  .timeline-step.warn { border-color: #fde68a; background: #fffbeb; }
+  .timeline-step.bad { border-color: #fecaca; background: #fef2f2; }
+  .timeline-step.skip { border-color: #e2e8e4; background: #f6f8f7; }
+  .timeline-step .step-text { min-width: 0; }
+  .timeline-step .step-label { display: block; font-size: 12px; font-weight: 700; color: var(--ink); }
+  .timeline-step .step-sub { display: block; color: var(--muted); font-size: 11px; word-break: break-word; overflow-wrap: anywhere; }
+  .cause { margin: 12px 0; }
+  .cause-title { margin-bottom: 5px; font-size: 13px; font-weight: 700; color: var(--ink); }
+  .cause-line { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; padding: 8px 10px;
+    border: 1px solid var(--line); border-radius: 9px; background: #fbfcfb; font-size: 12px; }
+  .cause-line b { color: var(--ink); }
+  .cause-block { margin-top: 8px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 9px; background: #fbfcfb; }
+  .cause-block b { display: block; margin-bottom: 4px; font-size: 12px; }
+  .table-scroll { overflow-x: auto; }
+  .change-list { margin: 0; padding-left: 18px; }
+  .change-list li { margin: 2px 0; }
+  .voice-compare { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: 8px; align-items: stretch; margin-top: 8px; }
+  .voice-box { padding: 8px 10px; border: 1px solid #fcd34d; border-radius: 8px; background: #fffbeb; word-break: break-word; }
+  .voice-box.fixed { border-color: #86efac; background: #f0fdf4; }
+  .voice-label { display: block; margin-bottom: 3px; color: var(--muted); font-size: 10px; font-weight: 700; }
+  .voice-arrow { align-self: center; color: var(--muted); font-weight: 700; }
+  .corrections { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .correction-tag { display: inline-block; padding: 1px 8px; border: 1px solid #cfe2d9; border-radius: 999px;
+    background: #eef6f1; color: var(--green-dark); font-size: 11px; }
+  .hint-bar { margin-top: 7px; padding: 6px 9px; border-left: 4px solid #d97706; border-radius: 6px;
+    background: var(--amber-bg); color: #7c2d12; font-size: 12px; }
+  .hint-bar.bad { border-left-color: var(--red); background: var(--red-bg); color: #7f1d1d; }
+  .raw-tech { margin-top: 12px; padding-top: 8px; border-top: 1px dashed var(--line); }
+  .raw-tech > summary { color: var(--muted); font-size: 12px; font-weight: 600; cursor: pointer; }
+  @media (max-width: 900px) { .timeline-bar { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 560px) { .timeline-bar { grid-template-columns: 1fr; }
+    .voice-compare { grid-template-columns: 1fr; } .voice-arrow { justify-self: center; } }
   .muted { color: var(--muted); }
   details.raw { margin-top: 9px; }
   details.raw summary { color: var(--muted); font-size: 11px; cursor: pointer; }
@@ -1620,6 +1661,11 @@ const adminPage = `<!doctype html>
     if (event.kind === 'submitted') return '提交：' + (payload.textLength || 0) + ' 字 · ' + (payload.images || 0) + ' 图';
     if (event.kind === 'image_applied') return '图片已应用 ' + String(payload.digest || '').slice(0, 12);
     if (event.kind === 'tool') return '工具 ' + (payload.name || '');
+    if (event.kind === 'voice_correction') {
+      var count = Array.isArray(payload.corrections) ? payload.corrections.length : 0;
+      return '语音纠偏：' + (payload.rawText || '（无原转写）') + ' → ' + (payload.text || '（无提交文字）') +
+        (count ? '（' + count + ' 项纠偏）' : '（无逐项纠偏）');
+    }
     return JSON.stringify(payload);
   };
   var prettyJson = function (value) {
@@ -1697,6 +1743,373 @@ const adminPage = `<!doctype html>
       '<div class="tool-body"><div><label>入参摘要</label><pre>' + esc(prettyJson(payload.arguments)) + '</pre></div>' +
       '<div><label>服务端结果</label><pre>' + esc(prettyJson(result)) + '</pre></div></div></div>';
   };
+  var actionLabel = { add: '新增', fill: '补填', update: '修改', remove_line: '删除', set_customer: '选店' };
+  var catalogStatusText = { active: '唯一在售', ambiguous: '同名多款待选', unit_mismatch: '单位不符',
+    discontinued: '已下架', unmatched: '库外新货', external: '手动库外' };
+  var catalogStatusClass = { active: 'ok', ambiguous: 'warn', unit_mismatch: 'warn', discontinued: 'warn',
+    unmatched: 'info', external: 'info' };
+  var priceSourceText = { spoken: '原话价', customer_history: '熟客价', catalog: '库内价', manual: '手改价' };
+  var blockedReasonText = { locked_sheet: '客户单已锁定', new_item_after_issue: '现场不能新增原单外货品',
+    next_trip_order: '下趟订单暂不处理' };
+  var voiceEventOf = function (turn) {
+    for (var index = 0; index < turn.events.length; index++) {
+      if (turn.events[index].kind === 'voice_correction') return turn.events[index];
+    }
+    return null;
+  };
+  var modelEventsOf = function (turn) {
+    return turn.events.filter(function (event) { return event.kind === 'model'; });
+  };
+  var toolEventsOf = function (turn) {
+    return turn.events.filter(function (event) { return event.kind === 'tool'; });
+  };
+  var hasEvent = function (turn, kind) {
+    return turn.events.some(function (event) { return event.kind === kind; });
+  };
+  var parseToolArgs = function (value) {
+    if (value && typeof value === 'object') return value;
+    if (typeof value !== 'string') return null;
+    try { return JSON.parse(value); } catch (e) { return null; }
+  };
+  var operationRows = function (turn) {
+    var fromTools = [];
+    var fromModels = [];
+    turn.events.forEach(function (event) {
+      var payload = event.payload || {};
+      if (event.kind === 'tool' && payload.name === 'edit_draft' && payload.arguments
+        && Array.isArray(payload.arguments.operations)) {
+        Array.prototype.push.apply(fromTools, payload.arguments.operations.filter(function (op) {
+          return op && typeof op === 'object';
+        }));
+      }
+      if (event.kind === 'model' && Array.isArray(payload.toolCalls)) {
+        payload.toolCalls.forEach(function (call) {
+          if (!call || call.name !== 'edit_draft') return;
+          var args = parseToolArgs(call.arguments);
+          if (args && Array.isArray(args.operations)) {
+            Array.prototype.push.apply(fromModels, args.operations.filter(function (op) {
+              return op && typeof op === 'object';
+            }));
+          }
+        });
+      }
+    });
+    return fromTools.length ? fromTools : fromModels;
+  };
+  var catalogRowsOf = function (turn) {
+    var rows = [];
+    turn.events.forEach(function (event) {
+      var payload = event.payload || {};
+      if (event.kind === 'tool' && payload.result && Array.isArray(payload.result.catalog)) {
+        payload.result.catalog.forEach(function (row) { if (row && typeof row === 'object') rows.push(row); });
+      }
+    });
+    return rows;
+  };
+  var intentOfTurn = function (turn) {
+    var structured = null;
+    var delivery = null;
+    turn.events.forEach(function (event) {
+      var payload = event.payload || {};
+      if (event.kind === 'delivery_intent') delivery = payload;
+      if (event.kind === 'model' && payload.phase === 'intent' && payload.intents) structured = payload.intents;
+    });
+    return { structured: structured, delivery: delivery };
+  };
+  var intentText = function (turn) {
+    var found = intentOfTurn(turn);
+    if (found.delivery) return found.delivery.adjust ? '送货核对' : '闲聊/查询';
+    if (!found.structured) return '';
+    var labels = [];
+    if (found.structured.draft) labels.push('录单改草稿');
+    if (found.structured.preview) labels.push('生成预览');
+    if (found.structured.query) labels.push('闲聊/查询');
+    if (found.structured.answering && found.structured.draft) labels.push('回答追问');
+    return labels.join('、');
+  };
+  var intentModelFailed = function (turn) {
+    if (hasEvent(turn, 'delivery_intent')) return false;
+    return turn.events.some(function (event) {
+      var payload = event.payload || {};
+      return event.kind === 'model' && payload.phase === 'intent' && !payload.intents;
+    });
+  };
+  var hasToolRecord = function (turn) {
+    return toolEventsOf(turn).length > 0 || hasEvent(turn, 'plan');
+  };
+  var guardrailEvents = function (turn) {
+    var hints = [];
+    turn.events.forEach(function (event) {
+      var payload = event.payload || {};
+      if (event.kind === 'questions' && Array.isArray(payload.questions)) {
+        payload.questions.forEach(function (question) {
+          if (!question || !question.text) return;
+          hints.push({ cls: 'warn', text: (question.customer ? question.customer + '：' : '') + question.text });
+        });
+      }
+      if (event.kind === 'edit_confirmation') {
+        var operations = Array.isArray(payload.operations) ? payload.operations.length : 0;
+        hints.push({ cls: 'warn', text: '需要确认操作 ' + operations + ' 项，接受词「' + (payload.accept || '') + '」' });
+      }
+      if (event.kind === 'tool' && payload.result) {
+        var result = payload.result;
+        if (Array.isArray(result.issues)) {
+          result.issues.forEach(function (issue) {
+            var message = typeof issue === 'string' ? issue : issue && issue.message;
+            if (message) hints.push({ cls: 'bad', text: message });
+          });
+        }
+        if (Array.isArray(result.conflicts)) {
+          result.conflicts.forEach(function (conflict) {
+            if (!conflict) return;
+            hints.push({ cls: 'warn', text: '冲突行：' +
+              [conflict.customer, conflict.brand, conflict.product, conflict.specification].filter(Boolean).join(' / ') });
+          });
+        }
+        if (result.outcome === 'error') {
+          hints.push({ cls: 'bad', text: '工具报错：' + (result.errorCode || payload.name || '未知错误') });
+        }
+      }
+    });
+    return hints;
+  };
+  var timelineSteps = function (turn) {
+    var voice = voiceEventOf(turn);
+    var failed = turn.status === 'failed' || turn.status === 'interrupted';
+    var ops = operationRows(turn);
+    var tools = toolEventsOf(turn);
+    var intent = intentText(turn);
+    var received = Boolean(turn.userText && turn.userText.trim()) || (turn.materials && turn.materials.length > 0);
+    var steps = [{
+      label: '① 收到原话',
+      state: received ? 'ok' : 'warn',
+      sub: voice ? '含语音纠偏' : received ? (turn.materials && turn.materials.length ? '文字与图片' : '文字原话') : '未收到内容',
+    }];
+    var intentState = 'warn';
+    var intentSub = '意图未明确';
+    if (failed) { intentState = 'bad'; intentSub = turn.status === 'failed' ? '回合执行失败' : '回合执行中断'; }
+    else if (intentModelFailed(turn)) { intentState = 'bad'; intentSub = '意图模型调用失败'; }
+    else if (intent) { intentState = 'ok'; intentSub = intent; }
+    else if (hasToolRecord(turn)) { intentState = 'ok'; intentSub = '快捷操作'; }
+    steps.push({ label: '② 判定意图', state: intentState, sub: intentSub });
+    var previewTool = tools.some(function (event) {
+      var name = event.payload && event.payload.name;
+      return name === 'preview_trip' || name === 'import_image' || name === 'propose_delivery';
+    });
+    var asked = tools.some(function (event) { return event.payload && event.payload.name === 'ask_user'; })
+      || hasEvent(turn, 'questions');
+    var detailState = 'warn';
+    var detailSub = '无操作明细';
+    if (failed) { detailState = 'bad'; detailSub = '模型或回合异常'; }
+    else if (ops.length) { detailState = 'ok'; detailSub = '拆出 ' + ops.length + ' 行'; }
+    else if (previewTool) { detailState = 'ok'; detailSub = '触发生成预览 / 图片识别 / 送货核对'; }
+    else if (asked) { detailState = 'warn'; detailSub = '未拆明细，直接追问'; }
+    else if (intent === '闲聊/查询' || (!intent && !hasToolRecord(turn))) { detailState = 'skip'; detailSub = '纯问答，未拆明细'; }
+    steps.push({ label: '③ 拆出明细', state: detailState, sub: detailSub });
+    var badTool = tools.some(function (event) {
+      return event.payload && event.payload.result && event.payload.result.outcome === 'error';
+    });
+    var writeTools = tools.filter(function (event) {
+      var name = event.payload && event.payload.name;
+      return name === 'edit_draft' || name === 'preview_trip' || name === 'import_image' || name === 'propose_delivery';
+    });
+    var warned = catalogRowsOf(turn).some(function (row) {
+      return row.status === 'ambiguous' || row.status === 'unit_mismatch' || row.status === 'discontinued';
+    }) || guardrailEvents(turn).length > 0 || turn.undone;
+    var checkState = 'ok';
+    var checkSub = '顺利落草稿';
+    if (failed || badTool) { checkState = 'bad'; checkSub = failed ? '回合失败' : '工具报错'; }
+    else if (!writeTools.length && !warned) { checkState = 'skip'; checkSub = '未触发工具写操作'; }
+    else if (!writeTools.length && warned) { checkState = 'warn'; checkSub = '仅追问，未写草稿'; }
+    else if (warned) { checkState = 'warn'; checkSub = turn.undone ? '已撤销' : '存在待选/追问/拦截'; }
+    else if (writeTools.some(function (event) { return event.payload && event.payload.name === 'preview_trip'; })) {
+      checkSub = '完成预览';
+    } else if (writeTools.some(function (event) { return event.payload && event.payload.name === 'propose_delivery'; })) {
+      checkSub = '完成送货核对';
+    }
+    steps.push({ label: '④ 查库/护栏结果', state: checkState, sub: checkSub });
+    return steps;
+  };
+  var timelineBarHtml = function (turn) {
+    return '<div class="timeline-bar">' + timelineSteps(turn).map(function (step) {
+      return '<div class="timeline-step ' + step.state + '"><span class="dot" aria-hidden="true"></span>' +
+        '<span class="step-text"><span class="step-label">' + esc(step.label) + '</span>' +
+        '<span class="step-sub">' + esc(step.sub) + '</span></span></div>';
+    }).join('') + '</div>';
+  };
+  var materialThumbsHtml = function (turn) {
+    if (!turn.materials.length) return '';
+    return '<div class="thumbs">' + turn.materials.map(function (material) {
+      return '<div class="thumb" data-thumb="' + esc(material.id) + '">加载图片…<div class="line-sub">' + esc(material.name) +
+        (material.organized ? ' · 已识别' : '') + '</div></div>';
+    }).join('') + '</div>';
+  };
+  var inputModuleHtml = function (turn) {
+    var voice = voiceEventOf(turn);
+    var html = '<div class="cause"><div class="cause-title">原始输入</div>';
+    html += '<div class="bubble"><span class="bubble-label">配送员原话</span>' + esc(turn.userText || '（无文字）') + '</div>';
+    if (voice) {
+      var voicePayload = voice.payload || {};
+      var corrections = Array.isArray(voicePayload.corrections) ? voicePayload.corrections : [];
+      html += '<div class="voice-compare">' +
+        '<div class="voice-box"><span class="voice-label">语音原转写</span><div>' + esc(voicePayload.rawText || '（无原转写）') +
+        '</div></div><div class="voice-arrow">→</div>' +
+        '<div class="voice-box fixed"><span class="voice-label">纠偏后提交</span><div>' +
+        esc(voicePayload.text || turn.userText || '（无提交文字）') + '</div></div></div>';
+      if (corrections.length) {
+        html += '<div class="corrections">' + corrections.map(function (entry) {
+          return '<span class="correction-tag">' + esc(entry && entry.from) + ' → ' + esc(entry && entry.to) + '</span>';
+        }).join('') + '</div>';
+      }
+    }
+    html += materialThumbsHtml(turn);
+    html += '<div class="bubble assistant"><span class="bubble-label">助手回复</span>' + esc(turn.assistantText || '（暂无回复）') + '</div>';
+    return html + '</div>';
+  };
+  var modelSummaryHtml = function (turn) {
+    var models = modelEventsOf(turn);
+    var html = '<div class="cause"><div class="cause-title">AI 意图与模型概况</div><div class="cause-line">';
+    html += '<span>判定意图：<b>' + esc(intentText(turn) || '未明确') + '</b></span>';
+    html += '<span>总耗时：' + esc(turn.elapsedMs === null || turn.elapsedMs === undefined ? '—' : turn.elapsedMs + ' ms') + '</span>';
+    if (!models.length) {
+      html += '<span class="muted">未记录模型调用' + (hasToolRecord(turn) ? '（快捷操作）' : '') + '</span>';
+    } else {
+      html += '<span>模型调用 ' + esc(models.length) + ' 次</span>';
+      models.forEach(function (event) {
+        var payload = event.payload || {};
+        html += '<button type="button" class="chip" data-prompt-version="' + esc(payload.promptVersion || '') + '">' +
+          esc(payload.model || '未标模型') + ' · ' + esc(payload.promptVersion || '未标版本') + '</button>';
+      });
+    }
+    return html + '</div></div>';
+  };
+  var questionsText = function (value) {
+    if (!Array.isArray(value)) return '';
+    return value.map(function (question) {
+      if (!question) return '';
+      return (question.customer ? question.customer + '：' : '') + (question.text || '');
+    }).filter(Boolean).join('；');
+  };
+  var previewText = function (result) {
+    var payload = result || {};
+    if (payload.outcome === 'issues') return '预览被拦下：' + (Array.isArray(payload.issues) ? payload.issues.join('；') : '请先核对必填项');
+    var parts = [];
+    if (payload.previewId) parts.push('预览 ' + String(payload.previewId).slice(0, 8));
+    if (typeof payload.totalCents === 'number') parts.push('预计应收 ¥' + (payload.totalCents / 100).toFixed(2));
+    if (typeof payload.pendingPrices === 'number') parts.push(payload.pendingPrices ? payload.pendingPrices + ' 处待补价' : '无待补价');
+    return parts.join(' · ') || '已生成送货单预览（仍需配送员确认）';
+  };
+  var deliveryText = function (result, args) {
+    var payload = result || {};
+    var parts = [];
+    if (payload.customer) parts.push(payload.customer);
+    if (args && args.sheetNumber !== undefined) parts.push('第 ' + args.sheetNumber + ' 店');
+    if (args && Array.isArray(args.edits)) parts.push('拟改 ' + args.edits.length + ' 行');
+    if (payload.canComplete !== undefined) parts.push(payload.canComplete ? '可确认送达' : '需核对');
+    if (payload.blockedReason) parts.push(blockedReasonText[payload.blockedReason] || payload.blockedReason);
+    if (Array.isArray(payload.pendingPriceNames) && payload.pendingPriceNames.length) {
+      parts.push('待补价：' + payload.pendingPriceNames.join('、'));
+    }
+    return parts.join(' · ') || '送货现场核对提案';
+  };
+  var actionBlocks = function (turn) {
+    var blocks = [];
+    toolEventsOf(turn).forEach(function (event) {
+      var payload = event.payload || {};
+      var name = payload.name;
+      if (name === 'import_image') {
+        var added = payload.result && typeof payload.result.added === 'number' ? ' · 新增 ' + payload.result.added + ' 行' : '';
+        blocks.push({ title: '图片识别写入草稿', text: '已使用本回合上传的图片识别结果' + added });
+      } else if (name === 'preview_trip') {
+        blocks.push({ title: '生成送货单预览', text: previewText(payload.result) });
+      } else if (name === 'ask_user') {
+        blocks.push({ title: '向配送员追问', text: questionsText(payload.arguments && payload.arguments.questions) || '需要配送员补充信息' });
+      } else if (name === 'propose_delivery') {
+        blocks.push({ title: '送货核对提案', text: deliveryText(payload.result, payload.arguments) });
+      }
+    });
+    return blocks;
+  };
+  var operationsModuleHtml = function (turn) {
+    var ops = operationRows(turn);
+    var blocks = actionBlocks(turn);
+    if (!ops.length && !blocks.length) return '';
+    var html = '<div class="cause"><div class="cause-title">AI 拆出哪几行</div>';
+    if (ops.length) {
+      html += '<div class="table-scroll"><table><thead><tr><th>动作</th><th>客户</th><th>品牌</th><th>货品</th>' +
+        '<th>规格</th><th>数量单位</th><th class="num">原话单价</th></tr></thead><tbody>';
+      ops.forEach(function (op) {
+        var action = actionLabel[op.action] || op.action || '—';
+        var customer = op.customer || (op.customerNumber !== undefined ? '第 ' + op.customerNumber + ' 店' : '—');
+        var quantity = [op.quantity, op.unit].filter(Boolean).join(' ') || '—';
+        html += '<tr><td>' + esc(action) + '</td><td>' + esc(customer) + '</td><td>' + esc(op.brand || '—') + '</td>' +
+          '<td>' + esc(op.product || '—') + '</td><td>' + esc(op.specification || '—') + '</td>' +
+          '<td>' + esc(quantity) + '</td><td class="num">' + esc(op.price ? '¥' + op.price : '—') + '</td></tr>';
+      });
+      html += '</tbody></table></div>';
+    }
+    blocks.forEach(function (block) {
+      html += '<div class="cause-block"><b>' + esc(block.title) + '</b><div>' + esc(block.text) + '</div></div>';
+    });
+    return html + '</div>';
+  };
+  var catalogModuleHtml = function (turn) {
+    var rows = catalogRowsOf(turn);
+    var hints = guardrailEvents(turn);
+    if (!rows.length && !hints.length) return '';
+    var html = '<div class="cause"><div class="cause-title">查货品库与护栏结果</div>';
+    if (rows.length) {
+      html += '<div class="table-scroll"><table><thead><tr><th>输入货品/规格/单位</th><th>查库结果</th>' +
+        '<th>配价来源</th><th class="num">单价</th><th>护栏提示</th></tr></thead><tbody>';
+      rows.forEach(function (row) {
+        var input = [row.input && row.input.product, row.input && row.input.brand,
+          row.input && row.input.specification, row.input && row.input.unit].filter(Boolean).join(' / ') || '—';
+        var status = catalogStatusText[row.status] || row.status || '—';
+        var statusClass = catalogStatusClass[row.status] || 'muted';
+        var source = priceSourceText[row.priceSource] || (row.price === null || row.price === undefined ? '待补价' : '—');
+        var price = row.price === null || row.price === undefined || row.price === '' ? '—' : '¥' + row.price;
+        var hint = row.priceHint || (row.status === 'ambiguous' ? '同名多款待选，需配送员选定' : '—');
+        html += '<tr><td>' + esc(input) + '</td><td><span class="badge ' + statusClass + '">' + esc(status) + '</span></td>' +
+          '<td>' + esc(source) + '</td><td class="num">' + esc(price) + '</td><td>' + esc(hint) + '</td></tr>';
+      });
+      html += '</tbody></table></div>';
+    }
+    hints.forEach(function (hint) {
+      html += '<div class="hint-bar ' + (hint.cls === 'bad' ? 'bad' : '') + '">' + esc(hint.text) + '</div>';
+    });
+    return html + '</div>';
+  };
+  var changesModuleHtml = function (turn) {
+    var links = [];
+    var changes = [];
+    turn.events.forEach(function (event) {
+      var payload = event.payload || {};
+      if (event.kind === 'customer_links' && Array.isArray(payload.links)) {
+        Array.prototype.push.apply(links, payload.links.filter(function (link) { return link && typeof link === 'object'; }));
+      }
+      if (event.kind === 'change' && Array.isArray(payload.lines)) {
+        Array.prototype.push.apply(changes, payload.lines.filter(function (line) { return typeof line === 'string'; }));
+      }
+    });
+    var revision = turn.startRevision === turn.endRevision
+      ? '修订 ' + turn.startRevision + '（未变）' : '修订 ' + turn.startRevision + ' → ' + turn.endRevision;
+    var html = '<div class="cause"><div class="cause-title">草稿最终改了什么</div>';
+    html += '<div class="cause-line"><span>' + esc(revision) + '</span>' +
+      (turn.undone ? '<span class="badge warn">已撤销</span>' : '') + '</div>';
+    if (links.length) {
+      html += '<div class="cause-block"><b>认人关联</b><div>' + links.map(function (link) {
+        return '<span class="correction-tag">' + esc(link.spoken) + ' → ' + esc(link.canonicalName) +
+          (link.merged ? '（合并）' : '') + '</span>';
+      }).join(' ') + '</div></div>';
+    }
+    if (changes.length) {
+      html += '<div class="cause-block"><b>改动明细</b><ul class="change-list">' + changes.map(function (line) {
+        return '<li>' + esc(line) + '</li>';
+      }).join('') + '</ul></div>';
+    }
+    if (!links.length && !changes.length) html += '<div class="cause-line muted">本轮没有改动草稿。</div>';
+    return html + '</div>';
+  };
   var renderTurns = function () {
     var turns = state.scope.turns;
     if (state.onlyAnomaly) {
@@ -1712,6 +2125,8 @@ const adminPage = `<!doctype html>
       var bad = signals.some(function (signal) { return signal.cls === 'bad'; });
       var warn = signals.some(function (signal) { return signal.cls === 'warn'; });
       var others = [];
+      var modelEvents = [];
+      var toolEvents = [];
       html += '<article class="turn ' + (bad ? 'bad' : warn ? 'warn' : '') + '">';
       html += '<div class="turn-head"><span class="mono">' + esc(turn.createdAt ? new Date(turn.createdAt).toLocaleString() : '') + '</span>' +
         '<span class="badge ' + (turn.status === 'completed' ? 'ok' : bad ? 'bad' : 'warn') + '">' +
@@ -1725,21 +2140,21 @@ const adminPage = `<!doctype html>
         '<span class="turn-actions"><button type="button" data-eval-export="' + esc(turn.id) + '">导出评测 Case</button>' +
         '<button type="button" data-eval-copy="' + esc(turn.id) + '">复制 Case</button></span>' +
         '<span class="mono muted">' + esc(turn.id) + '</span></div>';
-      html += '<div class="bubble"><span class="bubble-label">配送员原话</span>' + esc(turn.userText || '（无文字）') + '</div>';
-      if (turn.materials.length) {
-        html += '<div class="thumbs">';
-        turn.materials.forEach(function (material) {
-          html += '<div class="thumb" data-thumb="' + esc(material.id) + '">加载图片…<div class="line-sub">' + esc(material.name) +
-            (material.organized ? ' · 已识别' : '') + '</div></div>';
-        });
-        html += '</div>';
-      }
-      html += '<div class="bubble assistant"><span class="bubble-label">助手回复</span>' + esc(turn.assistantText || '（暂无回复）') + '</div>';
+      html += timelineBarHtml(turn);
+      html += inputModuleHtml(turn);
+      html += modelSummaryHtml(turn);
+      html += operationsModuleHtml(turn);
+      html += catalogModuleHtml(turn);
+      html += changesModuleHtml(turn);
       turn.events.forEach(function (event) {
-        if (event.kind === 'model') { html += modelCardHtml(event.payload || {}); return; }
-        if (event.kind === 'tool') { html += toolCardHtml(event.payload || {}); return; }
+        if (event.kind === 'model') { modelEvents.push(event); return; }
+        if (event.kind === 'tool') { toolEvents.push(event); return; }
         others.push(event);
       });
+      html += '<details class="raw-tech"><summary>查看原始技术报文 ▸（模型调用 / 工具入参 / ' +
+        esc(turn.events.length) + ' 条原始事件）</summary>';
+      modelEvents.forEach(function (event) { html += modelCardHtml(event.payload || {}); });
+      toolEvents.forEach(function (event) { html += toolCardHtml(event.payload || {}); });
       if (others.length) {
         html += '<ul class="event-list">';
         others.forEach(function (event) {
@@ -1749,6 +2164,7 @@ const adminPage = `<!doctype html>
       }
       html += '<details class="raw"><summary>展开原始事件 JSON（' + esc(turn.events.length) + ' 条）</summary><pre>' +
         esc(JSON.stringify(turn.events, null, 2)) + '</pre></details>';
+      html += '</details>';
       html += '</article>';
     });
     el('turns').innerHTML = html;

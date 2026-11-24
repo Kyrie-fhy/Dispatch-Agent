@@ -339,12 +339,69 @@ test('admin scopes tolerate unfinished draft values and keep full missing prices
     assert.equal(page.data.includes("accountId + ':' + id"), true);
     assert.equal(page.data.includes('URL.revokeObjectURL'), true);
     assert.ok((page.data.match(/clearMaterialUrls\(\)/g) || []).length >= 2);
+    for (const marker of ['timeline-bar', '① 收到原话', '② 判定意图', '③ 拆出明细', '④ 查库/护栏结果',
+      '查看原始技术报文', '语音原转写', '纠偏后提交', 'voice_correction']) {
+      assert.ok(page.data.includes(marker), `后台缺少 4 步时间轴结构 ${marker}`);
+    }
     const start = page.data.indexOf('<script>') + 8;
     const end = page.data.lastIndexOf('</script>');
     assert.ok(start > 7 && end > start);
     new vm.Script(page.data.slice(start, end));
 
     assert.deepEqual(await writeSnapshot(db), before);
+  } finally {
+    await api.stop();
+  }
+});
+
+test('admin scope returns voice correction evidence for the 4-step timeline', { timeout: 60_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const agentModel = async (_messages, _signal, record) => {
+    const operation = { action: 'add', customer: '老王', product: '水饺', quantity: '2', unit: '箱', price: '82' };
+    record({ model: 'fixture-agent', promptVersion: 'a1-agent-v5', outcome: 'tool_calls', elapsedMs: 4,
+      inputTokens: 80, outputTokens: 16, toolCalls: [{ name: 'edit_draft', arguments: JSON.stringify({ operations: [operation] }) }] });
+    return toolReply('edit_draft', { operations: [operation] });
+  };
+  const intentModel = async (_text, _context, _signal, record) => {
+    record({ model: 'fixture-intent', promptVersion: 'a1-agent-v5', outcome: 'received_json', elapsedMs: 2,
+      inputTokens: 40, outputTokens: 5 });
+    return { draft: true, preview: false, query: false, answering: false };
+  };
+  const adminToken = 'admin-voice-timeline-token-0123456789';
+  const api = await start(db, { agentModel, intentModel, adminToken });
+  try {
+    const token = await login(api, 'a');
+    const draft = await read(api, token);
+    const rawText = '老王订两箱水绞，82元一箱';
+    const text = '老王订两箱水饺，82元一箱';
+    const submitted = await api.request('/v1/agent/turns', { method: 'POST', token,
+      body: { ...agentInput(draft, text), voiceMeta: { rawText, corrections: [{ from: '水绞', to: '水饺' }] } } });
+    assert.equal(submitted.status, 202, JSON.stringify(submitted.data));
+    assert.equal((await waitForAgent(api, token, submitted.data.turnId)).status, 'completed');
+
+    const { rows: [account] } = await db.owner.query(
+      "SELECT id FROM dispatch.accounts WHERE identity_provider = 'development' AND identity_subject = 'a'");
+    const auth = adminAuth(adminToken);
+    const scope = await api.request(`/admin/api/accounts/${account.id}/scopes/${draft.id}`, { authorization: auth });
+    assert.equal(scope.status, 200, JSON.stringify(scope.data));
+    const turn = scope.data.turns.find(item => item.id === submitted.data.turnId);
+    assert.ok(turn, '未找到语音纠偏回合');
+    const voice = turn.events.find(event => event.kind === 'voice_correction');
+    assert.ok(voice, '范围接口未返回 voice_correction 事件');
+    assert.equal(voice.payload.rawText, rawText);
+    assert.equal(voice.payload.text, text);
+    assert.deepEqual(voice.payload.corrections, [{ from: '水绞', to: '水饺' }]);
+
+    const page = await api.request('/admin');
+    assert.equal(page.status, 200);
+    for (const marker of ['① 收到原话', '② 判定意图', '③ 拆出明细', '④ 查库/护栏结果',
+      '查看原始技术报文', '语音原转写', '纠偏后提交', 'voiceEventOf', 'voice-compare']) {
+      assert.ok(page.data.includes(marker), `后台缺少时间轴/语音对比结构 ${marker}`);
+    }
+    const scriptStart = page.data.indexOf('<script>') + 8;
+    const scriptEnd = page.data.lastIndexOf('</script>');
+    assert.ok(scriptStart > 7 && scriptEnd > scriptStart);
+    new vm.Script(page.data.slice(scriptStart, scriptEnd));
   } finally {
     await api.stop();
   }

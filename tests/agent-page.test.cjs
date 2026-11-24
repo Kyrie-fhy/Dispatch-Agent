@@ -1540,3 +1540,151 @@ test('6.5-2 catalog controls keep the native design baseline on both pages', () 
   }
   assert.ok(profileWxml.includes('货品库'));
 });
+
+test('6.5-5 collapses the finished checklist into one running line and one plain summary', async t => {
+  const wxml = fs.readFileSync(require.resolve('../code/dist/pages/agent/index.wxml'), 'utf8');
+  assert.equal(wxml.includes('wx:for="{{turn.checklist}}"'), false, '跑完后不再渲染多行步骤清单');
+  assert.equal(wxml.includes('turn.checklist.length'), false, '卡片显隐不再依赖步骤清单长度');
+  for (const token of ['running-bar', 'turn.runningStepText', 'turn.summaryText', 'turn-summary', 'change-list']) {
+    assert.ok(wxml.includes(token), `缺少降噪结构 ${token}`);
+  }
+
+  const draft = order();
+  const { page, event, setTurns } = setup(t, draft);
+  await page.onShow();
+  await page.login();
+
+  const running = { id: 'turn-running', text: '水饺两箱', materialIds: [], revision: draft.revision, status: 'running',
+    events: [
+      event('plan', { steps: [{ id: 'intent', text: '看懂你的意思' }, { id: 'edit', text: '整理进草稿' }] }),
+      event('step', { id: 'intent', state: 'done' }),
+      event('step', { id: 'edit', state: 'running' }),
+    ] };
+  setTurns([running]);
+  await page.onShow();
+  assert.equal(page.data.turns[0].runningStepText, '整理进草稿');
+  assert.equal(page.data.turns[0].summaryText, '');
+  assert.equal(page.data.turns[0].checklist.length, 2, '数据层保留 checklist 供既有测试使用');
+
+  const changed = { id: 'turn-changed', text: '水饺两箱', materialIds: [], revision: draft.revision, status: 'completed',
+    events: [event('change', { lines: ['老王 水饺 数量：1箱 → 2箱'] }),
+      event('end', { status: 'completed', text: '草稿已更新。', revision: draft.revision })] };
+  const undone = { ...changed, id: 'turn-undone', events: [...changed.events, event('undo', { revision: draft.revision + 1 })] };
+  const failed = { id: 'turn-failed', text: '水饺两箱', materialIds: [], revision: draft.revision, status: 'failed',
+    events: [event('end', { status: 'failed', text: '处理失败。草稿没有变化。', revision: draft.revision })] };
+  const silent = { id: 'turn-silent', text: '水饺两箱', materialIds: [], revision: draft.revision, status: 'interrupted',
+    events: [] };
+  const preview = { ...previewTrip(draft, true), previewId: 'pre-1', draftId: draft.id, revision: draft.revision, choices: [null] };
+  const previewed = { id: 'turn-preview', text: '生成送货单', materialIds: [], revision: draft.revision, status: 'completed',
+    events: [event('preview', { preview }), event('end', { status: 'completed', text: '', revision: draft.revision })] };
+  setTurns([changed, undone, failed, silent, previewed]);
+  await page.onShow();
+  assert.equal(page.data.turns[0].runningStepText, '');
+  assert.equal(page.data.turns[0].summaryText, '已整理入本趟草稿');
+  assert.equal(page.data.turns[0].reply, '', '同一句结果不再重复出现在回复字段');
+  assert.equal(page.data.turns[1].summaryText, '这一步已撤销');
+  assert.equal(page.data.turns[2].summaryText, '处理失败。草稿没有变化。');
+  assert.equal(page.data.turns[3].summaryText, '这一步没跑完，可以把原消息放回输入框重试');
+  assert.equal(page.data.turns[4].summaryText, '已生成送货单预览，请核对后确认出单');
+});
+
+test('6.5-5 splits draft and preview lines into nameOnly plus brand and specification', async t => {
+  const draft = order();
+  const customer = draft.customers[0];
+  const base = customer.items[0];
+  customer.items[0] = { ...base, product: '芝心虾球', brand: '亚渔', specification: '160g' };
+  customer.items.push({ ...base, id: 'line-spec', product: '鸭血', brand: '', specification: '300g', quantity: '2' });
+  const { page, event, setTurns } = setup(t, draft);
+  const preview = { ...previewTrip(draft, true), previewId: 'pre-1', draftId: draft.id, revision: draft.revision, choices: [null] };
+  setTurns([{ id: 'preview-turn', text: '生成送货单', materialIds: [], status: 'completed', revision: draft.revision,
+    events: [event('preview', { preview }), event('end', { status: 'completed', text: '请确认', revision: draft.revision })] }]);
+  await page.onShow();
+  await page.login();
+
+  const lines = page.data.draftSummary.customers[0].lines;
+  assert.equal(lines[0].nameOnly, '芝心虾球');
+  assert.equal(lines[0].metaLabel, '亚渔 · 160g');
+  assert.equal(lines[0].product, '亚渔 芝心虾球 · 160g', '保留原有 product 字段');
+  assert.equal(lines[1].nameOnly, '鸭血');
+  assert.equal(lines[1].metaLabel, '300g');
+  const { lineView } = require('../code/dist/pages/order-view');
+  const bare = lineView({ id: 'bare', product: '', brand: '', specification: '', unit: '箱', quantity: '1',
+    price: null, amountCents: null });
+  assert.equal(bare.nameOnly, '未命名货品');
+  assert.equal(bare.metaLabel, '');
+
+  const items = page.data.turns[0].preview.customers[0].items;
+  assert.equal(items[0].nameOnly, '芝心虾球');
+  assert.equal(items[0].metaLabel, '亚渔 · 160g');
+  assert.equal(items[0].productLabel, '亚渔 芝心虾球 · 160g', '预览仍保留原有 productLabel 字段');
+  assert.equal(items[1].nameOnly, '鸭血');
+
+  const wxml = fs.readFileSync(require.resolve('../code/dist/pages/agent/index.wxml'), 'utf8');
+  for (const token of ['line-row', 'line-primary', 'line-name', 'line-qty', 'line-price', 'line-secondary',
+    'line-meta', 'line-tags']) {
+    assert.ok(wxml.includes(token), `两行排版缺少 ${token}`);
+  }
+});
+
+test('6.5-5 shows a quiet voice correction hint and forwards voiceMeta only once', async t => {
+  const draft = order();
+  const { page, requests, handle } = setup(t, draft);
+  const callbacks = {};
+  Object.assign(global.wx, {
+    authorize({ success }) { success(); },
+    getRecorderManager: () => ({
+      onStart(callback) { callbacks.start = callback; }, onStop(callback) { callbacks.stop = callback; },
+      onError() {}, onInterruptionBegin() {}, start() { callbacks.start(); },
+      stop() { callbacks.stop({ tempFilePath: 'corrected.pcm', duration: 1000 }); },
+    }),
+    getFileSystemManager: () => ({ readFile: ({ success }) => success({ data: new ArrayBuffer(32000) }) }),
+    arrayBufferToBase64: bytes => Buffer.from(bytes).toString('base64'),
+  });
+  let transcription = { draftId: draft.id, revision: draft.revision, text: '明天加两箱水饺', rawText: '明天加两箱水蛟',
+    corrections: [{ from: '水蛟', to: '水饺' }, { from: '香姑', to: '香菇' }] };
+  let posts = 0;
+  handle(request => {
+    if (request.path === '/agent/transcription') { request.ok(transcription); return true; }
+    if (request.path === '/agent/turns') {
+      posts++;
+      assert.equal(request.data.text, '明天加两箱水饺');
+      assert.deepEqual(request.data.voiceMeta, { rawText: '明天加两箱水蛟',
+        corrections: [{ from: '水蛟', to: '水饺' }, { from: '香姑', to: '香菇' }] });
+      request.ok({ turnId: 'voice-turn' }, 202);
+      return true;
+    }
+    return false;
+  });
+  await page.onShow();
+  await page.login();
+
+  const recording = page.record();
+  page.stopRecording();
+  await recording;
+  assert.equal(page.data.text, '明天加两箱水饺');
+  assert.equal(page.data.voiceCorrectionHint, '已自动纠正：水蛟→水饺、香姑→香菇');
+  assert.deepEqual(page.voiceMeta, { rawText: '明天加两箱水蛟',
+    corrections: [{ from: '水蛟', to: '水饺' }, { from: '香姑', to: '香菇' }] });
+
+  await page.send();
+  assert.equal(posts, 1);
+  assert.equal(page.data.voiceCorrectionHint, '', '发送成功后隐藏纠偏提示');
+  assert.equal(page.voiceMeta, null, 'voiceMeta 只随这一次发送透传');
+  assert.equal(page.data.text, '');
+
+  transcription = { draftId: draft.id, revision: draft.revision, text: '再来一箱香菇' };
+  page.voiceFile = { draft, path: 'corrected.pcm' };
+  await page.transcribe();
+  assert.equal(page.data.voiceCorrectionHint, '');
+  assert.equal(page.voiceMeta, null, '没有纠偏时不得透传 voiceMeta');
+
+  transcription = { draftId: draft.id, revision: draft.revision, text: '明天加两箱水饺', rawText: '明天加两箱水蛟',
+    corrections: [{ from: '水蛟', to: '水饺' }] };
+  page.voiceFile = { draft, path: 'corrected.pcm' };
+  await page.transcribe();
+  assert.match(page.data.voiceCorrectionHint, /水蛟→水饺/);
+  page.editText({ detail: { value: '' } });
+  assert.equal(page.data.voiceCorrectionHint, '', '删空输入框后清空纠偏提示');
+  assert.equal(page.voiceMeta, null);
+  assert.equal(requests.some(request => request.path === '/agent/turns' && request.data.voiceMeta && posts > 1), false);
+});

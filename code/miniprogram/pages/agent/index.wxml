@@ -66,12 +66,18 @@
                 <view wx:for="{{draftSummary.customers}}" wx:for-item="customer" wx:key="id" class="detail">
                   <text class="card-title">{{customer.name}}</text>
                   <view wx:for="{{customer.lines}}" wx:for-item="line" wx:key="id" class="draft-line">
-                    <view class="preview-line">
-                      <text class="num">{{line.product}} {{line.quantity}} {{line.unit}}</text>
-                      <view class="price-wrap">
+                    <view class="line-row">
+                      <view class="line-primary">
+                        <text class="line-name">{{line.nameOnly}}</text>
+                        <text class="line-qty num">{{line.quantity}} {{line.unit}}</text>
+                      </view>
+                      <text class="line-price num {{line.pending ? 'pending-price' : ''}}">{{line.price}}</text>
+                    </view>
+                    <view wx:if="{{line.metaLabel || line.priceSourceLabel || line.discontinued}}" class="line-secondary">
+                      <text class="line-meta">{{line.metaLabel}}</text>
+                      <view class="line-tags">
                         <text wx:if="{{line.priceSourceLabel}}" class="price-tag {{line.priceSource === 'customer_history' ? 'price-tag-history' : 'price-tag-catalog'}}">{{line.priceSourceLabel}}</text>
                         <text wx:if="{{line.discontinued}}" class="warn-tag">已下架·核实库存</text>
-                        <text class="num {{line.pending ? 'pending-price' : ''}}">{{line.price}}</text>
                       </view>
                     </view>
                     <text wx:if="{{line.catalogHint}}" class="muted catalog-hint num">{{line.catalogHint}}</text>
@@ -129,22 +135,19 @@
           </view>
           <view class="avatar mine">我</view>
         </view>
-        <view class="assistant-row" wx:if="{{turn.checklist.length || turn.reply || turn.changes.length || turn.links.length || turn.questions.length || turn.preview || turn.delivery || turn.canRetry || turn.showDraftActions || turn.showDeliveryFooter}}">
+        <view class="assistant-row" wx:if="{{turn.runningStepText || turn.summaryText || turn.changes.length || turn.links.length || turn.questions.length || turn.preview || turn.delivery || turn.canRetry || turn.showDraftActions || turn.showDeliveryFooter}}">
           <view class="avatar helper">助</view>
           <view class="assistant-content">
             <text class="assistant-name">{{confirmed ? '送货助手' : '录单助手'}}</text>
             <view class="card">
-              <view wx:for="{{turn.checklist}}" wx:for-item="step" wx:key="id" class="step step-{{step.state}}">
-                <view class="step-icon">{{step.icon}}</view>
-                <view class="step-text">
-                  <text class="step-label">{{step.text}}</text>
-                  <text wx:if="{{step.result}}" class="step-result num">{{step.result}}</text>
-                </view>
+              <view wx:if="{{turn.status === 'running'}}" class="running-bar step-running">
+                <view class="step-icon"></view>
+                <text class="running-text">{{turn.runningStepText}}</text>
               </view>
-              <text wx:if="{{turn.reply}}" class="line">{{turn.reply}}</text>
-              <view wx:if="{{turn.changes.length && turn.status !== 'running'}}" class="detail">
-                <text class="card-title">{{turn.undone ? '这一步已撤销' : '草稿改动'}}</text>
-                <text wx:for="{{turn.changes}}" wx:key="*this" class="line num">{{item}}</text>
+              <text wx:elif="{{turn.summaryText}}" class="turn-summary">{{turn.summaryText}}</text>
+              <view wx:if="{{turn.changes.length && turn.status !== 'running'}}" class="change-list">
+                <text class="change-title">{{turn.undone ? '这一步已撤销 · 改动未生效' : '本轮改动'}}</text>
+                <text wx:for="{{turn.changes}}" wx:key="*this" class="change-item num">{{item}}</text>
                 <button wx:if="{{turn.showStandaloneUndo}}" class="card-btn-ghost" disabled="{{busy || polling}}"
                   data-id="{{turn.id}}" bindtap="undo">撤销这一步</button>
               </view>
@@ -180,12 +183,18 @@
                 <view wx:for="{{turn.preview.customers}}" wx:for-item="customer" wx:key="id" class="detail">
                   <text class="card-title">{{customer.customer}}</text>
                   <view wx:for="{{customer.items}}" wx:for-item="line" wx:key="id" class="preview-block">
-                    <view class="preview-line">
-                      <text class="num">{{line.productLabel}} · {{line.quantity}} {{line.unit}}</text>
-                      <view class="price-wrap">
+                    <view class="line-row">
+                      <view class="line-primary">
+                        <text class="line-name">{{line.nameOnly}}</text>
+                        <text class="line-qty num">{{line.quantity}} {{line.unit}}</text>
+                      </view>
+                      <text class="line-price num {{line.amountLabel === '待补价' ? 'pending-price' : ''}}">{{line.amountLabel}}</text>
+                    </view>
+                    <view wx:if="{{line.metaLabel || line.priceSourceLabel || line.discontinued}}" class="line-secondary">
+                      <text class="line-meta">{{line.metaLabel}}</text>
+                      <view class="line-tags">
                         <text wx:if="{{line.priceSourceLabel}}" class="price-tag {{line.priceSource === 'customer_history' ? 'price-tag-history' : 'price-tag-catalog'}}">{{line.priceSourceLabel}}</text>
                         <text wx:if="{{line.discontinued}}" class="warn-tag">已下架·核实库存</text>
-                        <text class="num {{line.amountLabel === '待补价' ? 'pending-price' : ''}}">{{line.amountLabel}}</text>
                       </view>
                     </view>
                     <text wx:if="{{line.catalogHint}}" class="muted catalog-hint num">{{line.catalogHint}}</text>
@@ -227,12 +236,18 @@
                   <view wx:for="{{draftSummary.customers}}" wx:for-item="customer" wx:key="id" class="detail">
                     <text class="card-title">{{customer.name}}</text>
                     <view wx:for="{{customer.lines}}" wx:for-item="line" wx:key="id" class="draft-line">
-                      <view class="preview-line">
-                        <text class="num">{{line.product}} {{line.quantity}} {{line.unit}}</text>
-                        <view class="price-wrap">
+                      <view class="line-row">
+                        <view class="line-primary">
+                          <text class="line-name">{{line.nameOnly}}</text>
+                          <text class="line-qty num">{{line.quantity}} {{line.unit}}</text>
+                        </view>
+                        <text class="line-price num {{line.pending ? 'pending-price' : ''}}">{{line.price}}</text>
+                      </view>
+                      <view wx:if="{{line.metaLabel || line.priceSourceLabel || line.discontinued}}" class="line-secondary">
+                        <text class="line-meta">{{line.metaLabel}}</text>
+                        <view class="line-tags">
                           <text wx:if="{{line.priceSourceLabel}}" class="price-tag {{line.priceSource === 'customer_history' ? 'price-tag-history' : 'price-tag-catalog'}}">{{line.priceSourceLabel}}</text>
                           <text wx:if="{{line.discontinued}}" class="warn-tag">已下架·核实库存</text>
-                          <text class="num {{line.pending ? 'pending-price' : ''}}">{{line.price}}</text>
                         </view>
                       </view>
                       <text wx:if="{{line.catalogHint}}" class="muted catalog-hint num">{{line.catalogHint}}</text>
@@ -318,6 +333,7 @@
           </button>
         </view>
       </view>
+      <text wx:if="{{voiceCorrectionHint}}" class="voice-correction">{{voiceCorrectionHint}}</text>
       <text wx:if="{{voicePhase}}" class="voice-status">{{voicePhase}}</text>
       <view class="composer-bar">
         <button wx:if="{{!confirmed}}" class="image-button" aria-label="上传订单图片"

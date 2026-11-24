@@ -21,6 +21,14 @@ export function productLabel(item: Pick<ItemInput, 'product' | 'brand' | 'specif
   return [[item.brand, item.product].filter(Boolean).join(' '), item.specification].filter(Boolean).join(' · ');
 }
 
+export function lineNameOnly(item: Pick<ItemInput, 'product'>) {
+  return (item.product ?? '').trim() || '未命名货品';
+}
+
+export function lineMetaLabel(item: Pick<ItemInput, 'brand' | 'specification'>) {
+  return [item.brand ?? '', item.specification ?? ''].map(value => value.trim()).filter(Boolean).join(' · ');
+}
+
 export function amountLabel(cents: number, pendingPrices: number, label: string) {
   return pendingPrices ? `已算金额 ¥${money(cents)} · 含 ${pendingPrices} 项待补价` : `${label} ¥${money(cents)}`;
 }
@@ -46,7 +54,8 @@ export const deliveryLabel: Record<DeliveryStatus, string> = { pending: '未配�
 
 export function lineView(line: OrderLine) {
   const discontinued = line.catalogStatus === 'discontinued';
-  return { ...line, productLabel: productLabel(line), priceLabel: line.price === null ? '待补价' : `¥${line.price}`,
+  return { ...line, productLabel: productLabel(line), nameOnly: lineNameOnly(line), metaLabel: lineMetaLabel(line),
+    priceLabel: line.price === null ? '待补价' : `¥${line.price}`,
     amount: line.amountCents === null ? '待补价' : money(line.amountCents),
     amountLabel: line.amountCents === null ? '待补价' : `¥${money(line.amountCents)}`,
     priceSourceLabel: priceSourceLabel(line.priceSource), discontinued,

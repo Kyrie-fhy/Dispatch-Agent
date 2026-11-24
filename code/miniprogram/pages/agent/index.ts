@@ -11,7 +11,7 @@ import { chooseMaterial, forgetStaged, materialInfo, sameMaterial, stagedMateria
   transferMaterial } from '../../services/materials';
 import { readVoiceFile, startVoiceRecording, transcribeVoice, VoiceFileError } from '../../services/voice';
 import { revokeSession, wechatCode, WorkspaceError, workspaceRequest } from '../../services/workspace';
-import { errorMessage, catalogHintText, priceSourceLabel, productLabel, tripView } from '../order-view';
+import { errorMessage, catalogHintText, lineMetaLabel, lineNameOnly, priceSourceLabel, productLabel, tripView } from '../order-view';
 
 type Conversation = { draft: TripDraft; draftConfirmed: boolean; confirmedPreviewId?: string | null; turns: AgentTurn[]; delivery?: DeliveryProgress | null };
 type PollResult = { status: AgentStatus; events: AgentEvent[] };
@@ -170,8 +170,24 @@ function view(turn: AgentTurn, revision: number, confirmed: boolean, last: boole
   const showStandaloneUndo = Boolean(canUndo && !showDraftActions);
   const allDelivered = Boolean(delivery && delivery.shops.length > 0 && delivery.shops.every(shop => shop.locked));
   const showDeliveryFooter = Boolean(last && confirmed && turn.status === 'completed' && !deliveryActive);
+  const runningStepText = turn.status === 'running'
+    ? checklist.find(item => item.state === 'running')?.text
+      || checklist.find(item => item.state !== 'done' && item.state !== 'skipped')?.text
+      || '正在整理…'
+    : '';
+  const endText = (end?.text ?? '').trim();
+  let summaryText = '';
+  if (turn.status !== 'running') {
+    if (undone) summaryText = '这一步已撤销';
+    else if (endText && !(endText === '草稿已更新。' && changes.length)) summaryText = endText;
+    else if (changes.length) summaryText = '已整理入本趟草稿';
+    else if (preview) summaryText = '已生成送货单预览，请核对后确认出单';
+    else if (proposal) summaryText = '已整理门店送货核对卡';
+    else if (turn.status === 'failed' || turn.status === 'interrupted') summaryText = '这一步没跑完，可以把原消息放回输入框重试';
+  }
   return { id: turn.id, text: turn.text, pictures: turn.materialIds.length, checklist, questions, changes, undone, issued, links, showChoices,
-    status: turn.status, reply: changes.length && end?.text === '草稿已更新。' ? '' : end?.text ?? '',
+    status: turn.status, runningStepText, summaryText,
+    reply: changes.length && end?.text === '草稿已更新。' ? '' : end?.text ?? '',
     elapsed: end?.elapsedMs === undefined ? '' : `用时 ${Math.max(1, Math.round(end.elapsedMs / 1000))} 秒`,
     canAnswer, hasPendingQuestions, showDraftSummary, showDraftActions, showStandaloneUndo, showDeliveryFooter, allDelivered,
     canRetry: last && (turn.status === 'failed' || turn.status === 'interrupted'),
@@ -197,7 +213,8 @@ function draftSummary(draft: TripDraft, pending: number) {
   const customers = draft.customers.map(customer => ({
     id: customer.id, name: customer.customer || '未命名客户',
     lines: customer.items.filter(line => line.product || line.quantity || line.price || line.brand || line.specification)
-      .map(line => ({ id: line.id, product: productLabel(line) || '未命名货品', quantity: line.quantity, unit: line.unit,
+      .map(line => ({ id: line.id, product: productLabel(line) || '未命名货品', nameOnly: lineNameOnly(line),
+        metaLabel: lineMetaLabel(line), quantity: line.quantity, unit: line.unit,
         price: line.price ? '¥' + line.price : '待补价', pending: !line.price,
         priceSource: line.priceSource ?? '', priceSourceLabel: priceSourceLabel(line.priceSource),
         discontinued: line.catalogStatus === 'discontinued', priceHint: line.priceHint ?? '',
@@ -221,6 +238,7 @@ Page({
     readyImages: [] as Attachment[], uploadRows: [] as (MaterialSource & { id?: string; local: boolean })[],
     draftSummary: null as ReturnType<typeof draftSummary> | null, draftExpanded: false, issuedCard: false, revokeFailed: false,
     deliverySummary: null as ReturnType<typeof deliverySummaryView> | null, navTitle: '录单助手', focusInput: false, imageLimit,
+    voiceCorrectionHint: '',
     choices: [] as ChoiceView[], memoryNames: [] as string[], rememberOff: {} as Record<string, boolean>,
     memoryFailed: false, notice: '', priceHints: {} as Record<string, PriceHint>, adoptableCount: 0,
     catalogChoices: [] as CatalogChoiceView[],
@@ -236,6 +254,7 @@ Page({
   pending: new Map<string, string>(),
   voiceCapture: null as ReturnType<typeof startVoiceRecording> | null,
   voiceFile: null as VoiceFile | null,
+  voiceMeta: null as { rawText: string; corrections: { from: string; to: string }[] } | null,
   discardVoice: false,
   pauseUpload: false,
   retiredToken: '',
@@ -275,6 +294,7 @@ Page({
     this.turns = [];
     this.pending.clear();
     this.voiceFile = null;
+    this.voiceMeta = null;
     this.confirmedPreviewId = '';
     this.delivery = null;
     this.memory = null;
@@ -282,7 +302,7 @@ Page({
       error: '', text: '', turns: [], attachments: [], readyImages: [], uploadRows: [], pendingMaterial: '',
       scrollTo: '', draftSummary: null, deliverySummary: null, navTitle: '录单助手', focusInput: false, draftExpanded: false,
       issuedCard: false, voiceRetry: false, inputMode: 'text', revokeFailed: !!this.retiredToken,
-      choices: [], memoryNames: [], rememberOff: {}, memoryFailed: false, notice: '', priceHints: {}, adoptableCount: 0,
+      voiceCorrectionHint: '', choices: [], memoryNames: [], rememberOff: {}, memoryFailed: false, notice: '', priceHints: {}, adoptableCount: 0,
       catalogChoices: [] });
     applyNavTitle('录单助手');
   },
@@ -344,10 +364,13 @@ Page({
     const target = agentSession.deliveryCustomer;
     agentSession.deliveryCustomer = null;
     const prefill = draftConfirmed && target?.tripId === draft.id && !this.data.text.trim();
-    if (changedMode || !sameTrip) this.voiceFile = null;
+    if (changedMode || !sameTrip) {
+      this.voiceFile = null;
+      this.voiceMeta = null;
+    }
     this.setData({ confirmed: draftConfirmed, draftsAvailable: true, polling: !!active,
       ...(changedMode || !sameTrip ? { text: '', attachments: [], readyImages: [], uploadRows: [], draftExpanded: false,
-        pendingMaterial: '', voiceRetry: false, inputMode: 'text' } : {}),
+        pendingMaterial: '', voiceRetry: false, inputMode: 'text', voiceCorrectionHint: '' } : {}),
       ...(prefill ? { text: `${target.name}：`, focusInput: !active, inputMode: 'text' } : { focusInput: false }) });
     await this.loadMemory(draft, draftConfirmed, generation, token);
     if (generation !== this.generation || token !== agentSession.token) return;
@@ -471,7 +494,13 @@ Page({
     }
   },
 
-  editText(event: WechatMiniprogram.TextareaInput) { this.setData({ text: event.detail.value }); },
+  editText(event: WechatMiniprogram.TextareaInput) {
+    const text = event.detail.value;
+    if (!text.trim()) {
+      this.voiceMeta = null;
+      this.setData({ text, voiceCorrectionHint: '' });
+    } else this.setData({ text });
+  },
 
   request<T>(path: string, input: object) {
     const key = JSON.stringify([path, input]);
@@ -549,11 +578,13 @@ Page({
       const token = agentSession.token;
       try {
         const { turnId } = await this.request<{ turnId: string }>('/agent/turns',
-          { draftId: draft.id, revision: draft.revision, text, materialIds, ...(direct ? { direct } : {}) });
+          { draftId: draft.id, revision: draft.revision, text, materialIds,
+            ...(direct ? { direct } : {}), ...(!direct && this.voiceMeta ? { voiceMeta: this.voiceMeta } : {}) });
         if (generation !== this.generation || token !== agentSession.token) return;
         this.turns = this.turns.filter(turn => turn !== local);
         if (!this.turns.some(turn => turn.id === turnId)) this.turns.push({ ...local, id: turnId });
-        this.setData({ ...(!direct ? { text: '', attachments: [], readyImages: [] } : {}), polling: true });
+        if (!direct) this.voiceMeta = null;
+        this.setData({ ...(!direct ? { text: '', attachments: [], readyImages: [], voiceCorrectionHint: '' } : {}), polling: true });
         this.render();
         this.schedule();
       } catch (error) {
@@ -954,7 +985,9 @@ Page({
       this.voiceCapture?.cancel();
     }
     const inputMode = this.data.inputMode === 'text' ? 'voice' : 'text';
-    this.setData({ inputMode, ...(inputMode === 'text' ? { focusInput: !this.data.busy } : { focusInput: false }) });
+    this.voiceMeta = null;
+    this.setData({ inputMode, voiceCorrectionHint: '',
+      ...(inputMode === 'text' ? { focusInput: !this.data.busy } : { focusInput: false }) });
   },
 
   voiceTap() {
@@ -993,7 +1026,8 @@ Page({
   async transcribe() {
     const file = this.voiceFile;
     if (!file) return;
-    this.setData({ voicePhase: '正在转写', voiceRetry: false });
+    this.voiceMeta = null;
+    this.setData({ voicePhase: '正在转写', voiceRetry: false, voiceCorrectionHint: '' });
     try {
       const bytes = await readVoiceFile(file.path);
       const result = await transcribeVoice(file.draft, bytes, agentSession.token, true);
@@ -1001,8 +1035,17 @@ Page({
       const text = [this.data.text.trim(), result.text.trim()].filter(Boolean).join('\n');
       if (!result.text.trim()) throw new Error('语音转写没有返回文字，请重试。');
       if (text.length > textOrderLimit) throw new Error('转写后文字太长，请缩短输入框内容再重试。');
+      const corrections = Array.isArray(result.corrections)
+        ? result.corrections.filter(item => item && item.from && item.to) : [];
+      if (corrections.length) {
+        this.voiceMeta = { rawText: result.rawText || result.text, corrections };
+        this.setData({ text, inputMode: 'text',
+          voiceCorrectionHint: `已自动纠正：${corrections.map(item => `${item.from}→${item.to}`).join('、')}` });
+      } else {
+        this.voiceMeta = null;
+        this.setData({ text, inputMode: 'text', voiceCorrectionHint: '' });
+      }
       this.voiceFile = null;
-      this.setData({ text, inputMode: 'text' });
     } catch (error) {
       if (error instanceof VoiceFileError || (error instanceof WorkspaceError && error.status < 500)) this.voiceFile = null;
       this.setData({ voiceRetry: !!this.voiceFile });

@@ -1,3 +1,4 @@
+import { clearCatalogIdentity, itemIdentityChanged } from '../draft-input';
 import { randomUUID } from 'node:crypto';
 import { isObject } from '../../miniprogram/core/orders';
 import { CustomerDirectory, normalizeMemoryText, resolveCustomerMention } from '../../miniprogram/core/memory';
@@ -43,12 +44,6 @@ function repeatedQuantity(source: string, unit: string) {
   if (!unit || changeVerb.test(source) || /追加|再加|加上|增加|多[要来拿]/.test(source) ||
       statedQuantity(source, unit, incrementVerb) !== undefined) return;
   return statedQuantity(source, unit, repeatVerb);
-}
-
-function compatibleDetail(fromDraft?: string | null, fromCandidate?: string) {
-  const oldValue = normalized(fromDraft ?? '');
-  const newValue = normalized(fromCandidate ?? '');
-  return !oldValue || !newValue || oldValue === newValue;
 }
 
 function quantityQuestion(row: ReturnType<typeof targetRows>[number], quantity: number) {
@@ -109,7 +104,7 @@ function normalizeAddFill(op: Record<string, unknown>, draft: TripDraft, source:
 }
 
 export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[], source: string, previous?: PreviousQuestions,
-  confirmed = false, directory?: CustomerDirectory) {
+  confirmed = false, directory?: CustomerDirectory, catalogEnabled = false) {
   if (!isObject(value) || !Array.isArray(value.operations) || !value.operations.length || value.operations.length > 24) invalidTool();
   const operations = value.operations.map((op: unknown) => isObject(op) && (op.action === 'add' || op.action === 'fill')
     ? normalizeAddFill(op, draft, source, directory) : op);
@@ -118,6 +113,8 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
   const initial = targetRows(draft);
   const actualRows = initial.filter(entry => !isPlaceholder(entry.item));
   const lines: string[] = [];
+  const questions: Question[] = [];
+  let conflicts: ReturnType<typeof mergeOrder>['conflicts'] = [];
   const confirmations: string[] = [];
   let deleting = false;
   const names = new Set(parties.map(party => normalized(party.name)));
@@ -143,26 +140,22 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
       !includesValue(response, op.price.trim()))) return issues('请明确说明要填写的单价。');
     if (edits.some(op => isObject(op) && typeof op.quantity === 'string' && op.quantity.trim() &&
       !includesValue(response, op.quantity.trim()))) return issues('请说明要填写的确切数量。');
-    if (checkRepeat && repeatVerb.test(response)) {
-      for (const op of edits) {
-        if (!isObject(op) || op.action !== 'add' || typeof op.customer !== 'string') continue;
-        const customerName = normalized(op.customer);
-        const { unit, product, quantity: proposed, brand, specification } = safeFields(op, invalidTool);
-        if (!customerName || !unit || !product || !proposed) continue;
-        const quantity = repeatedQuantity(response, normalized(unit));
-        if (quantity === undefined || quantity !== Number(proposed)) continue;
-        const matches = actualRows.filter(({ customer, item }) =>
-          normalized(customer.customer) === customerName &&
-          normalized(item.product) === normalized(product) &&
-          normalized(item.unit) === normalized(unit) &&
-          compatibleDetail(item.brand, brand) && compatibleDetail(item.specification, specification));
-        if (matches.length === 1) return quantityQuestion(matches[0], quantity);
-      }
-    }
     const contextSource = priorText ? `${source} ${priorText}` : source;
     const merged = mergeOrder(next, { operations: edits }, names, contextSource, true);
-    if (!merged.draft) return { issues: merged.issues };
-    next.customers = merged.draft.customers;
+    conflicts = merged.conflicts;
+    if (!merged.draft && !conflicts.length) return { issues: merged.issues };
+    if (merged.draft) next.customers = merged.draft.customers;
+    for (const conflict of conflicts) {
+      const label = [conflict.brand, conflict.product, conflict.specification].filter(Boolean).join(' ');
+      const originalRow = actualRows.find(row => row.item.id === conflict.existingRow.id);
+      const quantity = checkRepeat && conflict.unit ? repeatedQuantity(response, normalized(conflict.unit)) : undefined;
+      if (operations.length === 1 && originalRow && quantity !== undefined && quantity === Number(conflict.quantity)) {
+        questions.push(...quantityQuestion(originalRow, quantity).questions);
+      } else {
+        questions.push({ customer: conflict.customer,
+          text: `「${conflict.customer} · ${label}」草稿里已有同款，需要修改已有数量还是保留原明细？`, options: [] });
+      }
+    }
   }
 
   for (const op of operations as unknown[]) {
@@ -219,6 +212,8 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
       customer !== old.customer && customer.customer.trim() && targetSource.includes(normalized(customer.customer)));
     const explicit = changeVerb.test(response + selected);
     const fields = safeFields(op, invalidTool);
+    const unitChanged = fields.unit !== undefined && fields.unit !== row.item.unit;
+    const productChanged = fields.product !== undefined && fields.product !== row.item.product;
     if (checkRepeat && fields.quantity && (!fields.unit || normalized(fields.unit) === normalized(old.item.unit))) {
       const quantity = repeatedQuantity(response, normalized(old.item.unit));
       if (quantity !== undefined &&
@@ -228,7 +223,7 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
     }
     for (const field of textFields) {
       const value = fields[field];
-      if (typeof value !== 'string' || value === row.item[field]) continue;
+      if (typeof value !== 'string' || (value === row.item[field] && !(field === 'price' && (unitChanged || productChanged)))) continue;
       const increment = field === 'quantity'
         ? statedQuantity(selected || response, normalized(row.item.unit), incrementVerb) ||
           (selected && priorText && incrementVerb.test(selected)
@@ -244,6 +239,14 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
         confirmations.push(`${label} ${row.item[field] || '空'}${unit}改成 ${value}${unit}`);
       }
       row.item[field] = value;
+      if (field === 'price' && catalogEnabled) row.item.priceSource = 'spoken';
+    }
+    const identityChanged = itemIdentityChanged(row.item, old.item);
+    if (identityChanged) clearCatalogIdentity(row.item);
+    if (!fields.price && (unitChanged || productChanged || (identityChanged
+      && (row.item.priceSource === 'catalog' || row.item.priceSource === 'customer_history')))) {
+      row.item.price = null;
+      row.item.priceSource = null;
     }
   }
 
@@ -267,7 +270,7 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
       continue;
     }
     for (const field of textFields) {
-      if (item[field] === prior[field]) continue;
+      if (item[field] === prior[field] || (catalogEnabled && field === 'price')) continue;
       const label = { product: '货品', brand: '品牌', specification: '规格', unit: '单位', quantity: '数量', price: '单价' }[field];
       const unit = field === 'quantity' ? item.unit : field === 'price' ? '元' : '';
       const from = prior[field] ? `${prior[field]}${unit}` : '空';
@@ -276,7 +279,10 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
     }
   }
   if (added) lines.unshift(`新增 ${added} 行`);
-  if (JSON.stringify(next.customers) === JSON.stringify(draft.customers)) return issues('草稿已有相同内容，请核对明细。');
+  if (JSON.stringify(next.customers) === JSON.stringify(draft.customers)) {
+    return questions.length ? { questions, conflicts } : issues('草稿已有相同内容，请核对明细。');
+  }
   if (!lines.length) lines.push('已补充客户或货品信息');
-  return { draft: { ...next, revision: draft.revision + 1 }, lines, added };
+  return { draft: { ...next, revision: draft.revision + 1 }, lines, added,
+    ...(questions.length ? { questions, conflicts } : {}) };
 }

@@ -12,8 +12,11 @@ const { migrate } = require('../../code/server-dist/server/migrate');
 const { startLocalServer } = require('../../code/server-dist/server/main');
 const { configuredWechatLogin } = require('../../code/server-dist/server/wechat-login');
 const { configuredImageModel, configuredTextModel, imagePromptVersion, textPromptVersion } = require('../../code/server-dist/server/text-model');
-const { configuredSpeechModel } = require('../../code/server-dist/server/voice');
-const { configuredAgentModel, agentPromptVersion } = require('../../code/server-dist/server/agent/model');
+const { configuredSpeechModel, configuredVoiceCorrector, correctVoiceText, sanitizeVoiceCorrection } =
+  require('../../code/server-dist/server/voice');
+const { CatalogStore } = require('../../code/server-dist/server/catalog');
+const { catalogCsvColumns } = require('../../code/server-dist/miniprogram/core/catalog');
+const { configuredAgentModel, agentPrompt, agentPromptVersion, agentTools } = require('../../code/server-dist/server/agent/model');
 const { configuredIntentModel, intentPromptVersion } = require('../../code/server-dist/server/agent/intent');
 const { configuredDeliveryModel, deliveryPromptVersion } = require('../../code/server-dist/server/agent/delivery-model');
 const { HttpError } = require('../../code/server-dist/server/http-error');
@@ -79,11 +82,13 @@ function runPostgresClient(tool, database, args, input) {
 }
 
 async function start(db, wechat, textModel, imageModel, speechModel, agentModel,
-  intentModel = agentModel && (async () => ({ draft: true, preview: false, query: false, answering: false })), deliveryModel) {
+  intentModel = agentModel && (async () => ({ draft: true, preview: false, query: false, answering: false })), deliveryModel,
+  voiceCorrector) {
   const pool = db.pool();
   let server;
   try {
-    server = await startLocalServer(pool, 0, wechat, textModel, imageModel, speechModel, agentModel, intentModel, deliveryModel);
+    server = await startLocalServer(pool, 0, wechat, textModel, imageModel, speechModel, agentModel, intentModel, deliveryModel,
+      undefined, voiceCorrector);
   } catch (error) {
     await pool.end();
     throw error;
@@ -1801,10 +1806,11 @@ test('A2 agent voice transcribes the confirmed current trip without writing orde
   const draft = await read(api, token);
   const voice = (basis, path = '/v1/agent/transcription') => api.request(path, { method: 'POST', token,
     body: { wave: wave.toString('base64') }, headers: { 'x-draft-id': basis.id, 'x-draft-revision': String(basis.revision) } });
-  assert.deepEqual(await voice(draft), { status: 200, data: { draftId: draft.id, revision: draft.revision, text } });
+  assert.deepEqual(await voice(draft), { status: 200, data: { draftId: draft.id, revision: draft.revision, text, rawText: text, corrections: [] } });
   const current = (await deliveryFixture(api, token, [a2.shop('north', '北街餐馆', [a2.item('dumpling')])])).draft;
   const before = await deliverySnapshot(db);
-  assert.deepEqual(await voice(current), { status: 200, data: { draftId: current.id, revision: current.revision, text } });
+  assert.deepEqual(await voice(current), { status: 200, data: { draftId: current.id, revision: current.revision, text,
+    rawText: text, corrections: [] } });
   assert.equal((await voice(current, `/v1/drafts/${current.id}/transcription`)).data.error, 'draft_confirmed');
   assert.equal((await voice({ ...current, revision: current.revision + 1 })).data.error, 'draft_changed');
   assert.deepEqual(await deliverySnapshot(db), before);
@@ -1812,6 +1818,152 @@ test('A2 agent voice transcribes the confirmed current trip without writing orde
     body: { draftId: current.id, requestId: randomUUID() } })).status, 200);
   assert.equal((await voice(current)).status, 404);
   assert.equal(calls, 2);
+});
+
+test('voice correction sends a names-only payload and rejects malformed or changed amounts', async t => {
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+  const rawText = '两箱乔总管响铃卷，3袋冻虾，每袋12元';
+  const text = rawText.replace('乔', '巧');
+  const correction = { from: '乔总管', to: '巧总管' };
+  const vocabulary = { products: ['响铃卷'], brands: ['巧总管'], aliases: [], customers: [], customerAliases: [] };
+  const fallback = { text: rawText, rawText, corrections: [] };
+  for (const text of [
+    '三箱巧总管响铃卷，3袋冻虾，每袋12元',
+    '两袋巧总管响铃卷，3箱冻虾，每袋12元',
+    '两箱巧总管响铃卷，三袋冻虾，每袋12元',
+    '两箱巧总管响铃卷，3袋冻虾，每箱12元',
+    '两箱巧总管响铃卷，3袋冻虾，每袋13元',
+    '', 'x'.repeat(1601), '\0',
+  ]) assert.deepEqual(sanitizeVoiceCorrection(rawText, { text, corrections: [correction] }), fallback);
+  assert.deepEqual(sanitizeVoiceCorrection(rawText, { text, corrections: [
+    { from: '', to: '巧总管' }, { from: '冻虾', to: '冻虾' }, { from: '不存在', to: '巧总管' },
+    { from: '乔总管', to: '不在结果中' }, { from: false, to: '巧总管' }, ...Array(13).fill(correction),
+  ] }), { text, rawText, corrections: Array(12).fill(correction) });
+  assert.equal(configuredVoiceCorrector({}), undefined);
+  const corrector = configuredVoiceCorrector({ DISPATCH_TEXT_MODEL_KEY: 'fixture' });
+  const requests = [];
+  let content = JSON.stringify({ text, corrections: [correction] });
+  global.fetch = async (url, options) => {
+    requests.push({ url, options });
+    return new Response(JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content } }] }));
+  };
+  assert.deepEqual(await correctVoiceText(rawText, vocabulary, corrector), { text, rawText, corrections: [correction] });
+  const [{ url, options }] = requests;
+  assert.equal(url, 'https://api.deepseek.com/chat/completions');
+  assert.ok(options.signal instanceof AbortSignal);
+  const { model, temperature, thinking, response_format, messages } = JSON.parse(options.body);
+  assert.deepEqual({ model, temperature, thinking, response_format }, {
+    model: 'deepseek-flash', temperature: 0, thinking: { type: 'disabled' }, response_format: { type: 'json_object' },
+  });
+  assert.deepEqual(JSON.parse(messages[1].content), { rawText, vocabulary });
+  assert.equal(messages[0].role, 'system');
+  assert.match(messages[0].content, /明显不通顺/);
+  assert.match(messages[0].content, /同音/);
+  assert.match(messages[0].content, /数量/);
+  assert.match(messages[0].content, /单位/);
+  assert.match(messages[0].content, /单价/);
+  assert.match(messages[0].content, /编造/);
+  assert.doesNotMatch(messages[0].content, /灵石|临时冻虾/);
+  const spoken = '一箱林石带鱼';
+  const smoothed = { text: '一箱临时带鱼', corrections: [{ from: '林石', to: '临时' }] };
+  assert.deepEqual(sanitizeVoiceCorrection(spoken, smoothed), { ...smoothed, rawText: spoken });
+  for (const changed of [
+    { text: '两箱临时带鱼', corrections: smoothed.corrections },
+    { text: '一袋临时带鱼', corrections: smoothed.corrections },
+    { text: '一箱临时带鱼，每箱12元', corrections: smoothed.corrections },
+  ]) assert.deepEqual(sanitizeVoiceCorrection(spoken, changed), { text: spoken, rawText: spoken, corrections: [] });
+  content = '{broken json';
+  assert.deepEqual(await correctVoiceText(rawText, vocabulary, corrector), fallback);
+});
+
+test('agent product fields keep non-brand modifiers out of brand', () => {
+  assert.equal(agentPromptVersion, 'a1-agent-v5');
+  assert.match(agentPrompt, /不是品牌/);
+  assert.match(agentPrompt, /保留在 product 中/);
+  assert.match(agentPrompt, /只有明确可识别的商标或厂牌名称才写入 brand/);
+  assert.match(agentPrompt, /不确定时 brand 留空字符串/);
+  assert.doesNotMatch(agentPrompt, /灵石|临时冻虾/);
+  const editDraft = agentTools.find(tool => tool.function.name === 'edit_draft');
+  assert.ok(editDraft);
+  const { brand, product } = editDraft.function.parameters.properties.operations.items.properties;
+  assert.match(brand.description, /不是品牌/);
+  assert.match(brand.description, /空字符串/);
+  assert.match(brand.description, /商标、品牌或厂牌/);
+  assert.match(product.description, /非品牌的修饰词/);
+  assert.match(product.description, /排除明确的品牌、规格和订货数量/);
+  assert.doesNotMatch(`${brand.description}${product.description}`, /灵石|临时冻虾/);
+});
+
+test('agent voice correction is account-scoped, falls back, and logs only internal turn events', { timeout: 30_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const rawText = '王记两箱乔总管响铃卷，临时冻虾3袋';
+  const text = rawText.replace('乔', '巧');
+  const good = { text, corrections: [{ from: '乔总管', to: '巧总管' }] };
+  const inputs = [];
+  let correct = () => good;
+  const api = await start(db, undefined, undefined, undefined, async () => ({ text: rawText }),
+    async () => makeToolReply(['ask_user', { questions: [{ customer: '王记', text: '请核对', options: [] }] }]),
+    undefined, undefined, async input => { inputs.push(input); return correct(); });
+  const tokenA = await login(api, 'a');
+  await login(api, 'b');
+  const draft = await read(api, tokenA);
+  const wave = pcmWave(3200).toString('base64');
+  const transcribe = (token, draft, path = '/v1/agent/transcription') => api.request(path, {
+    method: 'POST', token, body: { wave }, headers: { 'x-draft-id': draft.id, 'x-draft-revision': String(draft.revision) },
+  });
+  const fallback = basis => ({ status: 200, data: { draftId: basis.id, revision: basis.revision, text: rawText, rawText, corrections: [] } });
+  assert.deepEqual(await transcribe(tokenA, draft), fallback(draft));
+  assert.equal(inputs.length, 0);
+  const catalog = new CatalogStore(db.admin);
+  const csv = row => [catalogCsvColumns, row].map(fields => fields.join(',')).join('\n');
+  await catalog.importCsv('dev:a', csv(['P1', '1', '速冻', '巧总管响铃卷120g', '巧总管', '响铃卷', '120g', '单规格', '箱',
+    '190.00', '已下架', '已核实', '品牌全称「巧总管食品」']));
+  await catalog.importCsv('dev:b', csv(['P2', '1', '速冻', '其他号货品', '其他号品牌', '其他号货品', '150g', '单规格', '箱',
+    '16', '在售', '已核实', '']));
+  const { rows: [account] } = await db.admin.query("SELECT id FROM dispatch.accounts WHERE identity_subject = 'a'");
+  const customerId = randomUUID();
+  await db.admin.query("INSERT INTO dispatch.parties (account_id, id, name) VALUES ($1, $2, '王记餐饮')", [account.id, customerId]);
+  await db.admin.query("INSERT INTO dispatch.customer_aliases (account_id, customer_id, alias, normalized_alias) VALUES ($1, $2, '王记', '王记')",
+    [account.id, customerId]);
+
+  const result = await transcribe(tokenA, draft);
+  assert.deepEqual(result, { status: 200, data: { draftId: draft.id, revision: draft.revision, rawText, ...good } });
+  const expected = { products: ['响铃卷'], brands: ['巧总管', '巧总管食品'], aliases: ['巧总管响铃卷120g'],
+    customers: ['王记餐饮'], customerAliases: ['王记'] };
+  assert.deepEqual(inputs, [{ rawText, vocabulary: expected }]);
+  assert.doesNotMatch(JSON.stringify(inputs[0].vocabulary), /price|190|19000|其他号/);
+  assert.deepEqual(await transcribe(tokenA, draft, `/v1/drafts/${draft.id}/transcription`), {
+    status: 200, data: { draftId: draft.id, revision: draft.revision, text: rawText },
+  });
+  assert.equal(inputs.length, 1);
+  for (const invalid of [
+    () => { throw new Error('offline'); },
+    () => ({ ...good, text: text.replace('两箱', '三箱') }),
+    () => ({ ...good, text: text + '，每袋120元' }),
+    () => ({ ...good, text: text.replace('3袋', '3袋价格') }),
+    () => new Promise(() => {}),
+  ]) {
+    correct = invalid;
+    assert.deepEqual(await transcribe(tokenA, draft), fallback(draft));
+  }
+  assert.deepEqual(await read(api, tokenA), draft);
+
+  const payload = { rawText, text, corrections: good.corrections };
+  const body = { ...agentInput(draft, text), voiceMeta: { rawText, corrections: good.corrections } };
+  const submitted = await agentPost(api, tokenA, 'turns', body);
+  assert.equal(submitted.status, 202, JSON.stringify(submitted.data));
+  const turn = await waitForAgent(api, tokenA, submitted.data.turnId);
+  assert.equal(turn.status, 'completed');
+  assert.equal(turn.events.some(event => event.kind === 'voice_correction'), false);
+  assert.deepEqual(await agentPost(api, tokenA, 'turns', body), submitted);
+  const recorded = () => db.admin.query("SELECT payload FROM dispatch.agent_events WHERE account_id = $1 AND kind = 'voice_correction'", [account.id]);
+  assert.deepEqual((await recorded()).rows, [{ payload }]);
+  const invalid = await agentPost(api, tokenA, 'turns', { ...agentInput(draft, text),
+    voiceMeta: { rawText, corrections: Array(13).fill(good.corrections[0]) } });
+  assert.equal(invalid.status, 202);
+  await waitForAgent(api, tokenA, invalid.data.turnId);
+  assert.deepEqual((await recorded()).rows, [{ payload }]);
 });
 
 test('A2 sends one candidate tool call and records the v3 prompt version', async t => {

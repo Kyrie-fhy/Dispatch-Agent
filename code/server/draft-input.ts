@@ -1,4 +1,4 @@
-import { isDraft, isObject, ItemInput } from '../miniprogram/core/orders';
+import { catalogStatuses, isDraft, isObject, itemPriceSources, ItemInput, nullablePrice } from '../miniprogram/core/orders';
 import { isTripDraft, TripDraft } from '../miniprogram/core/trips';
 import { HttpError } from './http-error';
 
@@ -15,6 +15,53 @@ function optionalItemFields(value: unknown) {
 
 function itemFields({ id, product, brand, specification, unit, quantity, price }: ItemInput): ItemInput {
   return { id, product, brand, specification, unit, quantity, price };
+}
+
+const catalogFields = ['catalogProductId', 'catalogVariantId', 'catalogStatus', 'priceSource', 'priceHint'] as const;
+
+function draftItemFields(item: ItemInput): ItemInput {
+  const validId = (id: string | null | undefined) => id == null || (typeof id === 'string' && uuidPattern.test(id));
+  if (!validId(item.catalogProductId) || !validId(item.catalogVariantId)
+    || (item.catalogStatus != null && !catalogStatuses.includes(item.catalogStatus))
+    || (item.priceSource != null && !itemPriceSources.includes(item.priceSource))
+    || (item.priceHint != null && (typeof item.priceHint !== 'string' || !cleanText(item.priceHint, 4000)))) {
+    throw new HttpError(400, 'invalid_catalog_metadata', '草稿的货品规格或价格来源不正确');
+  }
+  return Object.assign(itemFields(item), Object.fromEntries(
+    catalogFields.filter(key => item[key] !== undefined).map(key => [key, item[key]])));
+}
+
+export function itemIdentityChanged(item: ItemInput, prior: ItemInput) {
+  return (['product', 'brand', 'specification', 'unit'] as const).some(key => item[key] !== prior[key]);
+}
+
+export function clearCatalogIdentity(item: ItemInput) {
+  delete item.catalogProductId;
+  delete item.catalogVariantId;
+  delete item.catalogStatus;
+  delete item.priceHint;
+}
+
+export function reconcileManualItem(item: ItemInput, previous?: ItemInput, sameCustomer = true): ItemInput {
+  // Catalog metadata on a manual save comes from the server's previous copy of the row.
+  const next = itemFields(item);
+  const sameIdentity = previous && !itemIdentityChanged(item, previous);
+  if (sameIdentity) {
+    for (const key of catalogFields) {
+      if (previous[key] !== undefined) Object.assign(next, { [key]: previous[key] });
+    }
+  }
+  const price = nullablePrice(item.price);
+  if (price !== nullablePrice(previous?.price ?? null)) {
+    next.priceSource = price === null ? null : 'manual';
+  } else if (previous?.priceSource === 'customer_history' && (!sameIdentity || !sameCustomer)
+    || previous?.priceSource === 'catalog' && !sameIdentity) {
+    next.price = null;
+    next.priceSource = null;
+  } else if (!sameIdentity && previous?.priceSource !== undefined) {
+    next.priceSource = previous.priceSource;
+  }
+  return next;
 }
 
 export interface SaveDraftInput {
@@ -37,8 +84,8 @@ export function readSaveDraft(id: string, value: unknown): SaveDraftInput {
       throw new HttpError(400, 'invalid_customer', '请重新选择已有客户');
     }
     const fields = [customer.id, customer.customer];
-    const items = customer.items.map(itemFields);
-    for (const item of items) fields.push(...Object.values(item));
+    const items = customer.items.map(draftItemFields);
+    for (const item of items) fields.push(...Object.values(itemFields(item)));
     if (!fields.every(value => value === null || cleanText(value, 200))) {
       throw new HttpError(400, 'invalid_draft', '草稿字段过长或包含无效字符');
     }

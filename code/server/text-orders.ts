@@ -1,9 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { Pool, PoolClient } from 'pg';
+import { resolveCustomerMention } from '../miniprogram/core/memory';
 import { emptyItem, isObject, ItemInput } from '../miniprogram/core/orders';
 import { textFields, textOrderLimit, validTextField } from '../miniprogram/core/text-order';
 import { CustomerDraft, TripDraft } from '../miniprogram/core/trips';
 import { missingDraft, readAccount, readAccountResult, readParties, readWorkspace, Workspace, workspaceDraft, writeAccount } from './account-workspace';
+import { applyCatalogToDraft, loadCatalog } from './catalog';
+import { clearCatalogIdentity, itemIdentityChanged } from './draft-input';
+import { readDirectory } from './memory';
 import { HttpError } from './http-error';
 import { readOrderImage } from './materials';
 import { readId, readPreviewInput, validRevision } from './request-input';
@@ -47,8 +51,8 @@ export function targetRows(draft: TripDraft) {
 }
 
 function fieldsOf(item: ItemInput): Fields {
-  const { id: _id, ...fields } = item;
-  return fields;
+  const { product, brand, specification, unit, quantity, price } = item;
+  return { product, brand, specification, unit, quantity, price };
 }
 
 export function isPlaceholder(item: ItemInput) {
@@ -58,10 +62,10 @@ export function isPlaceholder(item: ItemInput) {
 export function sameOrSimilarProduct(item: ItemInput, candidate: Partial<Fields>) {
   const product = normalized(candidate.product ?? '');
   if (!product || normalized(item.product) !== product) return false;
-  return productFields.every(field => {
+  return (['unit', 'brand', 'specification'] as const).every(field => {
     const existing = normalized(item[field] ?? '');
     const incoming = normalized(candidate[field] ?? '');
-    return !existing || !incoming || existing === incoming;
+    return !incoming || existing === incoming || (field === 'unit' && !existing);
   });
 }
 
@@ -79,7 +83,11 @@ export function safeFields(op: Record<string, unknown>, invalidModel: () => neve
   return fields;
 }
 
-function prepareOrder(draft: TripDraft, output: unknown, partyNames: Set<string>, text?: string, agent = false): TripDraft {
+type ProductConflict = { customer: string; product: string; brand: string; specification: string; unit: string;
+  quantity: string; existingRow: Pick<ItemInput, 'id' | 'product' | 'brand' | 'specification' | 'unit' | 'quantity'> };
+
+function prepareOrder(draft: TripDraft, output: unknown, partyNames: Set<string>, text: string | undefined,
+  agent: boolean, conflicts: ProductConflict[]): TripDraft | null {
   const image = text === undefined;
   const partyChoice = (owner: CustomerDraft, name: string) => {
     if (agent) return owner.partyId === null || (name && !partyNames.size) ? null : undefined;
@@ -146,10 +154,22 @@ function prepareOrder(draft: TripDraft, output: unknown, partyNames: Set<string>
         const incoming = fields[field];
         if (!incoming) continue;
         const existing = row.item[field]?.trim();
+        if (field === 'price' && (row.item.priceSource === 'catalog' || row.item.priceSource === 'customer_history')) {
+          row.item.price = incoming;
+          row.item.priceSource = 'spoken';
+          continue;
+        }
         if (existing && normalized(existing) !== normalized(incoming)) {
           needsReview('这段文字与草稿已填内容冲突，请在对应明细中手动核对。');
         }
         if (!existing) row.item[field] = incoming;
+      }
+      if (itemIdentityChanged(row.item, selected.item)) {
+        clearCatalogIdentity(row.item);
+        if (!fields.price && (row.item.priceSource === 'catalog' || row.item.priceSource === 'customer_history')) {
+          row.item.price = null;
+          row.item.priceSource = null;
+        }
       }
     } else {
       if (op.target !== undefined && op.target !== null) invalidModel();
@@ -169,8 +189,16 @@ function prepareOrder(draft: TripDraft, output: unknown, partyNames: Set<string>
         owner.partyId = partyChoice(owner, customer);
       }
       if (image && !customer) unnamedImageCustomer = owner;
-      if (owner.items.some(item => sameOrSimilarProduct(item, fields))) {
-        needsReview('草稿里有同款或相似货品，请补充规格和单位，或直接修改现有明细。');
+      const duplicate = owner.items.find(item => sameOrSimilarProduct(item, fields));
+      if (duplicate && product) {
+        const customerLabel = owner.customer || '未填写客户';
+        if (!agent || image) {
+          needsReview(`「${customerLabel} · ${product}」草稿里已有同款，请补充品牌/规格/单位，或直接修改现有明细。`);
+        }
+        const { price, ...existingRow } = fieldsOf(duplicate);
+        conflicts.push({ customer: customerLabel, product, brand: fields.brand ?? '', specification: fields.specification ?? '',
+          unit: fields.unit ?? '', quantity: fields.quantity ?? '', existingRow: { id: duplicate.id, ...existingRow } });
+        continue;
       }
       const blank = owner.items.findIndex(isPlaceholder);
       const item = { ...emptyItem(blank < 0 ? randomUUID() : owner.items[blank].id), unit: '', price: null, ...fields };
@@ -179,6 +207,7 @@ function prepareOrder(draft: TripDraft, output: unknown, partyNames: Set<string>
     }
   }
   if (JSON.stringify(next.customers) === JSON.stringify(draft.customers)) {
+    if (conflicts.length) return null;
     needsReview(image ? '图片没有新增可填写的内容，请核对草稿。' : '这段文字没有新增可填写的内容，请核对草稿。');
   }
   return { ...next, revision: draft.revision + 1 };
@@ -187,10 +216,17 @@ function prepareOrder(draft: TripDraft, output: unknown, partyNames: Set<string>
 class OrderReview extends Error {}
 
 export function mergeOrder(draft: TripDraft, output: unknown, partyNames: Set<string>, text?: string, agent = false) {
-  try { return { draft: prepareOrder(draft, output, partyNames, text, agent), issues: [] }; }
-  catch (error) {
+  const conflicts: ProductConflict[] = [];
+  try {
+    const next = prepareOrder(draft, output, partyNames, text, agent, conflicts);
+    if (next) return { draft: next, issues: [], conflicts };
+    const [conflict] = conflicts;
+    return { draft: null, issues: [{ code: 'text_needs_review',
+      message: `「${conflict.customer} · ${conflict.product}」草稿里已有同款，请说明是再加一行还是修改已有数量。` }], conflicts };
+  } catch (error) {
     if (!(error instanceof OrderReview)) throw error;
-    return { draft: null, issues: [{ code: text === undefined ? 'image_needs_review' : 'text_needs_review', message: error.message }] };
+    return { draft: null, issues: [{ code: text === undefined ? 'image_needs_review' : 'text_needs_review', message: error.message }],
+      conflicts: [] };
   }
 }
 
@@ -294,7 +330,27 @@ export class TextOrders {
         hooks?.signal.throwIfAborted();
         checkBasis(latest, input);
         if (textDigest) await checkDuplicate(client, account, input.draftId, textDigest);
-        const draft = hooks ? await hooks.prepare(client, candidate, workspaceDraft(latest)) : candidate;
+        const before = workspaceDraft(latest);
+        const draft = hooks ? await hooks.prepare(client, candidate, before) : candidate;
+        if (!hooks) {
+          const catalog = await loadCatalog(client, account);
+          if (catalog.length) {
+            const directory = await readDirectory(client, account);
+            const previous = new Map(before.customers.map(customer => [customer.id, customer]));
+            for (const customer of draft.customers) {
+              if (!customer.customer || customer.partyId || previous.get(customer.id)?.customer === customer.customer) continue;
+              const mention = resolveCustomerMention(directory, customer.customer);
+              if (mention.status !== 'resolved') continue;
+              if (draft.customers.some(sibling => sibling !== customer && sibling.partyId === mention.customerId)) {
+                delete customer.partyId;
+                continue;
+              }
+              customer.customer = mention.canonicalName;
+              customer.partyId = mention.customerId;
+            }
+            await applyCatalogToDraft(client, account, draft, before, catalog, image ? undefined : input.text);
+          }
+        }
         await client.query('UPDATE dispatch.workspaces SET draft_revision = $2, draft_customers = $3 WHERE account_id = $1',
           [account, draft.revision, JSON.stringify(draft.customers)]);
         if (picture) {

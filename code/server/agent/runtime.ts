@@ -7,6 +7,7 @@ import { spokenNumbers } from '../../miniprogram/core/spoken-numbers';
 import { textOrderQuestions } from '../../miniprogram/core/text-order';
 import { previewTrip, resolveCustomerChoices, type TripDraft } from '../../miniprogram/core/trips';
 import { readAccount, readParties, readWorkspace, workspaceDraft, writeAccount } from '../account-workspace';
+import { applyCatalogToDraft, loadCatalog } from '../catalog';
 import { readSaveDraft } from '../draft-input';
 import { HttpError } from '../http-error';
 import { overlappingItems, readDirectory } from '../memory';
@@ -103,11 +104,13 @@ function summarizeEditResult(result: Record<string, unknown>) {
     return { outcome: 'confirmation', accept: confirmation.accept,
       question: isObject(result.question) ? String(result.question.text ?? '') : '' };
   }
-  if ('questions' in result && Array.isArray(result.questions)) {
+  if (!('revision' in result) && Array.isArray(result.questions)) {
     return { outcome: 'questions', questions: summarizeQuestions(result.questions as Question[]) };
   }
   if ('issues' in result) return { outcome: 'issues', issues: result.issues };
   return { outcome: 'applied', added: result.added, revision: result.revision, lines: result.lines,
+    ...(Array.isArray(result.questions) ? { questions: summarizeQuestions(result.questions as Question[]), conflicts: result.conflicts } : {}),
+    ...(result.catalog ? { catalog: result.catalog } : {}),
     customerLinks: Array.isArray(result.links) ? result.links.filter(isObject).map(link => ({
       spoken: link.spoken, canonicalName: link.canonicalName, matchedBy: link.matchedBy, merged: Boolean(link.merged),
     })) : [] };
@@ -175,6 +178,9 @@ export class AgentRuntime {
     };
     try {
       await run.checkSession();
+      if (input.voiceMeta && (input.voiceMeta.rawText !== input.text || input.voiceMeta.corrections.length)) {
+        await this.store.append(key, 'voice_correction', { ...input.voiceMeta, text: input.text });
+      }
       const context = await this.store.context(key, run.revision);
       if (context.delivery) {
         await runDelivery(this.store, this.trips, this.deliveryModel, key, input, context.previous, signal, run.checkSession);
@@ -495,9 +501,11 @@ export class AgentRuntime {
     if ('confirmation' in result && result.confirmation && result.question) {
       await this.store.append(run.key, 'edit_confirmation', result.confirmation);
       run.questions.push(result.question);
-    } else if ('questions' in result && result.questions) run.questions.push(...result.questions);
-    else if ('issues' in result) run.questions.push(...issueQuestions(result.issues));
-    else if ('lines' in result && result.lines) run.lines.push(...result.lines);
+    } else if ('issues' in result) run.questions.push(...issueQuestions(result.issues));
+    else {
+      if ('questions' in result && result.questions) run.questions.push(...result.questions);
+      if ('lines' in result && result.lines) run.lines.push(...result.lines);
+    }
   }
 
   private requiredQuestions(run: Run): Promise<Question[]> {
@@ -598,17 +606,24 @@ export class AgentRuntime {
             checkDraft(workspace, draftId, run.revision, true);
             const before = workspaceDraft(workspace);
             const directory = await readDirectory(client, account);
+            const catalog = await loadCatalog(client, account);
             const prepared = prepareEdits(before, args, [...directory.customers], String(args.source), run.previous,
-              args.confirmed === true, directory);
+              args.confirmed === true, directory, Boolean(catalog.length));
             if (!('draft' in prepared) || !prepared.draft) return prepared;
             const linked = await this.linkCustomers(client, account, prepared.draft, before, directory);
+            const priced = await applyCatalogToDraft(client, account, prepared.draft, before, catalog, String(args.source));
+            if (JSON.stringify(prepared.draft.customers) === JSON.stringify(before.customers)) {
+              return { issues: [{ code: 'edit_needs_review', message: '没有可写入的新内容，请核对货品或明确单价。' }] };
+            }
             const { draft } = readSaveDraft(draftId, { ...prepared.draft, revision: run.revision, requestId });
             const revision = run.revision + 1;
-            const lines = [...prepared.lines!, ...linked.lines];
+            const lines = [...prepared.lines!, ...linked.lines, ...priced.lines];
             await client.query('UPDATE dispatch.workspaces SET draft_revision = $2, draft_customers = $3 WHERE account_id = $1',
               [account, revision, JSON.stringify(draft.customers)]);
             await this.saveDraftChange(client, run, revision, lines, linked.links);
-            return { added: prepared.added, lines, revision, links: linked.links };
+            return { added: prepared.added, lines, revision, links: linked.links,
+              ...(prepared.questions?.length ? { questions: prepared.questions, conflicts: prepared.conflicts } : {}),
+              ...(priced.changes.length ? { catalog: priced.changes } : {}) };
           });
         if ('revision' in result && result.revision !== undefined) run.revision = result.revision;
         if ('links' in result && result.links) run.customerLinks.push(...result.links);
@@ -622,14 +637,16 @@ export class AgentRuntime {
       try {
         const image = readImageOrder({ draftId, revision: run.revision, materialId, requestId: randomUUID() });
         let linked = { lines: [] as string[], links: [] as CustomerLink[] };
+        let priced: Awaited<ReturnType<typeof applyCatalogToDraft>> | undefined;
         const result = await withDeadline(this.orders.importImage(account, image, run.checkSession, {
           signal, trace: () => {}, recognized,
           prepare: async (client, draft, previous) => {
             linked = await this.linkCustomers(client, account, draft, previous);
+            priced = await applyCatalogToDraft(client, account, draft, previous);
             return draft;
           },
           saved: (client, draft, digest) => this.saveDraftChange(client, run, draft.revision,
-            [`图片新增 ${lineCount(draft) - lineCount(before)} 行`, ...linked.lines], linked.links, digest),
+            [`图片新增 ${lineCount(draft) - lineCount(before)} 行`, ...linked.lines, ...(priced?.lines ?? [])], linked.links, digest),
         }), signal);
         if ('issues' in result) {
           await this.traceTool(run, name, args, { outcome: 'issues', issues: result.issues });
@@ -638,7 +655,8 @@ export class AgentRuntime {
         run.revision = result.draft.revision;
         run.customerLinks.push(...linked.links);
         const added = lineCount(result.draft) - lineCount(before);
-        await this.traceTool(run, name, args, { outcome: 'applied', added, revision: run.revision });
+        await this.traceTool(run, name, args, { outcome: 'applied', added, revision: run.revision,
+          ...(priced?.changes.length ? { catalog: priced.changes } : {}) });
         return { added };
       } catch (error) {
         if (error instanceof HttpError && ['duplicate_order_image', 'unsupported_order_image'].includes(error.code)) {

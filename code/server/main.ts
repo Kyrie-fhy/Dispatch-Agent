@@ -10,11 +10,12 @@ import { Pool } from 'pg';
 import { databaseOptions, requireApplicationRole, trialMode } from './database';
 import { readAmendmentInput, readSaveDraft } from './draft-input';
 import { AmendmentStore } from './amendments';
+import { CatalogStore, loadCatalog } from './catalog';
 import { DraftStore } from './drafts';
 import { DeliveryStore, readDeliveryApply } from './delivery';
 import { LedgerStore } from './ledger';
 import { MaterialStore, readMaterialInput } from './materials';
-import { MemoryStore } from './memory';
+import { MemoryStore, readDirectory } from './memory';
 import { TripStore } from './trips';
 import { readConfirmInput, readDeliveryEdit, readDeliveryInput, readNextInput, readOpeningInput, readPreviewInput, readReceiptInput,
   readCommand, readReviewInput, uuidPattern, validRevision, validSheetKey } from './request-input';
@@ -24,7 +25,8 @@ import { isObject } from '../miniprogram/core/orders';
 import { materialChunkBytes } from '../miniprogram/core/materials';
 import { configuredImageModel, configuredTextModel, ImageModel, TextModel } from './text-model';
 import { readImageOrder, readTextOrder, TextOrders } from './text-orders';
-import { configuredSpeechModel, decodeWave, readTranscript, SpeechModel, validateWave, voiceMaxBytes, voiceMaxJsonBytes } from './voice';
+import { buildVoiceVocabulary, configuredSpeechModel, configuredVoiceCorrector, correctVoiceText, decodeWave, readTranscript,
+  sanitizeVoiceCorrection, SpeechModel, validateWave, VoiceCorrector, voiceMaxBytes, voiceMaxJsonBytes } from './voice';
 
 const bodyLimit = 512 * 1024;
 
@@ -71,8 +73,8 @@ function resourceId(path: string, collection: 'drafts' | 'trips'): string | null
 }
 
 async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery: DeliveryStore, ledger: LedgerStore, amendments: AmendmentStore,
-  materials: MaterialStore, textOrders: TextOrders, agent: AgentRuntime, memory: MemoryStore, request: IncomingMessage, response: ServerResponse,
-  wechat?: WechatLogin, speechModel?: SpeechModel, adminToken?: string): Promise<void> {
+  materials: MaterialStore, textOrders: TextOrders, agent: AgentRuntime, memory: MemoryStore, catalog: CatalogStore, request: IncomingMessage, response: ServerResponse,
+  wechat?: WechatLogin, speechModel?: SpeechModel, adminToken?: string, voiceCorrector?: VoiceCorrector): Promise<void> {
   const host = request.headers.host ?? '';
   if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host)) {
     throw new HttpError(400, 'invalid_host', '请通过本机地址访问草稿服务');
@@ -137,6 +139,14 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
       throw new HttpError(400, 'invalid_id', '请提供有效的草稿编号');
     }
     sendJson(response, 200, await memory.agentMemory(account, id));
+    return;
+  }
+  if (method === 'GET' && path === '/v1/catalog/summary') {
+    sendJson(response, 200, await catalog.summary(account));
+    return;
+  }
+  if (method === 'POST' && path === '/v1/agent/catalog-choice') {
+    sendJson(response, 200, await catalog.chooseDraftCatalog(account, await readJson(request, response)));
     return;
   }
   if (method === 'POST' && path === '/v1/agent/customer-choice') {
@@ -205,7 +215,22 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
     const result = await speechModel(wave);
     await store.accountFor(token, wechat?.appId);
     await checkVoice();
-    sendJson(response, 200, { draftId: voiceDraftId, revision, text: readTranscript(result) });
+    const rawText = readTranscript(result);
+    if (!agentVoice) {
+      sendJson(response, 200, { draftId: voiceDraftId, revision, text: rawText });
+      return;
+    }
+    let corrected = sanitizeVoiceCorrection(rawText, undefined);
+    if (voiceCorrector) {
+      const vocabulary = await readAccount(pool, account, async client =>
+        buildVoiceVocabulary(await loadCatalog(client, account), await readDirectory(client, account))).catch(() => undefined);
+      if (vocabulary && Object.values(vocabulary).some(words => words.length)) {
+        corrected = await correctVoiceText(rawText, vocabulary, voiceCorrector);
+      }
+      await store.accountFor(token, wechat?.appId);
+      await checkVoice();
+    }
+    sendJson(response, 200, { draftId: voiceDraftId, revision, ...corrected });
     return;
   }
   if (method === 'POST' && (path === '/v1/text-orders' || path === '/v1/image-orders')) {
@@ -341,7 +366,7 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
 
 export async function startLocalServer(pool: Pool, port: number, wechat?: WechatLogin, textModel?: TextModel,
   imageModel?: ImageModel, speechModel?: SpeechModel, agentModel?: AgentModel, intentModel?: IntentModel, deliveryModel?: DeliveryModel,
-  adminToken?: string): Promise<Server> {
+  adminToken?: string, voiceCorrector?: VoiceCorrector): Promise<Server> {
   await requireApplicationRole(pool);
   const store = new DraftStore(pool);
   const trips = new TripStore(pool);
@@ -350,12 +375,13 @@ export async function startLocalServer(pool: Pool, port: number, wechat?: Wechat
   const amendments = new AmendmentStore(pool);
   const materials = new MaterialStore(pool);
   const memory = new MemoryStore(pool);
+  const catalog = new CatalogStore(pool);
   const textOrders = new TextOrders(pool, textModel, imageModel);
   const agent = new AgentRuntime(pool, trips, textOrders, agentModel, intentModel, deliveryModel);
   await agent.store.interrupt();
   const server = createServer({ requestTimeout: 15_000 }, (request, response) => {
-    void handle(pool, store, trips, delivery, ledger, amendments, materials, textOrders, agent, memory, request, response,
-      wechat, speechModel, adminToken).catch(error => {
+    void handle(pool, store, trips, delivery, ledger, amendments, materials, textOrders, agent, memory, catalog, request, response,
+      wechat, speechModel, adminToken, voiceCorrector).catch(error => {
       if (response.destroyed) return;
       if (error instanceof HttpError) {
         sendJson(response, error.status, { error: error.code, message: error.message });
@@ -387,7 +413,7 @@ async function main(): Promise<void> {
   try {
     const server = await startLocalServer(pool, port, wechat, configuredTextModel(process.env),
       configuredImageModel(process.env), configuredSpeechModel(process.env), configuredAgentModel(process.env),
-      configuredIntentModel(process.env, 'A'), configuredDeliveryModel(process.env), adminToken);
+      configuredIntentModel(process.env, 'A'), configuredDeliveryModel(process.env), adminToken, configuredVoiceCorrector(process.env));
     const stop = () => {
       server.close(() => { void pool.end(); });
       server.closeIdleConnections();

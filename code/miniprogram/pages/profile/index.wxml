@@ -26,6 +26,31 @@
         <view class="row-label">熟客档案</view>
         <view class="row-value"><text class="num">{{partyCount}} 家</text></view>
       </view>
+      <view class="overview-row">
+        <view class="row-label">货品库</view>
+        <view class="row-value">
+          <block wx:if="{{catalogSummary && catalogSummary.productCount > 0}}">
+            <view class="row-main num">{{catalogSummary.productCount}} 种</view>
+            <view class="row-detail num">{{catalogSummary.variantCount}} 规格 · 在售 {{catalogSummary.activeVariantCount}}{{catalogSummary.discontinuedVariantCount ? ' · 已下架 ' + catalogSummary.discontinuedVariantCount : ''}}</view>
+            <view wx:if="{{catalogError}}" class="error-row">
+              <text class="row-detail">{{catalogError}}</text>
+              <button class="btn-ghost retry-inline-btn" bindtap="retryLoad" disabled="{{busy}}">重试</button>
+            </view>
+          </block>
+          <block wx:elif="{{catalogSummary}}">
+            <view class="row-main">尚未导入</view>
+            <view wx:if="{{catalogError}}" class="error-row">
+              <text class="row-detail">{{catalogError}}</text>
+              <button class="btn-ghost retry-inline-btn" bindtap="retryLoad" disabled="{{busy}}">重试</button>
+            </view>
+          </block>
+          <view wx:elif="{{catalogError}}" class="error-row">
+            <text class="row-main">{{catalogError}}</text>
+            <button class="btn-ghost retry-inline-btn" bindtap="retryLoad" disabled="{{busy}}">重试</button>
+          </view>
+          <view wx:else class="row-main">正在同步…</view>
+        </view>
+      </view>
     </view>
 
     <view class="card aliases-card">
@@ -37,9 +62,17 @@
             bindtap="unbindAlias" disabled="{{busy}}">解绑</button>
         </view>
       </view>
-      <text wx:if="{{aliasError}}" class="hint">{{aliasError}}</text>
+      <view wx:if="{{aliasError}}" class="error-row">
+        <text class="alias-text">{{aliasError}}</text>
+        <button class="btn-ghost retry-inline-btn" bindtap="retryLoad" disabled="{{busy}}">重试</button>
+      </view>
       <text wx:elif="{{aliasesLoaded && !aliases.length}}" class="hint">还没有记住的叫法。录单选店时勾选「记住这个叫法」即可。</text>
       <text wx:elif="{{!aliasesLoaded}}" class="hint">正在同步…</text>
+    </view>
+
+    <view wx:if="{{signedIn && !loaded && error}}" class="error-row">
+      <text class="hint">本页信息没加载出来</text>
+      <button class="btn-ghost retry-inline-btn" bindtap="retryLoad" disabled="{{busy}}">重试</button>
     </view>
 
     <view class="action-group">

@@ -7,9 +7,11 @@ import {
 import { isObject, money } from '../miniprogram/core/orders';
 import { missingDraft, readAccount, readParties, readWorkspace, workspaceDraft, writeAccount } from './account-workspace';
 import { checkDraft } from './agent/store';
-import { readSaveDraft } from './draft-input';
+import { clearCatalogIdentity, itemIdentityChanged, readSaveDraft } from './draft-input';
 import { HttpError } from './http-error';
 import { readCommand, readId, readPreviewInput, uuidPattern, validSheetKey } from './request-input';
+import { catalogPriceUpdate, loadCatalog, suggestCatalogChoices, summarizeCatalog, type CatalogPriceUpdate } from './catalog';
+import { matchCatalogItem, resolveCatalogAutoPrice } from '../miniprogram/core/catalog';
 import { sameOrSimilarProduct } from './text-orders';
 import type { CustomerDraft } from '../miniprogram/core/trips';
 
@@ -28,6 +30,7 @@ export interface CustomerChoiceResult {
   revision: number;
   remembered: boolean | null;
   rememberIssue?: 'name_conflict';
+  priceUpdates?: CatalogPriceUpdate[];
 }
 
 type CustomerChoice = 'existing' | 'new' | 'unlink';
@@ -197,11 +200,11 @@ async function readDraft(client: PoolClient, accountId: string, draftId: string)
   return workspace;
 }
 
-async function readHistoricalSales(client: PoolClient, accountId: string, customerIds: readonly string[]) {
+export async function readHistoricalSales(client: PoolClient, accountId: string, customerIds: readonly string[]) {
   if (!customerIds.length) return [];
   // The sheet carries party_id even when the version snapshot has no embedded partyId.
   const { rows } = await client.query<HistoricalSheet>(`
-    SELECT s.trip_id AS "tripId", s.id AS "sheetId", s.party_id AS "customerId", s.reviewed,
+    SELECT s.trip_id AS "tripId", s.id AS "sheetId", s.party_id AS "customerId", s.reviewed, s.delivery_completed AS "deliveryCompleted",
            t.statuses, t.delivery_edits AS edits, sheet.customer,
            to_char(issued.saved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS "issuedAt"
     FROM dispatch.sheets s
@@ -275,7 +278,10 @@ export class MemoryStore {
       const directory = await readDirectory(client, accountId);
       const draft = workspaceDraft(workspace);
       const confirmed = workspace.currentTripId === draftId;
+      const catalog = await loadCatalog(client, accountId);
       return {
+        catalogSummary: summarizeCatalog(catalog),
+        catalogChoices: confirmed ? [] : suggestCatalogChoices(draft, catalog),
         draftId, revision: workspace.revision, confirmed,
         customers: directory.customers.map(({ id, name }) => ({ id, name })),
         mentions: confirmed ? [] : suggestDraftCustomerMentions(draft.customers, directory),
@@ -301,6 +307,7 @@ export class MemoryStore {
       const alreadyLinked = typeof customer.partyId === 'string';
       let remembered: boolean | null = null;
       let rememberIssue: 'name_conflict' | undefined;
+      let pricedCustomer = customer;
 
       if (choice === 'existing') {
         if (alreadyLinked) throw new HttpError(409, 'customer_already_linked', '这位客户已关联熟客');
@@ -320,6 +327,7 @@ export class MemoryStore {
         if (sibling) {
           const items = input.merge === 'keep_existing' ? customer.items.filter(item => !overlap.includes(item)) : customer.items;
           sibling.items.push(...items);
+          pricedCustomer = sibling;
           draft.customers = draft.customers.filter(entry => entry !== customer);
         } else {
           customer.customer = party.name;
@@ -351,14 +359,38 @@ export class MemoryStore {
         delete customer.partyId;
       }
 
+      const priceUpdates: CatalogPriceUpdate[] = [];
+      if (choice === 'existing' || choice === 'unlink') {
+        const catalog = await loadCatalog(client, accountId);
+        const sales = choice === 'existing' && catalog.length
+          ? await readHistoricalSales(client, accountId, [input.customerId!]) : [];
+        pricedCustomer.items = pricedCustomer.items.map(item => {
+          let updated = item;
+          if (choice === 'existing' && item.catalogVariantId
+            && (item.priceSource === 'catalog' || (!item.price && !item.priceSource))) {
+            const match = matchCatalogItem(item, catalog);
+            const next = resolveCatalogAutoPrice(item, match, input.customerId, sales);
+            if (next.priceSource !== 'catalog') updated = next;
+          } else if (choice === 'unlink' && item.priceSource === 'customer_history') {
+            updated = resolveCatalogAutoPrice(item, matchCatalogItem(item, catalog));
+            if (!catalog.length) updated = { ...item, price: null, priceSource: null };
+          }
+          const update = updated === item ? null : catalogPriceUpdate(pricedCustomer, item, updated);
+          if (update) priceUpdates.push(update);
+          return updated;
+        });
+      }
+
       const { draft: saved } = readSaveDraft(draftId, { ...draft, revision, requestId });
       const nextRevision = revision + 1;
       await client.query('UPDATE dispatch.workspaces SET draft_revision = $2, draft_customers = $3 WHERE account_id = $1',
         [accountId, nextRevision, JSON.stringify(saved.customers)]);
       await client.query(`INSERT INTO dispatch.agent_events (account_id, draft_id, kind, payload)
         VALUES ($1, $2, 'card', $3)`, [accountId, draftId,
-        JSON.stringify({ action: 'customer-choice', choice, remembered, merge: input.merge })]);
-      return { revision: nextRevision, remembered, ...(rememberIssue ? { rememberIssue } : {}) };
+        JSON.stringify({ action: 'customer-choice', choice, remembered, merge: input.merge,
+          ...(priceUpdates.length ? { priceUpdates } : {}) })]);
+      return { revision: nextRevision, remembered, ...(rememberIssue ? { rememberIssue } : {}),
+        ...(priceUpdates.length ? { priceUpdates } : {}) };
     });
   }
 
@@ -380,6 +412,7 @@ export class MemoryStore {
         const customer = draft.customers.find(entry => entry.id === line.draftCustomerId);
         const item = customer?.items.find(entry => entry.id === line.lineId);
         if (!item) throw priceSuggestionChanged();
+        const previous = { ...item };
         if (suggestion.status === 'exact_match' || suggestion.status === 'unique_variant_match') {
           const accepted = suggestion.unitPriceCents === line.unitPriceCents
             || suggestion.previousDistinctPrice?.unitPriceCents === line.unitPriceCents;
@@ -399,6 +432,8 @@ export class MemoryStore {
         } else {
           throw priceNotSuggested();
         }
+        if (itemIdentityChanged(item, previous)) clearCatalogIdentity(item);
+        item.priceSource = 'customer_history';
       }
       const { draft: saved } = readSaveDraft(draftId, { ...draft, revision, requestId });
       const nextRevision = revision + 1;

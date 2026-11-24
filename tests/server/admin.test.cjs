@@ -179,6 +179,34 @@ function adminAuth(token) {
   return `Bearer ${token}`;
 }
 
+async function importCatalogRows(db, accountId, rows) {
+  const importId = randomUUID();
+  await db.owner.query('INSERT INTO dispatch.catalog_imports (account_id, id, sha256) VALUES ($1, $2, $3)',
+    [accountId, importId, randomBytes(32)]);
+  const productIds = new Map();
+  for (const row of rows) {
+    let productId = productIds.get(row.productCode);
+    if (!productId) {
+      productId = randomUUID();
+      productIds.set(row.productCode, productId);
+      await db.owner.query(`INSERT INTO dispatch.catalog_products
+        (account_id, id, product_code, category, product, brand, import_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [accountId, productId, row.productCode, row.category, row.product, row.brand, importId]);
+    }
+    await db.owner.query(`INSERT INTO dispatch.catalog_variants
+      (account_id, id, product_id, variant_code, packaging, flavor_or_grade, canonical_spec, unit, price_cents, status, import_id)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+    [accountId, randomUUID(), productId, row.variantCode, row.packaging ?? '', row.flavorOrGrade ?? null,
+      row.specification, row.unit ?? null, row.priceCents, row.status, importId]);
+    for (const alias of row.aliases ?? []) {
+      await db.owner.query(`INSERT INTO dispatch.catalog_aliases (account_id, product_id, normalized_alias, alias)
+        VALUES ($1, $2, $3, $4)`, [accountId, productId, `product:${alias}`, alias]);
+    }
+  }
+  return importId;
+}
+
 test('admin token configuration requires at least 16 characters', () => {
   assert.equal(configuredAdminToken({}), undefined);
   assert.equal(configuredAdminToken({ DISPATCH_ADMIN_TOKEN: '   ' }), undefined);
@@ -311,12 +339,69 @@ test('admin scopes tolerate unfinished draft values and keep full missing prices
     assert.equal(page.data.includes("accountId + ':' + id"), true);
     assert.equal(page.data.includes('URL.revokeObjectURL'), true);
     assert.ok((page.data.match(/clearMaterialUrls\(\)/g) || []).length >= 2);
+    for (const marker of ['timeline-bar', '① 收到原话', '② 判定意图', '③ 拆出明细', '④ 查库/护栏结果',
+      '查看原始技术报文', '语音原转写', '纠偏后提交', 'voice_correction']) {
+      assert.ok(page.data.includes(marker), `后台缺少 4 步时间轴结构 ${marker}`);
+    }
     const start = page.data.indexOf('<script>') + 8;
     const end = page.data.lastIndexOf('</script>');
     assert.ok(start > 7 && end > start);
     new vm.Script(page.data.slice(start, end));
 
     assert.deepEqual(await writeSnapshot(db), before);
+  } finally {
+    await api.stop();
+  }
+});
+
+test('admin scope returns voice correction evidence for the 4-step timeline', { timeout: 60_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const agentModel = async (_messages, _signal, record) => {
+    const operation = { action: 'add', customer: '老王', product: '水饺', quantity: '2', unit: '箱', price: '82' };
+    record({ model: 'fixture-agent', promptVersion: 'a1-agent-v5', outcome: 'tool_calls', elapsedMs: 4,
+      inputTokens: 80, outputTokens: 16, toolCalls: [{ name: 'edit_draft', arguments: JSON.stringify({ operations: [operation] }) }] });
+    return toolReply('edit_draft', { operations: [operation] });
+  };
+  const intentModel = async (_text, _context, _signal, record) => {
+    record({ model: 'fixture-intent', promptVersion: 'a1-agent-v5', outcome: 'received_json', elapsedMs: 2,
+      inputTokens: 40, outputTokens: 5 });
+    return { draft: true, preview: false, query: false, answering: false };
+  };
+  const adminToken = 'admin-voice-timeline-token-0123456789';
+  const api = await start(db, { agentModel, intentModel, adminToken });
+  try {
+    const token = await login(api, 'a');
+    const draft = await read(api, token);
+    const rawText = '老王订两箱水绞，82元一箱';
+    const text = '老王订两箱水饺，82元一箱';
+    const submitted = await api.request('/v1/agent/turns', { method: 'POST', token,
+      body: { ...agentInput(draft, text), voiceMeta: { rawText, corrections: [{ from: '水绞', to: '水饺' }] } } });
+    assert.equal(submitted.status, 202, JSON.stringify(submitted.data));
+    assert.equal((await waitForAgent(api, token, submitted.data.turnId)).status, 'completed');
+
+    const { rows: [account] } = await db.owner.query(
+      "SELECT id FROM dispatch.accounts WHERE identity_provider = 'development' AND identity_subject = 'a'");
+    const auth = adminAuth(adminToken);
+    const scope = await api.request(`/admin/api/accounts/${account.id}/scopes/${draft.id}`, { authorization: auth });
+    assert.equal(scope.status, 200, JSON.stringify(scope.data));
+    const turn = scope.data.turns.find(item => item.id === submitted.data.turnId);
+    assert.ok(turn, '未找到语音纠偏回合');
+    const voice = turn.events.find(event => event.kind === 'voice_correction');
+    assert.ok(voice, '范围接口未返回 voice_correction 事件');
+    assert.equal(voice.payload.rawText, rawText);
+    assert.equal(voice.payload.text, text);
+    assert.deepEqual(voice.payload.corrections, [{ from: '水绞', to: '水饺' }]);
+
+    const page = await api.request('/admin');
+    assert.equal(page.status, 200);
+    for (const marker of ['① 收到原话', '② 判定意图', '③ 拆出明细', '④ 查库/护栏结果',
+      '查看原始技术报文', '语音原转写', '纠偏后提交', 'voiceEventOf', 'voice-compare']) {
+      assert.ok(page.data.includes(marker), `后台缺少时间轴/语音对比结构 ${marker}`);
+    }
+    const scriptStart = page.data.indexOf('<script>') + 8;
+    const scriptEnd = page.data.lastIndexOf('</script>');
+    assert.ok(scriptStart > 7 && scriptEnd > scriptStart);
+    new vm.Script(page.data.slice(scriptStart, scriptEnd));
   } finally {
     await api.stop();
   }
@@ -509,6 +594,89 @@ test('admin reads two accounts, images, prompts and full harness events without 
     }
     assert.equal(prompts.data.prompts.find(entry => entry.id === 'text-order').prompts[0].text, textPrompt);
     assert.deepEqual(prompts.data.prompts.find(entry => entry.id === 'a2-candidate').tools, deliveryTools);
+
+    assert.deepEqual(await writeSnapshot(db), before);
+  } finally {
+    await api.stop();
+  }
+});
+
+test('admin catalog snapshot keeps read-only token protection and account isolation', { timeout: 60_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const adminToken = 'admin-catalog-snapshot-0123456789';
+  const api = await start(db, { adminToken });
+  try {
+    await login(api, 'a');
+    await login(api, 'b');
+    const { rows: [accountA] } = await db.owner.query(
+      "SELECT id FROM dispatch.accounts WHERE identity_provider = 'development' AND identity_subject = 'a'");
+    const { rows: [accountB] } = await db.owner.query(
+      "SELECT id FROM dispatch.accounts WHERE identity_provider = 'development' AND identity_subject = 'b'");
+    const auth = adminAuth(adminToken);
+
+    const empty = await api.request(`/admin/api/accounts/${accountB.id}/catalog`, { authorization: auth });
+    assert.equal(empty.status, 200, JSON.stringify(empty.data));
+    assert.deepEqual(empty.data.summary, { productCount: 0, variantCount: 0, activeVariantCount: 0,
+      discontinuedVariantCount: 0, missingUnitVariantCount: 0 });
+    assert.equal(empty.data.importedAt, null);
+    assert.deepEqual(empty.data.items, []);
+
+    await importCatalogRows(db, accountA.id, [
+      { productCode: 'P001', category: '冻品', product: '水饺', brand: '安井', variantCode: 'V001',
+        packaging: '袋装', specification: '500g', unit: '箱', priceCents: 8200, status: 'active', aliases: ['饺子'] },
+      { productCode: 'P002', category: '冻品', product: '鸭血', brand: '甲牌', variantCode: 'V002',
+        packaging: '盒装', specification: '300g', unit: null, priceCents: 700, status: 'discontinued' },
+    ]);
+    await importCatalogRows(db, accountB.id, [
+      { productCode: 'P900', category: '冻品', product: '带鱼', brand: '海牌', variantCode: 'V900',
+        packaging: '箱装', specification: '1kg', unit: '箱', priceCents: 12000, status: 'active' },
+    ]);
+
+    const before = await writeSnapshot(db);
+    const path = `/admin/api/accounts/${accountA.id}/catalog`;
+    assert.equal((await api.request(path)).status, 401);
+    assert.equal((await api.request(path, { authorization: adminAuth('wrong-catalog-token-0123456789') })).status, 401);
+    assert.equal((await api.request(path, { authorization: auth, method: 'POST', body: {} })).status, 405);
+    assert.equal((await api.request('/admin/api/accounts/not-a-uuid/catalog', { authorization: auth })).status, 400);
+
+    const catalogA = await api.request(path, { authorization: auth });
+    assert.equal(catalogA.status, 200, JSON.stringify(catalogA.data));
+    assert.deepEqual(catalogA.data.summary, { productCount: 2, variantCount: 2, activeVariantCount: 1,
+      discontinuedVariantCount: 1, missingUnitVariantCount: 1 });
+    assert.equal(typeof catalogA.data.importedAt, 'string');
+    assert.equal(Number.isNaN(Date.parse(catalogA.data.importedAt)), false);
+    assert.deepEqual(catalogA.data.items.map(item => item.productCode), ['P001', 'P002']);
+    const dumpling = catalogA.data.items.find(item => item.variantCode === 'V001');
+    assert.deepEqual(dumpling, { productCode: 'P001', variantCode: 'V001', category: '冻品', product: '水饺',
+      brand: '安井', specification: '500g', unit: '箱', priceCents: 8200, status: 'active', aliases: ['饺子'] });
+    assert.equal('productId' in dumpling, false);
+    assert.equal('brandAliases' in dumpling, false);
+    const duckBlood = catalogA.data.items.find(item => item.variantCode === 'V002');
+    assert.equal(duckBlood.unit, null);
+    assert.equal(duckBlood.priceCents, 700);
+    assert.equal(duckBlood.status, 'discontinued');
+    assert.deepEqual(duckBlood.aliases, []);
+
+    const catalogB = await api.request(`/admin/api/accounts/${accountB.id}/catalog`, { authorization: auth });
+    assert.equal(catalogB.status, 200, JSON.stringify(catalogB.data));
+    assert.deepEqual(catalogB.data.items.map(item => item.productCode), ['P900']);
+    assert.equal(JSON.stringify(catalogB.data).includes('水饺'), false);
+    assert.equal(JSON.stringify(catalogB.data).includes('饺子'), false);
+
+    const overviewA = await api.request(`/admin/api/accounts/${accountA.id}/overview`, { authorization: auth });
+    assert.equal(overviewA.status, 200);
+    assert.deepEqual(overviewA.data.catalogSummary, catalogA.data.summary);
+
+    const page = await api.request('/admin');
+    assert.equal(page.status, 200);
+    for (const token of ['货品库', 'data-left="catalog"', 'catalog-search', 'npm run catalog:import',
+      '熟客价', '库内价', '?catalog=1']) {
+      assert.ok(page.data.includes(token), `后台缺少货品库结构 ${token}`);
+    }
+    const scriptStart = page.data.indexOf('<script>') + 8;
+    const scriptEnd = page.data.lastIndexOf('</script>');
+    assert.ok(scriptStart > 7 && scriptEnd > scriptStart);
+    new vm.Script(page.data.slice(scriptStart, scriptEnd));
 
     assert.deepEqual(await writeSnapshot(db), before);
   } finally {

@@ -21,8 +21,86 @@ export function productLabel(item: Pick<ItemInput, 'product' | 'brand' | 'specif
   return [[item.brand, item.product].filter(Boolean).join(' '), item.specification].filter(Boolean).join(' · ');
 }
 
+export function lineNameOnly(item: Pick<ItemInput, 'product'>) {
+  return (item.product ?? '').trim() || '未命名货品';
+}
+
+export function lineMetaLabel(item: Pick<ItemInput, 'brand' | 'specification'>) {
+  return [item.brand ?? '', item.specification ?? ''].map(value => value.trim()).filter(Boolean).join(' · ');
+}
+
 export function amountLabel(cents: number, pendingPrices: number, label: string) {
   return pendingPrices ? `已算金额 ¥${money(cents)} · 含 ${pendingPrices} 项待补价` : `${label} ¥${money(cents)}`;
+}
+
+export function priceSourceLabel(source: ItemInput['priceSource']): string {
+  if (source === 'customer_history') return '熟客价';
+  if (source === 'catalog') return '库内价';
+  return '';
+}
+
+// 把「库内仅记 ¥6.00（未标箱价）」这类程序员提示换成配送员能直接读懂的大白话。
+function plainHint(text: string): string {
+  return text.split(' / ').map(segment => {
+    const item = segment.trim();
+    if (!item) return '';
+    const missingUnit = /^库内仅记\s*¥([\d.]+)（未标([^）]+)）$/.exec(item);
+    if (missingUnit) {
+      const price = `¥${missingUnit[1]}`;
+      const unit = missingUnit[2];
+      if (unit === '计价单位') return `库里只记 ${price}，没写单位`;
+      return `库里只有散价 ${price}，没${unit.replace(/价$/, '')}价`;
+    }
+    const printedUnit = /^库内仅记\s+([^\s¥]+)\s+¥([\d.]+)/.exec(item);
+    if (printedUnit) return `库里只有 ${printedUnit[1]} ¥${printedUnit[2]}`;
+    return item.replace(/^库内仅记\s*/, '库里只记 ');
+  }).filter(Boolean).join(' / ').replace(/¥(\d+)\.00(?!\d)/g, '¥$1');
+}
+
+export function catalogHintText(priceHint: string | null | undefined, discontinued: boolean): string {
+  let text = (priceHint ?? '').trim();
+  if (!text) return '';
+  if (discontinued) text = text.replace(/已下架，请核实库存[。.]?\s*/g, '').trim();
+  if (!text) return '';
+  return plainHint(text);
+}
+
+// 「库内仅记 …」里的参考价只拆成可点按钮；配送员亲手点按后才填本地输入框，绝不自动提交。
+export function catalogReferencePrices(priceHint: string | null | undefined): { value: string; label: string }[] {
+  const text = (priceHint ?? '').replace(/已下架，请核实库存[。.]?\s*/g, '').trim();
+  if (!text) return [];
+  const amountValue = (raw: string) => {
+    const value = raw.replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '');
+    return /^\d+(?:\.\d+)?$/.test(value) && Number(value) > 0 ? value : '';
+  };
+  const found: { value: string; unit?: string }[] = [];
+  let inCatalogRun = false;
+  for (const raw of text.split(/ \/ | · /)) {
+    const segment = raw.trim();
+    if (!segment) continue;
+    const start = /^库内仅记\s*(.+)$/.exec(segment);
+    if (start) {
+      inCatalogRun = true;
+      const priced = /^([^\s¥]+)\s*¥([\d.]+)/.exec(start[1]);
+      if (priced) { found.push({ value: amountValue(priced[2]), unit: priced[1] }); continue; }
+      const bare = /^¥([\d.]+)/.exec(start[1]);
+      if (bare) { found.push({ value: amountValue(bare[1]) }); continue; }
+      inCatalogRun = false;
+      continue;
+    }
+    if (!inCatalogRun) continue;
+    const priced = /^([^\s¥]+)\s*¥([\d.]+)/.exec(segment);
+    if (!priced) { inCatalogRun = false; continue; }
+    found.push({ value: amountValue(priced[2]), unit: priced[1] });
+  }
+  const valid = found.filter(entry => entry.value);
+  const withUnit = valid.length > 1;
+  const prices: { value: string; label: string }[] = [];
+  for (const entry of valid) {
+    const label = withUnit && entry.unit ? `用 ¥${entry.value}（${entry.unit}）` : `用 ¥${entry.value}`;
+    if (!prices.some(item => item.value === entry.value && item.label === label)) prices.push({ value: entry.value, label });
+  }
+  return prices.slice(0, 4);
 }
 
 export function editLines(items: ItemInput[], id: string, field: string, value: string): ItemInput[] {
@@ -33,9 +111,16 @@ export function editLines(items: ItemInput[], id: string, field: string, value: 
 export const deliveryLabel: Record<DeliveryStatus, string> = { pending: '未配送', delivered: '已送达', unrecorded: '未记录' };
 
 export function lineView(line: OrderLine) {
-  return { ...line, productLabel: productLabel(line), priceLabel: line.price === null ? '待补价' : `¥${line.price}`,
+  const discontinued = line.catalogStatus === 'discontinued';
+  const metaLabel = lineMetaLabel(line);
+  const catalogHint = catalogHintText(line.priceHint, discontinued);
+  return { ...line, productLabel: productLabel(line), nameOnly: lineNameOnly(line), metaLabel,
+    priceLabel: line.price === null ? '待补价' : `¥${line.price}`,
     amount: line.amountCents === null ? '待补价' : money(line.amountCents),
-    amountLabel: line.amountCents === null ? '待补价' : `¥${money(line.amountCents)}` };
+    amountLabel: line.amountCents === null ? '待补价' : `¥${money(line.amountCents)}`,
+    priceSourceLabel: priceSourceLabel(line.priceSource), discontinued,
+    priceHint: line.priceHint ?? '', catalogHint,
+    secondaryText: [metaLabel, catalogHint].filter(Boolean).join(' · ') };
 }
 
 function customerView(customer: CustomerOrder) {

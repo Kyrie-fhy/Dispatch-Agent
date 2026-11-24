@@ -107,3 +107,19 @@
   height: var(--tap-min);
   padding: 0 20rpx;
 }
+
+.error-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16rpx;
+  width: 100%;
+  padding: 8rpx 0;
+}
+
+.retry-inline-btn {
+  flex: none;
+  width: 168rpx;
+  height: 80rpx;
+  padding: 0 20rpx;
+}

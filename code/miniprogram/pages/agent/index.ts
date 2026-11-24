@@ -396,12 +396,13 @@ Page({
     });
   },
 
-  async reload(): Promise<void> {
+  async reload(scrollToLatest?: boolean): Promise<void> {
     const token = agentSession.token;
     if (!token) return;
     const generation = this.generation;
     const { draft, draftConfirmed, confirmedPreviewId, turns, delivery } = await workspaceRequest<Conversation>('GET', '/agent/conversation', token);
     if (generation !== this.generation || token !== agentSession.token) return;
+    const hadDraft = Boolean(this.draft);
     const sameTrip = !this.draft || this.draft.id === draft.id;
     const changedMode = this.data.confirmed !== draftConfirmed;
     this.draft = draft;
@@ -422,7 +423,7 @@ Page({
       ...(prefill ? { text: `${target.name}：`, focusInput: !active, inputMode: 'text' } : { focusInput: false }) });
     await this.loadMemory(draft, draftConfirmed, generation, token);
     if (generation !== this.generation || token !== agentSession.token) return;
-    this.render();
+    this.render(scrollToLatest ?? (!hadDraft || !sameTrip || changedMode));
     if (active) this.schedule();
     if (!draftConfirmed) void this.syncMaterials(draft, generation);
   },
@@ -444,7 +445,7 @@ Page({
     }
   },
 
-  render() {
+  render(scrollToLatest = false) {
     const revision = this.draft?.revision ?? -1;
     const preview = [...this.turns].reverse().find(turn => turn.events.some(event => event.kind === 'preview') &&
       !turn.events.some(event => event.kind === 'step' && event.payload.id === 'confirm' && event.payload.state === 'skipped'));
@@ -500,7 +501,7 @@ Page({
     this.setData({ turns, scrollTo: '', issuedCard: turns.some(turn => turn.issued),
       deliverySummary, draftSummary: draftInfo, navTitle, choices, memoryNames, priceHints, adoptableCount,
       catalogChoices, memoryCustomers, quickCustomers });
-    this.setData({ scrollTo: 'latest' });
+    if (scrollToLatest) this.setData({ scrollTo: 'latest' });
     applyNavTitle(navTitle);
   },
 
@@ -666,7 +667,7 @@ Page({
     if (!draft || !agentSession.token || this.data.busy || this.data.polling || (!text && !materialIds.length)) return;
     const local: AgentTurn = { id: 'sending', text, materialIds, revision: draft.revision, events: [], status: 'running' };
     this.turns.push(local);
-    this.render();
+    this.render(true);
     return this.run(async () => {
       const generation = this.generation;
       const token = agentSession.token;
@@ -930,7 +931,7 @@ Page({
 
   editPriceDrawerPrice(event: WechatMiniprogram.Input) {
     const lineId = String(event.currentTarget.dataset.line ?? '');
-    this.setData({ priceDrawerRows: this.data.priceDrawerRows.map(row =>
+    this.setData({ priceDrawerFocusId: '', priceDrawerRows: this.data.priceDrawerRows.map(row =>
       row.lineId === lineId ? { ...row, price: event.detail.value } : row) });
   },
 
@@ -938,13 +939,13 @@ Page({
     const lineId = String(event.currentTarget.dataset.line ?? '');
     const value = String(event.currentTarget.dataset.value ?? '');
     if (!value) return;
-    this.setData({ priceDrawerRows: this.data.priceDrawerRows.map(row =>
+    this.setData({ priceDrawerFocusId: '', priceDrawerRows: this.data.priceDrawerRows.map(row =>
       row.lineId === lineId ? { ...row, price: value } : row) });
   },
 
   toggleDrawerSpec(event: WechatMiniprogram.TouchEvent) {
     const lineId = String(event.currentTarget.dataset.line ?? '');
-    this.setData({ priceDrawerRows: this.data.priceDrawerRows.map(row =>
+    this.setData({ priceDrawerFocusId: '', priceDrawerRows: this.data.priceDrawerRows.map(row =>
       row.lineId === lineId ? { ...row, showSpec: !row.showSpec } : row) });
   },
 
@@ -952,7 +953,7 @@ Page({
     const lineId = String(event.currentTarget.dataset.line ?? '');
     const field = String(event.currentTarget.dataset.field ?? '');
     if (field !== 'unit' && field !== 'specification') return;
-    this.setData({ priceDrawerRows: this.data.priceDrawerRows.map(row => row.lineId !== lineId
+    this.setData({ priceDrawerFocusId: '', priceDrawerRows: this.data.priceDrawerRows.map(row => row.lineId !== lineId
       ? row : { ...row, [field === 'unit' ? 'inputUnit' : 'inputSpecification']: event.detail.value }) });
   },
 

@@ -2150,3 +2150,69 @@ test('6.5-10 keeps the new sheets native, equal-width and reachable', () => {
     assert.ok(profileWxss.includes(token), `缺少重试样式 ${token}`);
   }
 });
+
+test('in-place agent actions keep current scroll position instead of jumping to bottom', async t => {
+  const customerId = 'c-scroll';
+  const lineId = 'l-scroll';
+  let draft = {
+    id: 'draft-scroll', revision: 1,
+    customers: [{
+      id: customerId, customer: '占位店',
+      items: [{
+        id: lineId, product: '蛋挞皮', brand: '鲁亿嘉腾', specification: '', unit: '袋', quantity: '5',
+        price: null, catalogStatus: 'unit_mismatch', priceHint: '库内仅记 ¥8.00（未标袋价）',
+      }],
+    }],
+  };
+  const { page, handle, setDraft, setTurns } = setup(t, draft);
+  draft = { ...draft, customers: [{ ...draft.customers[0], customer: '' }] };
+  setDraft(draft);
+  setTurns([{
+    id: 't-scroll', text: '', materialIds: ['m-1'], revision: 1, status: 'completed',
+    events: [
+      { seq: 1, kind: 'change', payload: { lines: ['新增 1 行'] } },
+      { seq: 2, kind: 'questions', payload: { questions: [{ customer: '第 1 位客户', text: '请填写客户名称', options: [] }] } },
+      { seq: 3, kind: 'end', payload: { status: 'completed', text: '草稿已更新。', revision: 1 } },
+    ],
+  }]);
+  handle(request => {
+    if (request.path === '/agent/memory') {
+      request.ok({ draftId: draft.id, revision: draft.revision, confirmed: false,
+        customers: [{ id: 'p-1', name: '王记餐饮' }], mentions: [], prices: [], catalogChoices: [] });
+      return true;
+    }
+    if (request.method === 'PUT' && request.path === `/drafts/${draft.id}`) {
+      draft = { ...draft, revision: draft.revision + 1, customers: request.data.customers };
+      setDraft(draft);
+      request.ok({ draft });
+      return true;
+    }
+    if (request.method === 'POST' && request.path === '/agent/turns') {
+      request.ok({ turnId: 't-next' });
+      return true;
+    }
+    return false;
+  });
+
+  await page.onShow();
+  await page.login();
+  assert.equal(page.data.scrollTo, 'latest', '首次进入滚动到最新位置');
+
+  page.editInlineCustomerName({ ...tap({ customer: customerId }), detail: { value: '张记火锅' } });
+  await page.saveInlineCustomerName(tap({ customer: customerId }));
+  assert.equal(page.data.scrollTo, '', '保存客户名称后不跳到底部');
+
+  page.openPriceDrawer(tap({ line: lineId }));
+  assert.equal(page.data.priceDrawerFocusId, `pf-${lineId}`);
+  page.applyRefPrice(tap({ line: lineId, value: '8' }));
+  assert.equal(page.data.priceDrawerFocusId, '', '抽屉内点参考价后解除定位锚点，避免回弹');
+  await page.savePriceDrawer();
+  assert.equal(page.data.scrollTo, '', '保存速填抽屉后不跳到底部');
+
+  await page.onShow();
+  assert.equal(page.data.scrollTo, '', '切回同一趟页面时保持当前位置');
+
+  page.editText({ detail: { value: '再加一箱水饺' } });
+  await page.send();
+  assert.equal(page.data.scrollTo, '', '发送后收到回执不再强行二次跳底');
+});

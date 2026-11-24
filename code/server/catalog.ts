@@ -5,6 +5,7 @@ import {
   type CatalogMatch, type CatalogVariant,
 } from '../miniprogram/core/catalog';
 import { money, nullablePrice, yuanToCents, type ItemInput } from '../miniprogram/core/orders';
+import { toPinyinTokens } from '../miniprogram/core/pinyin';
 import type { CustomerDraft, TripDraft } from '../miniprogram/core/trips';
 import { readAccount, workspaceDraft, writeAccount } from './account-workspace';
 import { checkDraft } from './agent/store';
@@ -78,27 +79,50 @@ export function suggestCatalogChoices(draft: TripDraft, catalog: readonly Catalo
   }));
 }
 
+function pinyinMentions(source: string) {
+  const characters = Array.from(source);
+  const sounds = characters.map(char => toPinyinTokens(char)[0]);
+  const mentions = new Map<string, string | undefined>();
+  return (term: string) => {
+    if (!term) return undefined;
+    if (source.includes(term)) return term;
+    if (mentions.has(term)) return mentions.get(term);
+    const tokens = toPinyinTokens(term);
+    const offset = (term.match(/\p{Script=Han}/gu)?.length ?? 0) >= 2 && tokens.length === Array.from(term).length
+      ? sounds.findIndex((sound, index) => sound === tokens[0] && tokens.every((token, i) => token === sounds[index + i]))
+      : -1;
+    const mention = offset < 0 ? undefined : characters.slice(offset, offset + tokens.length).join('');
+    mentions.set(term, mention);
+    return mention;
+  };
+}
+
 function groundedCatalogDetails(item: ItemInput, previous: ItemInput | undefined, source: string,
-  catalog: readonly CatalogVariant[]): { item: ItemInput; unitGrounded: boolean } {
+  catalog: readonly CatalogVariant[], mention: ReturnType<typeof pinyinMentions>) {
   const brand = catalogKey(item.brand);
   const specification = catalogKey(normalizeCatalogSpec(item.specification));
+  const productName = catalogKey(item.product);
   const brandMentioned = (name: string) => Boolean(name && source.includes(name));
-  const brandFamilyMentioned = (target: string) => brandMentioned(target) || catalog.some(variant => {
-    const names = [variant.brand, ...(variant.brandAliases ?? [])].map(catalogKey).filter(Boolean);
-    return names.includes(target) && names.some(brandMentioned);
-  });
-  const hasBrand = !brand || item.brand === previous?.brand || brandFamilyMentioned(brand);
+  const brandFamilyMentioned = (target: string, product: string) => {
+    const mentioned = (name: string) => brandMentioned(name) || (product && mention(name + product));
+    return mentioned(target) || catalog.some(variant => {
+      const names = [variant.brand, ...(variant.brandAliases ?? [])].map(catalogKey).filter(Boolean);
+      return names.includes(target) && names.some(mentioned);
+    });
+  };
+  const hasBrand = !brand || item.brand === previous?.brand || brandFamilyMentioned(brand,
+    productName.startsWith(brand) ? productName.slice(brand.length) : productName);
   // Strip an ungrounded catalog brand prefix glued onto product (e.g. "秋丰鸭血" when source only says "鸭血").
   let product = item.product;
   if (product && product !== previous?.product) {
-    const productKey = catalogKey(product);
     const catalogBrands = [...new Set(catalog.flatMap(variant => [variant.brand, ...(variant.brandAliases ?? [])])
       .filter(Boolean))].sort((a, b) => b.length - a.length);
     for (const candidateBrand of catalogBrands) {
       const candidateKey = catalogKey(candidateBrand);
-      if (!candidateKey || brandFamilyMentioned(candidateKey) || !productKey.startsWith(candidateKey)) continue;
+      if (!candidateKey || !productName.startsWith(candidateKey)
+        || brandFamilyMentioned(candidateKey, productName.slice(candidateKey.length))) continue;
       const stripped = product.trim().replace(new RegExp(`^${candidateBrand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*`, 'i'), '').trim();
-      if (stripped && stripped.length < product.trim().length && source.includes(catalogKey(stripped))) {
+      if (stripped && stripped.length < product.trim().length && mention(catalogKey(stripped))) {
         product = stripped;
         break;
       }
@@ -112,7 +136,8 @@ function groundedCatalogDetails(item: ItemInput, previous: ItemInput | undefined
   const unitGrounded = !unitKey || item.unit === previous?.unit || source.includes(unitKey);
   return {
     item: { ...item, product, brand: hasBrand ? item.brand : '', specification: hasSpec ? item.specification : '' },
-    unitGrounded,
+    unitGrounded, spokenProduct: mention(catalogKey(product)),
+    spokenBrandProduct: hasBrand && brand && product && !productName.startsWith(brand) ? mention(brand + catalogKey(product)) : undefined,
   };
 }
 
@@ -122,6 +147,7 @@ export async function applyCatalogToDraft(client: PoolClient, accountId: string,
   const changes: { draftCustomerId: string; lineId: string; product: string; status: ItemInput['catalogStatus'];
     priceSource: ItemInput['priceSource'];
     price: string | null; priceHint: string | null;
+    matchMethod?: CatalogMatch['matchMethod']; spokenName?: string;
     input: Pick<ItemInput, 'product' | 'brand' | 'specification' | 'unit'> }[] = [];
   const previously = new Map(before.customers.flatMap(customer =>
     customer.items.map(item => [item.id, { item, partyId: customer.partyId, customer: customer.customer }] as const)));
@@ -138,21 +164,23 @@ export async function applyCatalogToDraft(client: PoolClient, accountId: string,
     customer.partyId ? [customer.partyId] : []))]);
   const directory = sourceText ? await readDirectory(client, accountId) : undefined;
   const normalizedSource = sourceText === undefined ? undefined : catalogKey(normalizeCatalogSpec(sourceText));
+  const mention = normalizedSource === undefined ? undefined : pinyinMentions(normalizedSource);
   const changedItems = new Set(changed.map(row => row.item));
   const targets = draft.customers.flatMap(customer => customer.items.filter(item => item.product.trim() || changedItems.has(item)).map(item => {
     const previous = previously.get(item.id);
     const aliases = directory?.aliases.filter(alias => alias.customerId === customer.partyId) ?? [];
-    const grounded = normalizedSource !== undefined && changedItems.has(item)
-      ? groundedCatalogDetails(item, previous?.item, normalizedSource, variants)
-      : { item, unitGrounded: true };
+    const grounded = normalizedSource !== undefined && mention && changedItems.has(item)
+      ? groundedCatalogDetails(item, previous?.item, normalizedSource, variants, mention)
+      : { item, unitGrounded: true, spokenProduct: undefined, spokenBrandProduct: undefined };
     const input = grounded.item;
     const rawMatch = matchCatalogItem(input, variants);
     const match: CatalogMatch = !grounded.unitGrounded && 'variant' in rawMatch
-      ? { status: 'unit_mismatch', candidates: [rawMatch.variant], hint: '原话未提到该计价单位，请核对单位后再配价' }
+      ? { status: 'unit_mismatch', candidates: [rawMatch.variant], matchMethod: rawMatch.matchMethod,
+        hint: '原话未提到该计价单位，请核对单位后再配价' }
       : rawMatch;
     const matchedVariants = 'variant' in match ? [match.variant] : match.candidates;
-    return { item, input, match, quote: {
-      products: [input.product, previous?.item.product ?? '', ...matchedVariants.flatMap(variant => variant.aliases)],
+    return { item, input, match, spokenProduct: grounded.spokenProduct, spokenBrandProduct: grounded.spokenBrandProduct, quote: {
+      products: [input.product, grounded.spokenProduct ?? '', previous?.item.product ?? '', ...matchedVariants.flatMap(variant => variant.aliases)],
       customers: [customer.customer, previous?.customer ?? '', ...aliases.map(alias => alias.alias)],
       specifications: [input.specification, input.brand,
         ...('variant' in match && match.variant.flavorOrGrade ? [match.variant.flavorOrGrade] : [])], unit: input.unit,
@@ -162,7 +190,7 @@ export async function applyCatalogToDraft(client: PoolClient, accountId: string,
   const quotes = targets.map(row => row.quote);
   const byItem = new Map(targets.map(row => [row.item, row]));
   for (const { customer, item, index } of changed) {
-    const { input, match, quote } = byItem.get(item)!;
+    const { input, match, quote, spokenProduct, spokenBrandProduct } = byItem.get(item)!;
     const previous = previously.get(item.id)?.item;
     const incomingPrice = nullablePrice(input.price);
     const freshPrice = incomingPrice !== null && (input.priceSource == null || input.priceSource === 'spoken')
@@ -192,13 +220,16 @@ export async function applyCatalogToDraft(client: PoolClient, accountId: string,
     }
     customer.items[index] = next;
     const update = catalogPriceUpdate(customer, previous ?? { ...item, price: null, priceSource: null }, next);
-    if (!update && JSON.stringify(next) === JSON.stringify(item)) continue;
+    const spokenName = spokenBrandProduct && spokenBrandProduct !== catalogKey(input.brand + input.product)
+      ? spokenBrandProduct : spokenProduct && spokenProduct !== catalogKey(input.product) ? spokenProduct : undefined;
+    if (!update && !spokenName && JSON.stringify(next) === JSON.stringify(item)) continue;
     const aligned = [next.product, next.brand, next.specification].join(' ') !== [item.product, item.brand, item.specification].join(' ');
-    if (aligned) lines.push(`${customer.customer} ${item.product} → ${[next.brand, next.product, next.specification].filter(Boolean).join(' ')}`.trim());
+    if (aligned || spokenName) lines.push(`${customer.customer} ${spokenName ?? [item.brand, item.product].filter(Boolean).join(' ')} → ${[next.brand, next.product, next.specification].filter(Boolean).join(' ')}`.trim());
     if (update) lines.push(update.text);
     if (next.priceHint) lines.push(`${next.product}：${next.priceHint}`);
     changes.push({ draftCustomerId: customer.id, lineId: item.id, product: next.product,
       status: next.catalogStatus, priceSource: next.priceSource, price: next.price, priceHint: next.priceHint ?? null,
+      ...(match.matchMethod ? { matchMethod: match.matchMethod } : {}), ...(spokenName ? { spokenName } : {}),
       input: { product: input.product, brand: input.brand, specification: input.specification, unit: input.unit } });
   }
   return { lines, changes };

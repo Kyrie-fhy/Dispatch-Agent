@@ -12,10 +12,25 @@ import { readId, readPreviewInput, validRevision } from '../request-input';
 import { readable } from '../text-orders';
 import type { PreviousQuestions } from './edit';
 import { TripStore } from '../trips';
+import { voiceCorrectionLimit, type VoiceCorrectionEntry } from '../voice';
+
+function readVoiceMeta(value: unknown, text: string) {
+  if (!isObject(value) || !readable(value.rawText, textOrderLimit) || !value.rawText.trim()
+    || !Array.isArray(value.corrections) || value.corrections.length > voiceCorrectionLimit) return undefined;
+  const rawText = value.rawText;
+  const corrections: VoiceCorrectionEntry[] = [];
+  for (const entry of value.corrections) {
+    if (!isObject(entry) || !readable(entry.from, textOrderLimit) || !readable(entry.to, textOrderLimit)
+      || !entry.from.trim() || !entry.to.trim() || entry.from === entry.to
+      || !rawText.includes(entry.from) || !text.includes(entry.to)) return undefined;
+    corrections.push({ from: entry.from, to: entry.to });
+  }
+  return { rawText, corrections };
+}
 
 export function readTurnInput(value: unknown) {
   const basis = readPreviewInput(value);
-  const { text = '', materialIds = [], direct: rawDirect } = value as Record<string, unknown>;
+  const { text = '', materialIds = [], direct: rawDirect, voiceMeta: rawVoiceMeta } = value as Record<string, unknown>;
   let direct: DirectIntent | undefined;
   if (rawDirect !== undefined) {
     if (!isObject(rawDirect)) throw invalidIntent();
@@ -31,7 +46,9 @@ export function readTurnInput(value: unknown) {
   }
   const images = materialIds.map(id => readId(id, '图片编号'));
   if (new Set(images).size !== images.length) throw new HttpError(400, 'invalid_agent_message', '请移除重复图片');
-  return { ...basis, text: direct?.intent === 'preview' ? '生成送货单' : text.trim(), materialIds: images, ...(direct ? { direct } : {}) };
+  const voiceMeta = !direct && text.trim() ? readVoiceMeta(rawVoiceMeta, text.trim()) : undefined;
+  return { ...basis, text: direct?.intent === 'preview' ? '生成送货单' : text.trim(), materialIds: images,
+    ...(direct ? { direct } : {}), ...(voiceMeta ? { voiceMeta } : {}) };
 }
 
 function invalidIntent() {

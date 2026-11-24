@@ -104,11 +104,12 @@ function summarizeEditResult(result: Record<string, unknown>) {
     return { outcome: 'confirmation', accept: confirmation.accept,
       question: isObject(result.question) ? String(result.question.text ?? '') : '' };
   }
-  if ('questions' in result && Array.isArray(result.questions)) {
+  if (!('revision' in result) && Array.isArray(result.questions)) {
     return { outcome: 'questions', questions: summarizeQuestions(result.questions as Question[]) };
   }
   if ('issues' in result) return { outcome: 'issues', issues: result.issues };
   return { outcome: 'applied', added: result.added, revision: result.revision, lines: result.lines,
+    ...(Array.isArray(result.questions) ? { questions: summarizeQuestions(result.questions as Question[]), conflicts: result.conflicts } : {}),
     ...(result.catalog ? { catalog: result.catalog } : {}),
     customerLinks: Array.isArray(result.links) ? result.links.filter(isObject).map(link => ({
       spoken: link.spoken, canonicalName: link.canonicalName, matchedBy: link.matchedBy, merged: Boolean(link.merged),
@@ -177,6 +178,9 @@ export class AgentRuntime {
     };
     try {
       await run.checkSession();
+      if (input.voiceMeta && (input.voiceMeta.rawText !== input.text || input.voiceMeta.corrections.length)) {
+        await this.store.append(key, 'voice_correction', { ...input.voiceMeta, text: input.text });
+      }
       const context = await this.store.context(key, run.revision);
       if (context.delivery) {
         await runDelivery(this.store, this.trips, this.deliveryModel, key, input, context.previous, signal, run.checkSession);
@@ -497,9 +501,11 @@ export class AgentRuntime {
     if ('confirmation' in result && result.confirmation && result.question) {
       await this.store.append(run.key, 'edit_confirmation', result.confirmation);
       run.questions.push(result.question);
-    } else if ('questions' in result && result.questions) run.questions.push(...result.questions);
-    else if ('issues' in result) run.questions.push(...issueQuestions(result.issues));
-    else if ('lines' in result && result.lines) run.lines.push(...result.lines);
+    } else if ('issues' in result) run.questions.push(...issueQuestions(result.issues));
+    else {
+      if ('questions' in result && result.questions) run.questions.push(...result.questions);
+      if ('lines' in result && result.lines) run.lines.push(...result.lines);
+    }
   }
 
   private requiredQuestions(run: Run): Promise<Question[]> {
@@ -616,6 +622,7 @@ export class AgentRuntime {
               [account, revision, JSON.stringify(draft.customers)]);
             await this.saveDraftChange(client, run, revision, lines, linked.links);
             return { added: prepared.added, lines, revision, links: linked.links,
+              ...(prepared.questions?.length ? { questions: prepared.questions, conflicts: prepared.conflicts } : {}),
               ...(priced.changes.length ? { catalog: priced.changes } : {}) };
           });
         if ('revision' in result && result.revision !== undefined) run.revision = result.revision;

@@ -46,12 +46,6 @@ function repeatedQuantity(source: string, unit: string) {
   return statedQuantity(source, unit, repeatVerb);
 }
 
-function compatibleDetail(fromDraft?: string | null, fromCandidate?: string) {
-  const oldValue = normalized(fromDraft ?? '');
-  const newValue = normalized(fromCandidate ?? '');
-  return !oldValue || !newValue || oldValue === newValue;
-}
-
 function quantityQuestion(row: ReturnType<typeof targetRows>[number], quantity: number) {
   const amount = `${quantity} ${row.item.unit}`;
   return { questions: [{
@@ -119,6 +113,8 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
   const initial = targetRows(draft);
   const actualRows = initial.filter(entry => !isPlaceholder(entry.item));
   const lines: string[] = [];
+  const questions: Question[] = [];
+  let conflicts: ReturnType<typeof mergeOrder>['conflicts'] = [];
   const confirmations: string[] = [];
   let deleting = false;
   const names = new Set(parties.map(party => normalized(party.name)));
@@ -144,26 +140,22 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
       !includesValue(response, op.price.trim()))) return issues('请明确说明要填写的单价。');
     if (edits.some(op => isObject(op) && typeof op.quantity === 'string' && op.quantity.trim() &&
       !includesValue(response, op.quantity.trim()))) return issues('请说明要填写的确切数量。');
-    if (checkRepeat && repeatVerb.test(response)) {
-      for (const op of edits) {
-        if (!isObject(op) || op.action !== 'add' || typeof op.customer !== 'string') continue;
-        const customerName = normalized(op.customer);
-        const { unit, product, quantity: proposed, brand, specification } = safeFields(op, invalidTool);
-        if (!customerName || !unit || !product || !proposed) continue;
-        const quantity = repeatedQuantity(response, normalized(unit));
-        if (quantity === undefined || quantity !== Number(proposed)) continue;
-        const matches = actualRows.filter(({ customer, item }) =>
-          normalized(customer.customer) === customerName &&
-          normalized(item.product) === normalized(product) &&
-          normalized(item.unit) === normalized(unit) &&
-          compatibleDetail(item.brand, brand) && compatibleDetail(item.specification, specification));
-        if (matches.length === 1) return quantityQuestion(matches[0], quantity);
-      }
-    }
     const contextSource = priorText ? `${source} ${priorText}` : source;
     const merged = mergeOrder(next, { operations: edits }, names, contextSource, true);
-    if (!merged.draft) return { issues: merged.issues };
-    next.customers = merged.draft.customers;
+    conflicts = merged.conflicts;
+    if (!merged.draft && !conflicts.length) return { issues: merged.issues };
+    if (merged.draft) next.customers = merged.draft.customers;
+    for (const conflict of conflicts) {
+      const label = [conflict.brand, conflict.product, conflict.specification].filter(Boolean).join(' ');
+      const originalRow = actualRows.find(row => row.item.id === conflict.existingRow.id);
+      const quantity = checkRepeat && conflict.unit ? repeatedQuantity(response, normalized(conflict.unit)) : undefined;
+      if (operations.length === 1 && originalRow && quantity !== undefined && quantity === Number(conflict.quantity)) {
+        questions.push(...quantityQuestion(originalRow, quantity).questions);
+      } else {
+        questions.push({ customer: conflict.customer,
+          text: `「${conflict.customer} · ${label}」草稿里已有同款，需要修改已有数量还是保留原明细？`, options: [] });
+      }
+    }
   }
 
   for (const op of operations as unknown[]) {
@@ -287,7 +279,10 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
     }
   }
   if (added) lines.unshift(`新增 ${added} 行`);
-  if (JSON.stringify(next.customers) === JSON.stringify(draft.customers)) return issues('草稿已有相同内容，请核对明细。');
+  if (JSON.stringify(next.customers) === JSON.stringify(draft.customers)) {
+    return questions.length ? { questions, conflicts } : issues('草稿已有相同内容，请核对明细。');
+  }
   if (!lines.length) lines.push('已补充客户或货品信息');
-  return { draft: { ...next, revision: draft.revision + 1 }, lines, added };
+  return { draft: { ...next, revision: draft.revision + 1 }, lines, added,
+    ...(questions.length ? { questions, conflicts } : {}) };
 }

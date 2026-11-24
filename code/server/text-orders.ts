@@ -62,10 +62,10 @@ export function isPlaceholder(item: ItemInput) {
 export function sameOrSimilarProduct(item: ItemInput, candidate: Partial<Fields>) {
   const product = normalized(candidate.product ?? '');
   if (!product || normalized(item.product) !== product) return false;
-  return productFields.every(field => {
+  return (['unit', 'brand', 'specification'] as const).every(field => {
     const existing = normalized(item[field] ?? '');
     const incoming = normalized(candidate[field] ?? '');
-    return !existing || !incoming || existing === incoming;
+    return !incoming || existing === incoming || (field === 'unit' && !existing);
   });
 }
 
@@ -83,7 +83,11 @@ export function safeFields(op: Record<string, unknown>, invalidModel: () => neve
   return fields;
 }
 
-function prepareOrder(draft: TripDraft, output: unknown, partyNames: Set<string>, text?: string, agent = false): TripDraft {
+type ProductConflict = { customer: string; product: string; brand: string; specification: string; unit: string;
+  quantity: string; existingRow: Pick<ItemInput, 'id' | 'product' | 'brand' | 'specification' | 'unit' | 'quantity'> };
+
+function prepareOrder(draft: TripDraft, output: unknown, partyNames: Set<string>, text: string | undefined,
+  agent: boolean, conflicts: ProductConflict[]): TripDraft | null {
   const image = text === undefined;
   const partyChoice = (owner: CustomerDraft, name: string) => {
     if (agent) return owner.partyId === null || (name && !partyNames.size) ? null : undefined;
@@ -185,8 +189,16 @@ function prepareOrder(draft: TripDraft, output: unknown, partyNames: Set<string>
         owner.partyId = partyChoice(owner, customer);
       }
       if (image && !customer) unnamedImageCustomer = owner;
-      if (owner.items.some(item => sameOrSimilarProduct(item, fields))) {
-        needsReview('草稿里有同款或相似货品，请补充规格和单位，或直接修改现有明细。');
+      const duplicate = owner.items.find(item => sameOrSimilarProduct(item, fields));
+      if (duplicate && product) {
+        const customerLabel = owner.customer || '未填写客户';
+        if (!agent || image) {
+          needsReview(`「${customerLabel} · ${product}」草稿里已有同款，请补充品牌/规格/单位，或直接修改现有明细。`);
+        }
+        const { price, ...existingRow } = fieldsOf(duplicate);
+        conflicts.push({ customer: customerLabel, product, brand: fields.brand ?? '', specification: fields.specification ?? '',
+          unit: fields.unit ?? '', quantity: fields.quantity ?? '', existingRow: { id: duplicate.id, ...existingRow } });
+        continue;
       }
       const blank = owner.items.findIndex(isPlaceholder);
       const item = { ...emptyItem(blank < 0 ? randomUUID() : owner.items[blank].id), unit: '', price: null, ...fields };
@@ -195,6 +207,7 @@ function prepareOrder(draft: TripDraft, output: unknown, partyNames: Set<string>
     }
   }
   if (JSON.stringify(next.customers) === JSON.stringify(draft.customers)) {
+    if (conflicts.length) return null;
     needsReview(image ? '图片没有新增可填写的内容，请核对草稿。' : '这段文字没有新增可填写的内容，请核对草稿。');
   }
   return { ...next, revision: draft.revision + 1 };
@@ -203,10 +216,17 @@ function prepareOrder(draft: TripDraft, output: unknown, partyNames: Set<string>
 class OrderReview extends Error {}
 
 export function mergeOrder(draft: TripDraft, output: unknown, partyNames: Set<string>, text?: string, agent = false) {
-  try { return { draft: prepareOrder(draft, output, partyNames, text, agent), issues: [] }; }
-  catch (error) {
+  const conflicts: ProductConflict[] = [];
+  try {
+    const next = prepareOrder(draft, output, partyNames, text, agent, conflicts);
+    if (next) return { draft: next, issues: [], conflicts };
+    const [conflict] = conflicts;
+    return { draft: null, issues: [{ code: 'text_needs_review',
+      message: `「${conflict.customer} · ${conflict.product}」草稿里已有同款，请说明是再加一行还是修改已有数量。` }], conflicts };
+  } catch (error) {
     if (!(error instanceof OrderReview)) throw error;
-    return { draft: null, issues: [{ code: text === undefined ? 'image_needs_review' : 'text_needs_review', message: error.message }] };
+    return { draft: null, issues: [{ code: text === undefined ? 'image_needs_review' : 'text_needs_review', message: error.message }],
+      conflicts: [] };
   }
 }
 

@@ -5,6 +5,7 @@ const {
   quotedLinePrices, resolveCatalogAutoPrice,
 } = require('../code/dist/core/catalog');
 const { lookupDeliveredPrice, lookupHistoricalPrice, collectHistoricalSales } = require('../code/dist/core/memory');
+const { toPinyinTokens, toFuzzyPinyinTokens, pinyinSimilarity } = require('../code/dist/core/pinyin');
 const { isDraft, preview } = require('../code/dist/core/orders');
 const { pickingList, previewTrip } = require('../code/dist/core/trips');
 
@@ -211,6 +212,74 @@ test('catalog history uses completed delivery, actual receipt, strict variant/un
     deliveryCompleted: true, customer: { items: [item, { ...item, id: 'zero' }, { ...item, id: 'pending' }] },
     statuses: { pending: 'pending' }, edits: { zero: { receivedQuantity: 0 } } };
   assert.deepEqual(collectHistoricalSales([historical]).map(row => [row.catalogVariantId, row.receivedQuantity]), [[variant.variantId, 2]]);
+});
+
+test('catalog homophones share exact pricing guards and near matches only suggest a choice', () => {
+  const rows = variants([
+    record({ code: '013', original: '亚渔芝心虾球160g', brand: '亚渔', product: '芝心虾球', packaging: '160g',
+      unit: '盒', price: '10', remarks: '包装全称「亚洲渔港」' }),
+    record({ code: '013', variant: '2', original: '亚渔芝心虾球160g', brand: '亚渔', product: '芝心虾球', packaging: '160g',
+      price: '190', remarks: '包装全称「亚洲渔港」' }),
+    ...['芹菜猪肉', '白菜猪肉', '酸菜猪肉', '牛肉', '三鲜', '香菇猪肉', '韭菜鸡蛋', '猪肉'].map((spec, index) =>
+      record({ code: '142', variant: String(index + 1), original: '益家德手工水饺500g', brand: '益家德', product: '手工水饺',
+        packaging: '500g', spec, unit: '包', price: '5' })),
+    record({ code: '041', original: '德炎龙虾尾4.5kg', brand: '德炎', product: '龙虾尾', packaging: '4.5kg',
+      unit: '', price: '145', status: '已下架' }),
+    record({ code: '002', original: '巧总管响铃卷120g', brand: '巧总管', product: '响铃卷', packaging: '120g', unit: '', price: '6' }),
+    record({ code: '049', original: '渔家姑娘龙虾尾4.5kg', brand: '渔家姑娘', product: '龙虾尾', packaging: '4.5kg', price: '120' }),
+  ]);
+  assert.deepEqual(toPinyinTokens(' 知心虾球，１６０g '), ['zhi', 'xin', 'xia', 'qiu', '1', '6', '0', 'g']);
+  assert.deepEqual(toFuzzyPinyinTokens('南蓝，山三，陈程，林灵'), ['lan', 'lan', 'san', 'san', 'cen', 'cen', 'lin', 'lin']);
+  assert.notDeepEqual(toPinyinTokens('绿'), toPinyinTokens('路'));
+  assert.equal(pinyinSimilarity('芝心虾球', '芝心虾球'), 1);
+
+  const shrimp = line({ product: '知心虾球' });
+  const aligned = priceFor(shrimp, rows);
+  assert.deepEqual([aligned.product, aligned.brand, aligned.specification, aligned.price, aligned.priceSource, aligned.catalogStatus],
+    ['芝心虾球', '亚渔', '160g', '190.00', 'catalog', 'active']);
+  assert.equal(matchCatalogItem(shrimp, rows).matchMethod, 'homophone');
+  assert.equal(priceFor({ ...shrimp, unit: '袋' }, rows).price, null);
+  assert.equal(matchCatalogItem({ ...shrimp, specification: '161g' }, rows).status, 'unmatched');
+  assert.equal(matchCatalogItem({ ...shrimp, catalogProductId: '013' }, rows).status, 'unmatched');
+  assert.equal(matchCatalogItem({ ...shrimp, catalogVariantId: '013/2' }, rows).status, 'unmatched');
+  assert.equal(matchCatalogItem({ ...shrimp, catalogStatus: 'external' }, rows).status, 'external');
+  const changedSize = matchCatalogItem(line({ product: '试制知心虾球45g' }), variants([
+    record({ original: '试制芝心虾球4.5g', product: '试制芝心虾球', packaging: '4.5g', price: '190' }),
+  ]));
+  assert.notEqual(changedSize.status, 'active');
+
+  for (const input of [{ product: '手工水饺', brand: '易家得' }, { product: '易家得手工水饺' }]) {
+    const row = line({ ...input, unit: '包', quantity: '5' });
+    const match = matchCatalogItem(row, rows);
+    assert.equal(match.status, 'ambiguous');
+    assert.equal(match.matchMethod, 'homophone');
+    assert.equal(match.candidates.length, 8);
+    assert.equal(priceFor(row, rows).price, null);
+  }
+  for (const input of [{ product: '龙虾尾', brand: '德盐' }, { product: '德盐龙虾尾' }]) {
+    const row = priceFor(line({ ...input, quantity: '1' }), rows);
+    assert.equal(row.catalogStatus, 'discontinued');
+    assert.equal(row.price, null);
+    assert.match(row.priceHint, /已下架.*未标箱价/);
+  }
+  for (const [input, expected] of [
+    [{ brand: '乔总管', product: '想卷帘' }, '响铃卷'],
+    [{ product: '乔总管想卷帘' }, '响铃卷'],
+    [{ product: '巧总管想卷帘' }, '响铃卷'],
+    [{ product: '芝心虾' }, '芝心虾球'],
+  ]) {
+    const row = line({ ...input, price: '99', priceSource: 'spoken' });
+    const match = matchCatalogItem(row, rows);
+    assert.equal(match.status, 'ambiguous');
+    assert.equal(match.matchMethod, 'similar');
+    assert.ok(match.candidates.some(candidate => candidate.product === expected));
+    assert.match(match.hint, /未完全对上/);
+    assert.equal(priceFor(row, rows).price, null);
+  }
+  for (const product of ['新到带鱼', '新道带鱼', '临时冻虾', '灵石冻虾', '带鱼', '冻虾', '羊肉', '虾']) {
+    const row = priceFor(line({ product }), rows);
+    assert.deepEqual([row.catalogStatus, row.price], ['unmatched', null], product);
+  }
 });
 
 test('reuse of a catalog variant ID after a packaging change does not reuse the delivered price', () => {

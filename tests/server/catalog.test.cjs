@@ -8,6 +8,7 @@ const { readAccount } = require('../../code/server-dist/server/account-workspace
 const { prepareEdits } = require('../../code/server-dist/server/agent/edit');
 const { setAccount, transaction } = require('../../code/server-dist/server/database');
 const { readHistoricalSales } = require('../../code/server-dist/server/memory');
+const { mergeOrder, sameOrSimilarProduct } = require('../../code/server-dist/server/text-orders');
 const { previewTrip } = require('../../code/server-dist/miniprogram/core/trips');
 const {
   gradeCase, runCase, isolatedDatabase, start, login, read, agentInput, waitForAgent, uploadImage, toolReply, saveCustomers,
@@ -516,6 +517,156 @@ test('catalog matches changed brand and spec only when the utterance supports th
   const confirmed = item('鸭血', { brand: '秋丰', specification: '200g' });
   const updated = await price('鸭血数量改成三箱', { ...confirmed, quantity: '3' }, draftWith(confirmed));
   assert.deepEqual([updated.brand, updated.specification, updated.price], ['秋丰', '200g', '15.00']);
+});
+
+const speechCatalog = [
+  ['002', '002', '冻品', '巧总管响铃卷120g', '巧总管', '响铃卷', '120g', '单规格', '', '6', '在售', '已核实', ''],
+  ['013', '013-2', '冻品', '亚渔芝心虾球160g', '亚渔', '芝心虾球', '160g', '20盒/箱', '箱', '190', '在售', '已核实', ''],
+  ['041', '041', '冻品', '德炎龙虾尾4.5kg', '德炎', '龙虾尾', '4.5kg', '单规格', '', '145', '已下架', '已核实', ''],
+  ['049', '049', '冻品', '渔家姑娘龙虾尾4.5kg', '渔家姑娘', '龙虾尾', '4.5kg', '单规格', '', '120', '在售', '已核实', ''],
+  ...['芹菜猪肉', '白菜猪肉', '酸菜猪肉', '牛肉', '三鲜', '香菇猪肉', '韭菜鸡蛋', '猪肉'].map((flavor, index) =>
+    ['142', `142-${index + 1}`, '冻品', '益家德手工水饺500g', '益家德', '手工水饺', '500g', flavor, '包', '5', '在售', '已核实', '']),
+];
+
+test('catalog grounds both original and corrected homophones and reports the alignment', async () => {
+  const catalog = variants([...original, ...speechCatalog]);
+  const client = { query: async () => ({ rows: [] }) };
+  for (const product of ['知心虾球', '芝心虾球', '亚渔芝心虾球']) {
+    const draft = draftWith(item(product, { brand: '亚渔' }));
+    const result = await applyCatalogToDraft(client, 'account', draft, draftWith(), catalog, '甲店要两箱知心虾球');
+    assert.deepEqual(state(draft).map(row => [row.brand, row.product, row.specification, row.price]),
+      [['亚渔', '芝心虾球', '160g', '190.00']]);
+    assert.match(result.lines[0], /知心虾球 → 亚渔 芝心虾球 160g/);
+    assert.equal(result.changes[0].spokenName ?? result.changes[0].input.product, '知心虾球');
+  }
+  for (const brand of ['易家得', '益家德']) {
+    const draft = draftWith(item('手工水饺', { brand, specification: '牛肉', unit: '包', quantity: '5' }));
+    await applyCatalogToDraft(client, 'account', draft, draftWith(), catalog, '甲店要五包易家得手工水饺');
+    assert.deepEqual(state(draft).map(row => [row.brand, row.specification, row.catalogStatus, row.price]),
+      [[brand, '', 'ambiguous', null]]);
+  }
+  const lobster = draftWith(item('德炎龙虾尾'));
+  const result = await applyCatalogToDraft(client, 'account', lobster, draftWith(), catalog, '甲店一箱德盐龙虾尾');
+  assert.equal(state(lobster)[0].catalogStatus, 'discontinued');
+  assert.match(result.lines[0], /德盐龙虾尾 → 德炎龙虾尾/);
+});
+
+test('agent saves the rest of an order while asking about a duplicate and accepts near-match choices', { timeout: 60_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const customer = '王记餐饮';
+  const rolling = '王记餐饮两箱巧总管响铃卷、一箱德炎龙虾尾、新到带鱼一箱每箱120元、临时冻虾一箱';
+  const partial = '王记餐饮安井水饺500g一箱，三全汤圆两袋';
+  const duplicate = '王记餐饮安井水饺500g一箱';
+  const near = '王记餐饮两箱芝心虾';
+  const dumpling = { brand: '安井', specification: '500g', quantity: '1' };
+  const operations = new Map([
+    [rolling, [add(customer, '响铃卷', { brand: '巧总管' }), add(customer, '龙虾尾', { brand: '德炎', quantity: '1' }),
+      add(customer, '新到带鱼', { quantity: '1', price: '120' }), add(customer, '临时冻虾', { quantity: '1' })]],
+    [partial, [add(customer, '水饺', dumpling), add(customer, '汤圆', { brand: '三全', unit: '袋' })]],
+    [duplicate, [add(customer, '水饺', dumpling)]],
+    [near, [add(customer, '芝心虾')]],
+  ]);
+  const api = await start(db, {
+    textModel: async () => orderOutput(operations.get(duplicate)),
+    intentModel: async () => ({ draft: true, query: false, preview: false, answering: false }),
+    agentModel: async messages => toolReply('edit_draft', { operations: operations.get(JSON.parse(messages.at(-1).content).text) }),
+  });
+  try {
+    const token = await login(api, 'a');
+    const catalog = new CatalogStore(db.owner);
+    const startItems = [item('龙虾尾', { quantity: '1' }), item('水饺', { brand: '安井', specification: '500g' })];
+    const basis = await saveCustomers(api, token, await read(api, token),
+      [{ id: randomUUID(), customer, partyId: null, items: startItems }]);
+    await catalog.importCsv('dev:a', csv(speechCatalog));
+    const send = async (draft, text) => {
+      const id = await runTurn(api, token, draft, text);
+      const visible = await api.request(`/v1/agent/turns/${id}/events`, { token });
+      assert.equal(visible.status, 200);
+      return visible.data.events;
+    };
+
+    const recorded = await send(basis, rolling);
+    assert.equal(recorded.filter(event => event.kind === 'change').length, 1);
+    const after = await read(api, token);
+    assert.deepEqual(state(after).slice(2).map(row => [row.brand, row.product, row.catalogStatus, row.price, row.priceSource]), [
+      ['巧总管', '响铃卷', 'unit_mismatch', null, null], ['德炎', '龙虾尾', 'discontinued', null, null],
+      ['', '新到带鱼', 'unmatched', '120', 'spoken'], ['', '临时冻虾', 'unmatched', null, null],
+    ]);
+    assert.match(state(after)[2].priceHint, /未标箱价/);
+    assert.equal(state(after).filter(row => row.product === '龙虾尾').length, 2);
+    const combined = await send(after, partial);
+    assert.equal(combined.filter(event => event.kind === 'change').length, 1);
+    const questions = combined.find(event => event.kind === 'questions').payload.questions;
+    assert.equal(questions.length, 1);
+    assert.match(questions[0].text, /王记餐饮 · 安井 水饺 500g.*已有同款/);
+    const partiallySaved = await read(api, token);
+    assert.deepEqual(state(partiallySaved).filter(row => row.product === '水饺').map(row => row.quantity), ['2']);
+    assert.deepEqual(state(partiallySaved).filter(row => row.product === '汤圆').map(row => [row.brand, row.quantity, row.unit]),
+      [['三全', '2', '袋']]);
+    const blocked = await send(partiallySaved, duplicate);
+    assert.equal(blocked.some(event => event.kind === 'change'), false);
+    assert.match(blocked.find(event => event.kind === 'questions').payload.questions[0].text, /王记餐饮 · 安井 水饺/);
+    assert.deepEqual(await read(api, token), partiallySaved);
+    const legacy = await post(api, token, '/v1/text-orders', {
+      draftId: partiallySaved.id, revision: partiallySaved.revision, text: duplicate, requestId: randomUUID(),
+    });
+    assert.equal(legacy.status, 422);
+    assert.equal(legacy.data.error, 'text_needs_review');
+    assert.match(legacy.data.message, /王记餐饮 · 水饺.*已有同款/);
+
+    await send(partiallySaved, near);
+    const pending = await read(api, token);
+    const line = state(pending).find(row => row.product === '芝心虾');
+    assert.deepEqual([line.catalogStatus, line.price], ['ambiguous', null]);
+    const memory = await api.request(`/v1/agent/memory?draftId=${pending.id}`, { token });
+    const match = memory.data.catalogChoices.find(row => row.lineId === line.id);
+    assert.match(match.priceHint, /未完全对上/);
+    const [candidate] = match.candidates;
+    const picked = await post(api, token, '/v1/agent/catalog-choice', {
+      draftId: pending.id, revision: pending.revision, draftCustomerId: match.draftCustomerId, lineId: line.id,
+      requestId: randomUUID(), choice: 'variant', variantId: candidate.variantId,
+    });
+    assert.equal(picked.status, 200, JSON.stringify(picked.data));
+    assert.deepEqual([picked.data.item.product, picked.data.item.price, picked.data.item.priceSource],
+      ['芝心虾球', '190.00', 'catalog']);
+  } finally {
+    await api.stop();
+  }
+});
+
+test('duplicate checks are directional by brand and specification and permit other text edits', () => {
+  const general = item('龙虾尾');
+  const specific = { ...general, brand: '德炎', specification: '4.5kg' };
+  assert.equal(sameOrSimilarProduct(general, specific), false);
+  assert.equal(sameOrSimilarProduct(general, { ...general, specification: '4.5kg' }), false);
+  assert.equal(sameOrSimilarProduct(specific, general), true);
+  assert.equal(sameOrSimilarProduct(specific, { ...specific, unit: '袋' }), false);
+  assert.equal(sameOrSimilarProduct(specific, { ...specific, brand: '其他品牌' }), false);
+
+  const existing = item('水饺', { brand: '安井', specification: '500g' });
+  const incomplete = item('汤圆', { brand: '三全', specification: '400g', unit: '', quantity: '' });
+  const start = draftWith(existing, incomplete);
+  const duplicate = add('甲店', '水饺', { brand: '安井', specification: '500g', quantity: '1' });
+  const fill = { action: 'fill', target: 2, quantity: '2', unit: '袋' };
+  const source = '甲店安井水饺一箱，三全汤圆400g两袋';
+  const mixed = mergeOrder(start, orderOutput([duplicate, fill]), new Set(), source, true);
+  assert.equal(mixed.issues.length, 0);
+  assert.equal(mixed.draft.revision, 2);
+  assert.deepEqual(state(mixed.draft).map(({ product, quantity, unit }) => [product, quantity, unit]),
+    [['水饺', '2', '箱'], ['汤圆', '2', '袋']]);
+  assert.deepEqual(mixed.conflicts, [{
+    customer: '甲店', product: '水饺', brand: '安井', specification: '500g', unit: '箱', quantity: '1',
+    existingRow: { id: existing.id, product: '水饺', brand: '安井', specification: '500g', unit: '箱', quantity: '2' },
+  }]);
+  const onlyConflict = mergeOrder(start, orderOutput([duplicate]), new Set(), source, true);
+  assert.equal(onlyConflict.draft, null);
+  assert.deepEqual(onlyConflict.issues, [{ code: 'text_needs_review',
+    message: '「甲店 · 水饺」草稿里已有同款，请说明是再加一行还是修改已有数量。' }]);
+  assert.deepEqual(onlyConflict.conflicts, mixed.conflicts);
+  assert.deepEqual(prepareEdits(start, { operations: [duplicate, add('甲店', '馄饨')] }, [],
+    '甲店安井水饺一箱，馄饨两箱').questions, [
+    { customer: '甲店', text: '「甲店 · 安井 水饺 500g」草稿里已有同款，需要修改已有数量还是保留原明细？', options: [] },
+  ]);
 });
 
 test('changing a unit clears previous prices of every origin and checks an explicitly repeated amount', async () => {

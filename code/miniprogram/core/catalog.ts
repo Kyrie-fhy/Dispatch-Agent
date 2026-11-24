@@ -1,6 +1,7 @@
 import { lookupDeliveredPrice, normalizeMemoryText, type HistoricalSale } from './memory';
 import { spokenNumbers } from './spoken-numbers';
 import { money, nullablePrice, yuanToCents, type ItemInput } from './orders';
+import { pinyinSimilarity, toFuzzyPinyinTokens, toPinyinTokens } from './pinyin';
 
 export const catalogCsvColumns = [
   '总商品号', '规格序号', '分类', '原商品名', '品牌', '标准品名', '包装规格', '售卖规格', '计价单位',
@@ -156,10 +157,11 @@ export function parseCatalogCsv(input: string): CatalogRow[] {
 }
 
 type MatchFields = Pick<ItemInput, 'product' | 'brand' | 'specification' | 'unit' | 'catalogProductId' | 'catalogVariantId' | 'catalogStatus' | 'priceHint'>;
-export type CatalogMatch =
+export type CatalogMatch = (
   | { status: 'active' | 'discontinued'; variant: CatalogVariant }
   | { status: 'unit_mismatch'; candidates: CatalogVariant[]; hint: string; selectedVariant?: CatalogVariant }
-  | { status: 'ambiguous' | 'unmatched' | 'external'; candidates: CatalogVariant[]; hint?: string };
+  | { status: 'ambiguous' | 'unmatched' | 'external'; candidates: CatalogVariant[]; hint?: string }
+) & { matchMethod?: 'homophone' | 'similar' };
 
 function specKey(value: string) { return catalogKey(normalizeCatalogSpec(value)); }
 
@@ -197,6 +199,77 @@ export function matchCatalogChoice(item: MatchFields, variant: CatalogVariant): 
   return { ...unitMismatch(item, [variant]), selectedVariant: variant };
 }
 
+const hanLength = (name: string) => name.match(/\p{Script=Han}/gu)?.length ?? 0;
+const byCatalogOrder = (a: CatalogVariant, b: CatalogVariant) =>
+  Number(a.status === 'discontinued') - Number(b.status === 'discontinued')
+  || a.productCode.localeCompare(b.productCode) || a.variantCode.localeCompare(b.variantCode);
+const genericSyllables = new Set(toFuzzyPinyinTokens('鱼虾肉丸卷包肠饺'));
+
+function fuzzyCatalogMatch(item: MatchFields, name: string, brand: string, detail: string,
+  catalog: readonly CatalogVariant[]): CatalogMatch {
+  const unmatched: CatalogMatch = { status: 'unmatched', candidates: [] };
+  if (item.catalogProductId || item.catalogVariantId || hanLength(name) < 2) return unmatched;
+  const keysByVariant = catalog.map(variant => ({ variant, keys: variantKeys(variant) }));
+  const sounds = new Map<string, string>();
+  const soundKey = (value: string) => {
+    let key = sounds.get(value);
+    if (key === undefined) {
+      // Name punctuation can be ignored, but a decimal point or range is part of a size.
+      const numbers = value.match(/\d+(?:[./-]\d+)*/g) ?? [];
+      key = JSON.stringify([hanLength(value), toPinyinTokens(value), numbers]);
+      sounds.set(value, key);
+    }
+    return key;
+  };
+  const sameSound = (a: string, b: string) => a === b || soundKey(a) === soundKey(b);
+  const brands = [...new Set(keysByVariant.flatMap(({ keys }) => [...keys.brands]))];
+  if (!brand && brands.some(key => sameSound(name, key))) return unmatched;
+  const scope = keysByVariant.filter(({ keys }) => (!detail || keys.details.has(detail))
+    && (!brand || [...keys.brands].some(key => sameSound(brand, key))));
+  const strict = scope.filter(({ keys }) => [...keys.names].some(term =>
+    sameSound(name, term) || (brand && sameSound(brand + name, term))));
+  if (strict.length) {
+    const candidates = strict.map(({ variant }) => variant).sort(byCatalogOrder);
+    return { ...classifyCatalogMatches(item, candidates), matchMethod: 'homophone' };
+  }
+
+  // Recognize the longest written or homophonic brand prefix before comparing product names.
+  const prefixLengths = brands.filter(key => sameSound(name.slice(0, key.length), key)).map(key => key.length);
+  const prefixLength = Math.max(0, ...prefixLengths);
+  const prefix = name.slice(0, prefixLength);
+  const product = name.slice(prefixLength);
+  if (hanLength(product) < 2) return unmatched;
+  const qualified = Boolean(prefix || brand);
+  const distinctSounds = new Set(toFuzzyPinyinTokens(product).filter(token =>
+    !genericSyllables.has(token) && !/^[a-z0-9]$/.test(token)));
+  const unit = catalogKey(item.unit);
+  const ranked = scope.flatMap(({ variant, keys }) => {
+    if (prefix && ![...keys.brands].some(key => sameSound(prefix, key))) return [];
+    const terms = new Set([...keys.names].map(term => {
+      if (term === specKey(variant.product)) return term;
+      const qualifier = [...keys.brands].filter(key => term.startsWith(key)).sort((a, b) => b.length - a.length)[0];
+      return qualifier ? term.slice(qualifier.length) : term;
+    }));
+    const score = Math.max(0, ...[...terms].map(term => {
+      if (!toFuzzyPinyinTokens(term).some(token => distinctSounds.has(token))) return 0;
+      return pinyinSimilarity(product, term);
+    }));
+    return score >= (qualified ? 0.55 : 0.72) ? [{ variant, score }] : [];
+  }).sort((a, b) => b.score - a.score || Number(b.variant.status === 'active') - Number(a.variant.status === 'active')
+    || Number(b.variant.unit === unit) - Number(a.variant.unit === unit)
+    || byCatalogOrder(a.variant, b.variant));
+  if (!ranked.length) return unmatched;
+  const products = new Map<string, CatalogVariant[]>();
+  for (const { variant } of ranked) {
+    const variants = products.get(variant.productId);
+    if (variants) variants.push(variant);
+    else if (products.size < 3) products.set(variant.productId, [variant]);
+  }
+  const candidates = [...products.values()].flatMap(variants => variants.slice(0, products.size === 1 ? 6 : 1));
+  return { status: 'ambiguous', candidates, matchMethod: 'similar',
+    hint: '未完全对上，找到相近货品，请选定或按库外新货保留' };
+}
+
 export function matchCatalogItem(item: MatchFields, catalog: readonly CatalogVariant[]): CatalogMatch {
   if (item.catalogStatus === 'external') return { status: 'external', candidates: [] };
   const name = specKey(item.product);
@@ -209,9 +282,11 @@ export function matchCatalogItem(item: MatchFields, catalog: readonly CatalogVar
     const keys = variantKeys(variant);
     return (!brand || keys.brands.has(brand)) && (!detail || keys.details.has(detail)) &&
       (keys.names.has(name) || keys.combined.has(name));
-  }).sort((a, b) => Number(a.status === 'discontinued') - Number(b.status === 'discontinued')
-      || a.productCode.localeCompare(b.productCode) || a.variantCode.localeCompare(b.variantCode));
-  if (!candidates.length) return { status: 'unmatched', candidates: [] };
+  }).sort(byCatalogOrder);
+  return candidates.length ? classifyCatalogMatches(item, candidates) : fuzzyCatalogMatch(item, name, brand, detail, catalog);
+}
+
+function classifyCatalogMatches(item: MatchFields, candidates: CatalogVariant[]): CatalogMatch {
   if (item.catalogProductId && !item.catalogVariantId
     && (item.catalogStatus === 'unit_mismatch' || item.catalogStatus === 'discontinued')) {
     // A selection without a compatible unit identifies the product only.
@@ -234,7 +309,7 @@ export function resolveCatalogAutoPrice(item: ItemInput, match: CatalogMatch, cu
   const price = nullablePrice(item.price);
   // Older drafts did not record provenance, so preserve their non-empty prices as manual.
   const source = item.priceSource ?? (price === null ? null : 'manual');
-  const protectedPrice = price !== null && (source === 'spoken' || source === 'manual');
+  const protectedPrice = match.matchMethod !== 'similar' && price !== null && (source === 'spoken' || source === 'manual');
   const next: ItemInput = {
     ...item, price: protectedPrice ? price : null, priceSource: protectedPrice ? source : null,
     catalogProductId: null, catalogVariantId: null, catalogStatus: match.status, priceHint: null,

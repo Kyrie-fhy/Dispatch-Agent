@@ -68,7 +68,7 @@
                 <text class="trip-pill-count num">{{draftSummary.customerCount}} 家 · {{draftSummary.lineCount}} 样</text>
                 <text wx:if="{{draftSummary.hasKnownAmount}}" class="trip-pill-amount num">{{draftSummary.knownTotalLabel}}</text>
               </view>
-              <text class="trip-pill-todo num">{{draftSummary.todoText}}</text>
+              <text class="trip-pill-todo num {{draftSummary.hasTodo ? 'warn' : ''}}">{{draftSummary.todoText}}</text>
             </view>
           </view>
           <view wx:else class="trip-pill-main">
@@ -420,7 +420,7 @@
         <scroll-view wx:if="{{orderSheetStep === 'preview' && sheetPreview}}" scroll-y class="order-sheet-body">
           <view class="preview-total">
             <text class="preview-total-label">本趟预览总金额</text>
-            <text class="preview-total-amount num">¥{{sheetPreview.total}}</text>
+            <text class="preview-total-amount num {{sheetPreview.allPending ? 'pending-price' : ''}}">{{sheetPreview.displayTotal}}</text>
             <text wx:if="{{sheetPreview.pendingPrices > 0}}" class="preview-pending num">另有 {{sheetPreview.pendingPrices}} 样待补价，送货到店时可继续补</text>
             <text wx:else class="preview-clear">全部货品均已有单价</text>
           </view>
@@ -429,7 +429,10 @@
           <view wx:for="{{sheetPreview.customers}}" wx:for-item="customer" wx:key="id" class="sheet-customer">
             <view class="sheet-shop-head">
               <text class="card-title">{{customer.customer}}</text>
-              <text class="sheet-shop-total num">¥{{customer.total}}</text>
+              <view class="sheet-shop-amount">
+                <text class="sheet-shop-total num {{customer.allPending ? 'pending-price' : ''}}">{{customer.displayTotal}}</text>
+                <text wx:if="{{!customer.allPending && customer.pendingPrices > 0}}" class="sheet-shop-pending num"> · +{{customer.pendingPrices}}待补</text>
+              </view>
             </view>
             <view wx:for="{{customer.items}}" wx:for-item="line" wx:key="id" class="draft-line">
               <view class="line-row">

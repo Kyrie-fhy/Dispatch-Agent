@@ -58,6 +58,7 @@ page {
 .trip-pill-count { font-size: 32rpx; font-weight: 700; color: var(--ink); line-height: 1.3; }
 .trip-pill-amount { font-size: 32rpx; font-weight: 700; color: var(--primary); }
 .trip-pill-todo { color: var(--ink-3); font-size: 26rpx; line-height: 1.35; overflow-wrap: anywhere; }
+.trip-pill-todo.warn { color: var(--warning); font-weight: 500; }
 .trip-pill-actions { display: flex; flex: none; align-items: center; gap: 12rpx; }
 .pill-btn {
   display: flex;
@@ -442,7 +443,7 @@ page {
   color: var(--ink);
   font-weight: 500;
 }
-.card-btn-secondary:active { background: var(--hairline); }
+.card-btn-secondary:active { background: #E2E8F0; }
 .card-btn-ghost {
   flex: 1 1 calc(50% - 8rpx);
   min-width: 200rpx;
@@ -696,7 +697,7 @@ page {
   line-height: 1;
 }
 .file-btn::after { border: 0; }
-.file-btn:active { background: var(--hairline); }
+.file-btn:active { background: #E2E8F0; }
 .file-btn[disabled] { color: var(--ink-disabled); }
 .attachment-row { display: flex; flex-wrap: wrap; gap: 8rpx; }
 .attachment { display: flex; align-items: center; gap: 2rpx; max-width: 100%; padding: 2rpx 4rpx 2rpx 16rpx; background: var(--surface); border: 1rpx solid var(--hairline); border-radius: var(--radius-sm); }
@@ -716,7 +717,7 @@ page {
   z-index: 100;
   display: flex;
   align-items: flex-end;
-  background: rgba(24, 43, 36, 0.45);
+  background: rgba(15, 23, 42, 0.42);
 }
 .sheet-mask-top { z-index: 110; }
 .order-sheet {
@@ -777,7 +778,7 @@ page {
   text-align: center;
 }
 .seg-item.on { background: var(--surface); color: var(--ink); font-weight: 650; box-shadow: var(--shadow-card); }
-.order-sheet-body { flex: 1; height: 0; box-sizing: border-box; padding: 0 var(--page-x); }
+.order-sheet-body { flex: 1; height: 0; box-sizing: border-box; padding: 20rpx var(--page-x) 20rpx; }
 .sheet-body-inner { padding-bottom: 16rpx; }
 .sheet-customer {
   margin-bottom: 16rpx;
@@ -886,12 +887,17 @@ page {
 }
 .preview-total-label { color: var(--ink-2); font-size: 28rpx; font-weight: 600; }
 .preview-total-amount { color: var(--ink); font-size: 56rpx; font-weight: 800; line-height: 1.15; }
+.preview-total-amount.pending-price { color: var(--warning); }
 .preview-pending { color: var(--warning); font-size: 28rpx; line-height: 1.45; }
 .preview-clear { color: var(--primary); font-size: 28rpx; line-height: 1.45; }
 .sheet-shop-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12rpx; }
+.sheet-shop-amount { display: flex; flex: none; align-items: baseline; gap: 4rpx; }
 .sheet-shop-total { flex: none; color: var(--primary); font-size: 32rpx; font-weight: 700; }
+.sheet-shop-total.pending-price { color: var(--warning); }
+.sheet-shop-pending { flex: none; color: var(--warning); font-size: 24rpx; font-weight: 500; }
 .order-sheet-foot {
   display: flex;
+  align-items: center;
   gap: 16rpx;
   padding: 12rpx var(--page-x) calc(20rpx + env(safe-area-inset-bottom));
   background: var(--surface);
@@ -916,7 +922,7 @@ page {
 .order-sheet-primary::after { border: 0; }
 .order-sheet-primary:active { background: var(--primary-pressed); }
 .order-sheet-primary[disabled] { background: var(--canvas-sub); color: var(--ink-disabled); }
-.order-sheet-secondary { flex: 1 1 0; min-width: 0; height: 88rpx; }
+.order-sheet-secondary { flex: 1 1 0; min-width: 0; height: 96rpx; }
 
 .sheet-panel {
   display: flex;

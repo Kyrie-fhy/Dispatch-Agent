@@ -46,6 +46,11 @@ type PriceDrawerRow = { lineId: string; draftCustomerId: string; customerName: s
   productName: string; quantity: string; unit: string; price: string; metaLabel: string; discontinued: boolean;
   refButtons: { value: string; label: string }[]; showSpec: boolean;
   inputUnit: string; inputSpecification: string; originalUnit: string; originalSpecification: string };
+type SheetPreviewCustomer = ReturnType<typeof tripView>['customers'][number] & {
+  pendingPrices: number; allPending: boolean; displayTotal: string };
+type SheetPreview = Omit<ReturnType<typeof tripView>, 'customers'> & {
+  id: string; pendingPrices: number; allPending: boolean; displayTotal: string;
+  customers: SheetPreviewCustomer[] };
 type CustomerSheet = { id: string; label: string; value: string };
 const draftConflicts = ['draft_changed', 'draft_confirmed', 'draft_not_found', 'preview_not_found', 'material_draft_changed'];
 const choiceConflicts = ['draft_changed', 'draft_confirmed', 'draft_not_found', 'agent_busy', 'customer_already_linked',
@@ -302,7 +307,7 @@ Page({
     memoryCustomers: [] as { id: string; name: string }[], quickCustomers: [] as { id: string; name: string }[],
     priceDrawerOpen: false, priceDrawerRows: [] as PriceDrawerRow[], priceDrawerError: '', priceDrawerFocusId: '',
     orderSheetOpen: false, orderSheetTab: 'all' as 'all' | 'pending', orderSheetStep: 'list' as 'list' | 'preview',
-    sheetPreview: null as (ReturnType<typeof tripView> & { id: string; pendingPrices: number }) | null,
+    sheetPreview: null as SheetPreview | null,
     priceDrawerDirty: false,
     customerSheet: null as CustomerSheet | null, inlineCustomerDrafts: {} as Record<string, string>,
   },
@@ -1086,10 +1091,18 @@ Page({
       try {
         const { preview } = await this.request<{ preview: TripPreview }>('/trips/preview',
           { draftId: draft.id, revision: draft.revision });
-        const pendingPrices = preview.customers.reduce((sum, customer) =>
-          sum + customer.items.filter(line => line.amountCents === null).length, 0);
+        const view = tripView(preview);
+        const customers = view.customers.map(customer => {
+          const customerPending = customer.items.filter(line => line.amountCents === null).length;
+          const allPending = customer.totalCents === 0 && customerPending > 0;
+          return { ...customer, pendingPrices: customerPending, allPending,
+            displayTotal: allPending ? '待补价' : '¥' + money(customer.totalCents) };
+        });
+        const pendingPrices = customers.reduce((sum, customer) => sum + customer.pendingPrices, 0);
+        const allPending = preview.totalCents === 0 && pendingPrices > 0;
         this.setData({ orderSheetStep: 'preview', priceDrawerError: '',
-          sheetPreview: { ...tripView(preview), id: preview.previewId, pendingPrices } });
+          sheetPreview: { ...view, customers, id: preview.previewId, pendingPrices, allPending,
+            displayTotal: allPending ? '待补价' : '¥' + money(preview.totalCents) } });
       } catch (error) {
         if (error instanceof WorkspaceError && error.status === 401) throw error;
         if (error instanceof WorkspaceError && draftConflicts.includes(error.code)) {

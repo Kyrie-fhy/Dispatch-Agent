@@ -2320,6 +2320,11 @@ test('6.6-2 runs the Plan A loop from the trip pill through the order book to co
   assert.equal(page.data.orderSheetOpen, true);
   assert.equal(page.data.sheetPreview.total, '200.00');
   assert.equal(page.data.sheetPreview.pendingPrices, 0);
+  assert.equal(page.data.sheetPreview.allPending, false);
+  assert.equal(page.data.sheetPreview.displayTotal, '¥200.00');
+  assert.equal(page.data.sheetPreview.customers[0].pendingPrices, 0);
+  assert.equal(page.data.sheetPreview.customers[0].allPending, false);
+  assert.equal(page.data.sheetPreview.customers[0].displayTotal, '¥200.00');
   const previewRequest = requests.find(request => request.path === '/trips/preview');
   assert.deepEqual([previewRequest.data.draftId, previewRequest.data.revision], [draft.id, 2]);
 
@@ -2391,6 +2396,62 @@ test('6.6-2 blocks drawer preview until prices are saved and keeps failures insi
   assert.equal(page.data.orderSheetStep, 'list');
   assert.match(page.data.priceDrawerError, /草稿已更新/);
   assert.equal(page.data.scrollTo, '');
+});
+
+test('6.6-2 shows honest all-pending totals inside the order book preview', async t => {
+  const pending = order();
+  pending.customers[0].items[0].price = null;
+  const first = setup(t, pending);
+  first.handle(request => {
+    if (request.path !== '/trips/preview') return false;
+    request.ok({ preview: { ...previewTrip(pending, true), previewId: 'pre-all-pending', draftId: pending.id,
+      revision: pending.revision, choices: [null] } });
+    return true;
+  });
+  await first.page.onShow();
+  await first.page.login();
+  first.page.openOrderSheet(tap({ tab: 'all' }));
+  await first.page.previewInSheet();
+  assert.equal(first.page.data.orderSheetStep, 'preview');
+  assert.equal(first.page.data.sheetPreview.total, '0.00', '预览接口原始金额仍是 0');
+  assert.equal(first.page.data.sheetPreview.pendingPrices, 1);
+  assert.equal(first.page.data.sheetPreview.allPending, true);
+  assert.equal(first.page.data.sheetPreview.displayTotal, '待补价', '全单缺价不得显示 ¥0.00');
+  assert.equal(first.page.data.sheetPreview.customers[0].pendingPrices, 1);
+  assert.equal(first.page.data.sheetPreview.customers[0].allPending, true);
+  assert.equal(first.page.data.sheetPreview.customers[0].displayTotal, '待补价');
+
+  const mixed = order();
+  const base = mixed.customers[0].items[0];
+  mixed.customers[0].items[0] = { ...base, id: 'line-open', price: null };
+  mixed.customers.push({ id: 'customer-paid', customer: '老李', partyId: null,
+    items: [{ ...base, id: 'line-paid', product: '汤圆', quantity: '1', unit: '箱', price: '30' }] });
+  const second = setup(t, mixed);
+  second.handle(request => {
+    if (request.path !== '/trips/preview') return false;
+    request.ok({ preview: { ...previewTrip(mixed, true), previewId: 'pre-mixed', draftId: mixed.id,
+      revision: mixed.revision, choices: [null] } });
+    return true;
+  });
+  await second.page.onShow();
+  await second.page.login();
+  second.page.openOrderSheet(tap({ tab: 'all' }));
+  await second.page.previewInSheet();
+  assert.equal(second.page.data.sheetPreview.allPending, false);
+  assert.equal(second.page.data.sheetPreview.displayTotal, '¥30.00');
+  assert.equal(second.page.data.sheetPreview.pendingPrices, 1);
+  assert.equal(second.page.data.sheetPreview.customers[0].allPending, true);
+  assert.equal(second.page.data.sheetPreview.customers[0].displayTotal, '待补价', '单店全缺价不得显示 ¥0.00');
+  assert.equal(second.page.data.sheetPreview.customers[1].allPending, false);
+  assert.equal(second.page.data.sheetPreview.customers[1].displayTotal, '¥30.00');
+  assert.equal(second.page.data.sheetPreview.customers[1].pendingPrices, 0);
+
+  const wxml = fs.readFileSync(require.resolve('../code/dist/pages/agent/index.wxml'), 'utf8');
+  assert.equal(wxml.includes('¥{{sheetPreview.total}}'), false, '总金额不得写死 ¥ 加原始金额');
+  assert.equal(wxml.includes('¥{{customer.total}}'), false, '门店小计不得写死 ¥ 加原始金额');
+  assert.ok(wxml.includes('sheetPreview.displayTotal'));
+  assert.ok(wxml.includes('customer.displayTotal'));
+  assert.ok(wxml.includes('trip-pill-todo num {{draftSummary.hasTodo'));
 });
 
 test('6.6-1 ships v2.0 global visual tokens and native bar palette', async () => {

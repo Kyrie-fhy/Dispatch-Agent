@@ -551,6 +551,82 @@ test('catalog grounds both original and corrected homophones and reports the ali
   assert.match(result.lines[0], /德盐龙虾尾 → 德炎龙虾尾/);
 });
 
+test('catalog grounds series brands and soft spec words without letting invented packages through', async () => {
+  const catalog = variants([
+    ['T1', '1', '冻品', '大庄园尊宴羔羊肉片240g', '大庄园', '尊宴羔羊肉片', '240g', '锁鲜装', '箱', '120', '在售', '已核实', ''],
+    ['T1', '2', '冻品', '大庄园尊宴羔羊肉片1kg', '大庄园', '尊宴羔羊肉片', '1kg', '单规格', '箱', '300', '在售', '已核实', ''],
+    ['T2', '1', '冻品', '安井锁鲜鱼豆腐240g', '安井', '锁鲜鱼豆腐', '240g', '单规格', '箱', '88', '在售', '已核实', ''],
+    ['T2B', '1', '冻品', '安井包心鱼豆腐2.5kg', '安井', '包心鱼豆腐', '2.5kg', '单规格', '箱', '150', '在售', '已核实', ''],
+    ['T3', '1', '冻品', '甲牌锁鲜松叶蟹味棒250g', '甲牌', '锁鲜松叶蟹味棒', '250g', '单规格', '袋', '45', '在售', '已核实', ''],
+    ['T4', '1', '冻品', '甲牌糯米烧麦1kg', '甲牌', '糯米烧麦', '1kg', '单规格', '袋', '30', '在售', '已核实', ''],
+    ['T6', '1', '冻品', '安井鲜肉丸500g', '安井', '鲜肉丸', '500g', '单规格', '箱', '50', '在售', '已核实', ''],
+    ['T6', '2', '冻品', '安井鲜肉丸1kg', '安井', '鲜肉丸', '1kg', '单规格', '箱', '92', '在售', '已核实', ''],
+  ]);
+  const client = { async query(sql) {
+    assert.match(sql, /dispatch\.(?:parties|customer_aliases)/);
+    return { rows: [] };
+  } };
+  const price = async (text, ...items) => {
+    const draft = draftWith(...items);
+    await applyCatalogToDraft(client, 'account', draft, draftWith(), catalog, text);
+    return state(draft);
+  };
+
+  const series = await price('甲店要两箱大庄园尊宴羔羊肉片240g锁鲜装',
+    item('羔羊肉片', { brand: '大庄园尊宴', specification: '240g 锁鲜装' }));
+  assert.deepEqual(series.map(row => [row.brand, row.product, row.specification, row.price, row.priceSource]),
+    [['大庄园', '尊宴羔羊肉片', '240g·锁鲜装', '120.00', 'catalog']]);
+  // The spoken source says only 锁鲜; the grounded series word is kept.
+  const stem = await price('甲店要两箱大庄园尊宴羔羊肉片锁鲜',
+    item('羔羊肉片', { brand: '大庄园尊宴', specification: '锁鲜装' }));
+  assert.deepEqual(stem.map(row => [row.brand, row.specification, row.price]),
+    [['大庄园', '240g·锁鲜装', '120.00']]);
+  // An invented weight is cleared; the known product stays ambiguous instead of guessing a package.
+  const inventedWeight = await price('甲店要两箱大庄园尊宴羔羊肉片240g锁鲜装',
+    item('羔羊肉片', { brand: '大庄园尊宴', specification: '1kg' }));
+  assert.deepEqual(inventedWeight.map(row => [row.brand, row.specification, row.price]),
+    [['大庄园尊宴', '', null]]);
+  // 1500g must not ground 500g.
+  const tail = await price('甲店要两箱安井鲜肉丸1500g', item('鲜肉丸', { brand: '安井', specification: '500g' }));
+  assert.deepEqual(tail.map(row => [row.brand, row.specification, row.price]), [['安井', '', null]]);
+  // A brand that the source never mentions is cleared.
+  const inventedBrand = await price('甲店要两箱大庄园尊宴羔羊肉片240g锁鲜装',
+    item('羔羊肉片', { brand: '新品牌', specification: '1kg' }));
+  assert.deepEqual(inventedBrand.map(row => [row.brand, row.specification, row.price]), [['', '', null]]);
+});
+
+test('image recognition crosses soft spec slots but keeps hard units and short-name choices', async () => {
+  const catalog = variants([
+    ['T1', '1', '冻品', '大庄园尊宴羔羊肉片240g', '大庄园', '尊宴羔羊肉片', '240g', '锁鲜装', '箱', '120', '在售', '已核实', ''],
+    ['T1', '2', '冻品', '大庄园尊宴羔羊肉片1kg', '大庄园', '尊宴羔羊肉片', '1kg', '单规格', '箱', '300', '在售', '已核实', ''],
+    ['T2', '1', '冻品', '安井锁鲜鱼豆腐240g', '安井', '锁鲜鱼豆腐', '240g', '单规格', '箱', '88', '在售', '已核实', ''],
+    ['T2B', '1', '冻品', '安井包心鱼豆腐2.5kg', '安井', '包心鱼豆腐', '2.5kg', '单规格', '箱', '150', '在售', '已核实', ''],
+    ['T3', '1', '冻品', '甲牌锁鲜松叶蟹味棒250g', '甲牌', '锁鲜松叶蟹味棒', '250g', '单规格', '袋', '45', '在售', '已核实', ''],
+    ['T4', '1', '冻品', '甲牌糯米烧麦1kg', '甲牌', '糯米烧麦', '1kg', '单规格', '袋', '30', '在售', '已核实', ''],
+  ]);
+  const client = { query: async () => ({ rows: [] }) };
+  const draft = draftWith(
+    item('鱼豆腐', { brand: '安井', specification: '锁鲜装', unit: '箱' }),
+    item('鱼豆腐', { brand: '安井', specification: '锁鲜装', unit: '盒' }),
+    item('羔羊肉片', { brand: '大庄园尊宴', specification: '1千克', unit: '箱' }),
+    item('蟹味棒', { brand: '甲牌', specification: '锁鲜装', unit: '袋' }),
+    item('烧卖', { brand: '甲牌', unit: '袋' }),
+  );
+  await applyCatalogToDraft(client, 'account', draft, draftWith(), catalog);
+  assert.deepEqual(state(draft).map(row => [row.product, row.brand, row.specification, row.catalogStatus, row.price]),
+    [
+      ['锁鲜鱼豆腐', '安井', '240g', 'active', '88.00'],
+      ['鱼豆腐', '安井', '锁鲜装', 'unit_mismatch', null],
+      ['尊宴羔羊肉片', '大庄园', '1kg', 'active', '300.00'],
+      ['蟹味棒', '甲牌', '锁鲜装', 'ambiguous', null],
+      ['烧卖', '甲牌', '', 'ambiguous', null],
+    ]);
+  assert.match(state(draft)[1].priceHint, /库内仅记 箱 ¥88\.00/);
+  const choices = suggestCatalogChoices(draft, catalog);
+  assert.ok(choices.some(choice => choice.candidates.some(candidate => candidate.product === '锁鲜松叶蟹味棒')));
+  assert.ok(choices.some(choice => choice.candidates.some(candidate => candidate.product === '糯米烧麦')));
+});
+
 test('agent saves the rest of an order while asking about a duplicate and accepts near-match choices', { timeout: 60_000 }, async t => {
   const db = await isolatedDatabase(t);
   const customer = '王记餐饮';

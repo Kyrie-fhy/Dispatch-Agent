@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import {
-  catalogKey, matchCatalogChoice, matchCatalogItem, normalizeCatalogSpec, parseCatalogCsv, quotedLinePrices, resolveCatalogAutoPrice,
-  type CatalogMatch, type CatalogVariant,
+  catalogKey, matchCatalogChoice, matchCatalogItem, modifierStems, normalizeCatalogSpec, parseCatalogCsv, parseSpecTokens,
+  quotedLinePrices, resolveCatalogAutoPrice, type CatalogMatch, type CatalogVariant,
 } from '../miniprogram/core/catalog';
 import { money, nullablePrice, yuanToCents, type ItemInput } from '../miniprogram/core/orders';
 import { toPinyinTokens } from '../miniprogram/core/pinyin';
@@ -110,8 +110,16 @@ function groundedCatalogDetails(item: ItemInput, previous: ItemInput | undefined
       return names.includes(target) && names.some(mentioned);
     });
   };
+  const catalogBrandKeys = [...new Set(catalog.flatMap(variant =>
+    [variant.brand, ...(variant.brandAliases ?? [])]).map(catalogKey).filter(Boolean))]
+    .sort((a, b) => b.length - a.length);
+  function catalogBrandPrefixGrounded(target: string) {
+    return catalogBrandKeys.some(key => target.length > key.length && target.startsWith(key)
+      && brandMentioned(key) && modifierStems(target.slice(key.length)).some(stem => brandMentioned(stem)));
+  }
   const hasBrand = !brand || item.brand === previous?.brand || brandFamilyMentioned(brand,
-    productName.startsWith(brand) ? productName.slice(brand.length) : productName);
+    productName.startsWith(brand) ? productName.slice(brand.length) : productName)
+    || catalogBrandPrefixGrounded(brand);
   // Strip an ungrounded catalog brand prefix glued onto product (e.g. "秋丰鸭血" when source only says "鸭血").
   let product = item.product;
   if (product && product !== previous?.product) {
@@ -128,14 +136,26 @@ function groundedCatalogDetails(item: ItemInput, previous: ItemInput | undefined
       }
     }
   }
-  // A package such as 500g must not match the tail of 1500g or 1.500g.
+  // A package such as 500g must not match the tail of 1500g or 1.500g. Each spec
+  // token is checked separately so a grounded series word survives while an invented weight does not.
+  const spec = parseSpecTokens(item.specification);
   const escapedSpec = specification.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const hasSpec = !specification || item.specification === previous?.specification ||
-    new RegExp((/^\d/.test(specification) ? '(?<![\\d.])' : '') + escapedSpec).test(source);
+  const fullSpecGrounded = new RegExp((/^\d/.test(specification) ? '(?<![\\d.])' : '') + escapedSpec).test(source);
+  const groundedSpec = spec.tokens.filter(token => /^\d/.test(token)
+    ? new RegExp('(?<![\\d.])' + token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).test(source)
+    : modifierStems(token).some(stem => source.includes(stem)));
+  const nextSpecification = !specification || item.specification === previous?.specification
+    ? item.specification
+    : !spec.tokens.length
+      ? (fullSpecGrounded ? item.specification : '')
+      : groundedSpec.length === spec.tokens.length
+        ? item.specification
+        : groundedSpec.join('·');
+  const hasSpec = !specification || item.specification === previous?.specification || Boolean(nextSpecification);
   const unitKey = catalogKey(item.unit);
   const unitGrounded = !unitKey || item.unit === previous?.unit || source.includes(unitKey);
   return {
-    item: { ...item, product, brand: hasBrand ? item.brand : '', specification: hasSpec ? item.specification : '' },
+    item: { ...item, product, brand: hasBrand ? item.brand : '', specification: hasSpec ? nextSpecification : '' },
     unitGrounded, spokenProduct: mention(catalogKey(product)),
     spokenBrandProduct: hasBrand && brand && product && !productName.startsWith(brand) ? mention(brand + catalogKey(product)) : undefined,
   };

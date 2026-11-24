@@ -165,6 +165,94 @@ export type CatalogMatch = (
 
 function specKey(value: string) { return catalogKey(normalizeCatalogSpec(value)); }
 
+// A specification mixes hard facts (weight, volume, count, size) with soft text
+// (flavor, grade, series or package wording). Only the hard facts may lock a price.
+const numericSpec = /\d+(?:[.\/-]\d+)*(?:[a-zA-Z]+|(?:片装|个\/板|枚|寸|斤|克|千克|公斤|片|个|支|根|只|条|粒|颗|串|块|升|毫升))?/g;
+
+export interface ParsedSpecTokens {
+  fullDetail: string;
+  hardSpecs: string[];
+  textSpecs: string[];
+  tokens: string[];
+}
+
+export function parseSpecTokens(value: string): ParsedSpecTokens {
+  const hardSpecs: string[] = [];
+  const textSpecs: string[] = [];
+  const tokens: string[] = [];
+  for (const fragment of normalizeCatalogSpec(value).split(/[\s·,，;；+]+/u)) {
+    if (!fragment) continue;
+    let remainder = fragment;
+    for (const raw of fragment.match(numericSpec) ?? []) {
+      const token = specKey(raw);
+      if (token) {
+        hardSpecs.push(token);
+        tokens.push(token);
+      }
+      remainder = remainder.replace(raw, '');
+    }
+    const text = specKey(remainder.replace(/[\/／]+/g, ''));
+    if (text && !/\d/.test(text)) {
+      textSpecs.push(text);
+      tokens.push(text);
+    }
+  }
+  return {
+    fullDetail: specKey(value), hardSpecs: [...new Set(hardSpecs)], textSpecs: [...new Set(textSpecs)],
+    tokens: [...new Set(tokens)],
+  };
+}
+
+export function modifierStems(token: string): string[] {
+  const stems = [token];
+  if (!/\d/.test(token)) {
+    const stem = token.endsWith('包装') ? token.slice(0, -2) : token.endsWith('装') ? token.slice(0, -1) : '';
+    if (stem && hanLength(stem) >= 2) stems.push(stem);
+  }
+  return stems;
+}
+
+function productNameVariants(name: string): string[] {
+  const variants = new Set([name]);
+  // "锁鲜装鱼豆腐" also compares as "锁鲜鱼豆腐" when 装 is a series modifier.
+  const match = name.match(/^([\u4e00-\u9fff]{2,})装([\u4e00-\u9fff]{2,})$/u);
+  if (match) variants.add(match[1] + match[2]);
+  return [...variants];
+}
+
+function nameQueries(bases: readonly string[], groups: readonly (readonly string[])[]): string[] {
+  const required = groups.filter(group => group.length);
+  if (!required.length) return [...bases];
+  const selections = required.reduce<string[][]>((rows, group) =>
+    rows.flatMap(row => group.map(stem => [...row, stem])), [[]]);
+  const queries = new Set<string>();
+  for (const selection of selections) {
+    const joined = selection.join('');
+    for (const base of bases) {
+      queries.add(joined + base);
+      queries.add(base + joined);
+    }
+  }
+  return [...queries];
+}
+
+function brandRestFor(brand: string, brands: ReadonlySet<string>, same: (a: string, b: string) => boolean): string | null {
+  if (!brand) return '';
+  let matched: string | null = null;
+  for (const key of brands) {
+    if (same(brand, key) || (brand.length > key.length && same(brand.slice(0, key.length), key))) {
+      if (matched === null || key.length > matched.length) matched = key;
+    }
+  }
+  return matched === null ? null : brand.slice(matched.length);
+}
+
+function hardSpecsMatch(keys: ReturnType<typeof variantKeys>, spec: ParsedSpecTokens): boolean {
+  if (!spec.hardSpecs.length) return true;
+  if (spec.fullDetail && keys.details.has(spec.fullDetail)) return true;
+  return spec.hardSpecs.every(token => keys.hardDetails.has(token));
+}
+
 function variantKeys(variant: CatalogVariant) {
   const { brand, brandAliases = [], product, aliases, packaging, flavorOrGrade, specification } = variant;
   const brands = new Set([brand, ...brandAliases].map(catalogKey).filter(Boolean));
@@ -176,6 +264,12 @@ function variantKeys(variant: CatalogVariant) {
   }
   const details = new Set([packaging, flavorOrGrade ?? '', specification,
     flavorOrGrade ? packaging + flavorOrGrade : ''].map(specKey).filter(Boolean));
+  const hardDetails = new Set(details);
+  for (const part of packaging.split(/[\/／]/)) {
+    const key = specKey(part);
+    if (key) hardDetails.add(key);
+  }
+  for (const hard of parseSpecTokens(packaging).hardSpecs) hardDetails.add(hard);
   const combined = new Set<string>();
   for (const name of names) for (const detail of details) {
     if (flavorOrGrade && detail === specKey(packaging)) continue;
@@ -183,7 +277,7 @@ function variantKeys(variant: CatalogVariant) {
     combined.add(name + '·' + detail);
     combined.add(detail + name);
   }
-  return { names, details, combined, brands };
+  return { names, details, hardDetails, combined, brands, flavorKey: flavorOrGrade ? specKey(flavorOrGrade) : '' };
 }
 
 function unitMismatch(item: MatchFields, candidates: CatalogVariant[]): Extract<CatalogMatch, { status: 'unit_mismatch' }> {
@@ -205,10 +299,28 @@ const byCatalogOrder = (a: CatalogVariant, b: CatalogVariant) =>
   || a.productCode.localeCompare(b.productCode) || a.variantCode.localeCompare(b.variantCode);
 const genericSyllables = new Set(toFuzzyPinyinTokens('鱼虾肉丸卷包肠饺'));
 
-function fuzzyCatalogMatch(item: MatchFields, name: string, brand: string, detail: string,
-  catalog: readonly CatalogVariant[]): CatalogMatch {
+const exactSame = (a: string, b: string) => a === b;
+
+function containsSoundSequence(term: string, modifier: string): boolean {
+  const wanted = toFuzzyPinyinTokens(modifier);
+  if (!wanted.length) return true;
+  const tokens = toFuzzyPinyinTokens(term);
+  return tokens.some((_, start) => wanted.every((token, offset) => tokens[start + offset] === token));
+}
+
+function isContiguousSubarray(needle: readonly string[], haystack: readonly string[]): boolean {
+  if (!needle.length || needle.length > haystack.length) return false;
+  return haystack.some((_, start) => needle.every((token, offset) => haystack[start + offset] === token));
+}
+
+const specNumbers = (value: string) => value.match(/\d+(?:[./-]\d+)*/g) ?? [];
+
+function fuzzyCatalogMatch(item: MatchFields, catalog: readonly CatalogVariant[]): CatalogMatch {
   const unmatched: CatalogMatch = { status: 'unmatched', candidates: [] };
+  const name = specKey(item.product);
   if (item.catalogProductId || item.catalogVariantId || hanLength(name) < 2) return unmatched;
+  const spec = parseSpecTokens(item.specification);
+  const brand = catalogKey(item.brand);
   const keysByVariant = catalog.map(variant => ({ variant, keys: variantKeys(variant) }));
   const sounds = new Map<string, string>();
   const soundKey = (value: string) => {
@@ -224,10 +336,23 @@ function fuzzyCatalogMatch(item: MatchFields, name: string, brand: string, detai
   const sameSound = (a: string, b: string) => a === b || soundKey(a) === soundKey(b);
   const brands = [...new Set(keysByVariant.flatMap(({ keys }) => [...keys.brands]))];
   if (!brand && brands.some(key => sameSound(name, key))) return unmatched;
-  const scope = keysByVariant.filter(({ keys }) => (!detail || keys.details.has(detail))
-    && (!brand || [...keys.brands].some(key => sameSound(brand, key))));
-  const strict = scope.filter(({ keys }) => [...keys.names].some(term =>
-    sameSound(name, term) || (brand && sameSound(brand + name, term))));
+  const scope = keysByVariant.filter(({ keys }) => hardSpecsMatch(keys, spec)
+    && (!brand || brandRestFor(brand, keys.brands, sameSound) !== null));
+  const variantModifiers = (keys: ReturnType<typeof variantKeys>) => {
+    const rest = brand ? brandRestFor(brand, keys.brands, sameSound) ?? '' : '';
+    const nameModifiers = spec.textSpecs.filter(token =>
+      !keys.details.has(token) && !(keys.flavorKey && sameSound(token, keys.flavorKey)));
+    const groups = [
+      ...(rest ? [modifierStems(rest)] : []),
+      ...nameModifiers.map(modifierStems),
+    ];
+    return { nameModifiers, groups, modifiers: groups.flat() };
+  };
+  const strict = scope.filter(({ keys }) => {
+    const { groups } = variantModifiers(keys);
+    return productNameVariants(name).some(base => nameQueries([base], groups).some(query =>
+      [...keys.names].some(term => sameSound(query, term) || (brand && sameSound(brand + query, term)))));
+  });
   if (strict.length) {
     const candidates = strict.map(({ variant }) => variant).sort(byCatalogOrder);
     return { ...classifyCatalogMatches(item, candidates), matchMethod: 'homophone' };
@@ -240,20 +365,39 @@ function fuzzyCatalogMatch(item: MatchFields, name: string, brand: string, detai
   const product = name.slice(prefixLength);
   if (hanLength(product) < 2) return unmatched;
   const qualified = Boolean(prefix || brand);
-  const distinctSounds = new Set(toFuzzyPinyinTokens(product).filter(token =>
-    !genericSyllables.has(token) && !/^[a-z0-9]$/.test(token)));
   const unit = catalogKey(item.unit);
+  const bases = productNameVariants(product);
   const ranked = scope.flatMap(({ variant, keys }) => {
     if (prefix && ![...keys.brands].some(key => sameSound(prefix, key))) return [];
+    const { nameModifiers, groups, modifiers } = variantModifiers(keys);
     const terms = new Set([...keys.names].map(term => {
       if (term === specKey(variant.product)) return term;
       const qualifier = [...keys.brands].filter(key => term.startsWith(key)).sort((a, b) => b.length - a.length)[0];
       return qualifier ? term.slice(qualifier.length) : term;
     }));
-    const score = Math.max(0, ...[...terms].map(term => {
-      if (!toFuzzyPinyinTokens(term).some(token => distinctSounds.has(token))) return 0;
-      return pinyinSimilarity(product, term);
-    }));
+    let score = 0;
+    for (const base of bases) {
+      for (const query of nameQueries([base], groups)) {
+        const queryTokens = toFuzzyPinyinTokens(query);
+        const queryNumbers = specNumbers(query);
+        const distinctSounds = new Set(queryTokens.filter(token =>
+          !genericSyllables.has(token) && !/^[a-z0-9]$/.test(token)));
+        for (const term of terms) {
+          if (modifiers.length && !modifiers.some(modifier => containsSoundSequence(term, modifier))) continue;
+          if (!toFuzzyPinyinTokens(term).some(token => distinctSounds.has(token))) continue;
+          let value = pinyinSimilarity(query, term);
+          // A known brand plus a short name still needs an explicit, contiguous sound match.
+          const termTokens = toFuzzyPinyinTokens(term);
+          if (qualified && hanLength(query) >= 2 && nameModifiers.length === 0 && distinctSounds.size >= 1
+            && JSON.stringify(queryNumbers) === JSON.stringify(specNumbers(term))
+            && queryTokens.length >= 2 && isContiguousSubarray(queryTokens, termTokens)
+            && queryTokens.some(token => distinctSounds.has(token))) {
+            value = Math.max(value, 0.62);
+          }
+          score = Math.max(score, value);
+        }
+      }
+    }
     return score >= (qualified ? 0.55 : 0.72) ? [{ variant, score }] : [];
   }).sort((a, b) => b.score - a.score || Number(b.variant.status === 'active') - Number(a.variant.status === 'active')
     || Number(b.variant.unit === unit) - Number(a.variant.unit === unit)
@@ -274,16 +418,23 @@ export function matchCatalogItem(item: MatchFields, catalog: readonly CatalogVar
   if (item.catalogStatus === 'external') return { status: 'external', candidates: [] };
   const name = specKey(item.product);
   const brand = catalogKey(item.brand);
-  const detail = specKey(item.specification);
+  const spec = parseSpecTokens(item.specification);
   if (!name) return { status: 'unmatched', candidates: [] };
   const candidates = catalog.filter(variant => {
     if (item.catalogProductId && variant.productId !== item.catalogProductId) return false;
     if (item.catalogVariantId && variant.variantId !== item.catalogVariantId) return false;
     const keys = variantKeys(variant);
-    return (!brand || keys.brands.has(brand)) && (!detail || keys.details.has(detail)) &&
-      (keys.names.has(name) || keys.combined.has(name));
+    const rest = brandRestFor(brand, keys.brands, exactSame);
+    if (rest === null || !hardSpecsMatch(keys, spec)) return false;
+    const nameModifiers = spec.textSpecs.filter(token =>
+      !keys.details.has(token) && !(keys.flavorKey && token === keys.flavorKey));
+    const groups = [
+      ...(rest ? [modifierStems(rest)] : []),
+      ...nameModifiers.map(modifierStems),
+    ];
+    return nameQueries(productNameVariants(name), groups).some(query => keys.names.has(query) || keys.combined.has(query));
   }).sort(byCatalogOrder);
-  return candidates.length ? classifyCatalogMatches(item, candidates) : fuzzyCatalogMatch(item, name, brand, detail, catalog);
+  return candidates.length ? classifyCatalogMatches(item, candidates) : fuzzyCatalogMatch(item, catalog);
 }
 
 function classifyCatalogMatches(item: MatchFields, candidates: CatalogVariant[]): CatalogMatch {

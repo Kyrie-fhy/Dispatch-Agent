@@ -2,7 +2,7 @@ const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const {
   catalogCsvColumns, extractCatalogAliases, hasQuotedLinePrice, matchCatalogChoice, matchCatalogItem, parseCatalogCsv,
-  quotedLinePrices, resolveCatalogAutoPrice,
+  parseSpecTokens, quotedLinePrices, resolveCatalogAutoPrice,
 } = require('../code/dist/core/catalog');
 const { lookupDeliveredPrice, lookupHistoricalPrice, collectHistoricalSales } = require('../code/dist/core/memory');
 const { toPinyinTokens, toFuzzyPinyinTokens, pinyinSimilarity } = require('../code/dist/core/pinyin');
@@ -294,6 +294,110 @@ test('reuse of a catalog variant ID after a packaging change does not reuse the 
   assert.equal(priceFor(line(), [oldVariant], 'one', sales).priceSource, 'customer_history');
   const current = priceFor(line(), updated, 'one', sales);
   assert.deepEqual([current.price, current.priceSource], ['9.25', 'catalog']);
+});
+
+test('catalog crosses soft spec slots but locks weight, flavor and unit hard slots', () => {
+  const rows = variants([
+    record({ code: 'Q1', original: '安井锁鲜鱼豆腐240g', brand: '安井', product: '锁鲜鱼豆腐', packaging: '240g',
+      unit: '箱', price: '88' }),
+    record({ code: 'Q2', original: '安井包心鱼豆腐2.5kg', brand: '安井', product: '包心鱼豆腐', packaging: '2.5kg',
+      unit: '箱', price: '150' }),
+    record({ code: 'Q3', original: '某厂尊宴羔羊肉片400g', brand: '某厂', product: '尊宴羔羊肉片', packaging: '400g',
+      unit: '箱', price: '100' }),
+    record({ code: 'Q3', variant: '2', original: '某厂尊宴羔羊肉片1kg', brand: '某厂', product: '尊宴羔羊肉片',
+      packaging: '1kg', unit: '箱', price: '200' }),
+    record({ code: 'Q4', original: '甲厂锁鲜鱼子福袋150g', brand: '甲厂', product: '锁鲜鱼子福袋', packaging: '150g',
+      unit: '箱', price: '70' }),
+    record({ code: 'Q5', original: '甲厂鱼籽福袋2.5kg', brand: '甲厂', product: '鱼籽福袋', packaging: '2.5kg',
+      unit: '箱', price: '210' }),
+    record({ code: 'Q6', original: '甲牌糯米烧麦1kg', brand: '甲牌', product: '糯米烧麦', packaging: '1kg',
+      unit: '袋', price: '30' }),
+    record({ code: 'Q7', original: '甲牌锁鲜松叶蟹味棒250g', brand: '甲牌', product: '锁鲜松叶蟹味棒', packaging: '250g',
+      unit: '袋', price: '45' }),
+    record({ code: 'Q8', original: '三全豆沙春卷300g', brand: '三全', product: '豆沙春卷', packaging: '300g',
+      unit: '袋', price: '12' }),
+    record({ code: 'Q9', original: '甲牌馄饨400g', brand: '甲牌', product: '馄饨', packaging: '400g',
+      spec: '荠菜猪肉', unit: '袋', price: '20' }),
+    record({ code: 'Q9', variant: '2', original: '甲牌馄饨400g', brand: '甲牌', product: '馄饨', packaging: '400g',
+      spec: '香菇猪肉', unit: '袋', price: '22' }),
+  ]);
+
+  // A series modifier may sit in specification, inside the product name, or in the brand prefix.
+  for (const input of [
+    { brand: '安井', product: '鱼豆腐', specification: '锁鲜装' },
+    { brand: '安井', product: '锁鲜装鱼豆腐' },
+    { brand: '安井锁鲜装', product: '鱼豆腐' },
+  ]) {
+    const priced = priceFor(line(input), rows);
+    assert.deepEqual([priced.product, priced.brand, priced.specification, priced.price, priced.priceSource],
+      ['锁鲜鱼豆腐', '安井', '240g', '88.00', 'catalog'], JSON.stringify(input));
+  }
+  // A series word merged into the brand becomes part of the product name.
+  const lamp = priceFor(line({ brand: '某厂尊宴', product: '羔羊肉片', specification: '1千克' }), rows);
+  assert.deepEqual([lamp.product, lamp.brand, lamp.specification, lamp.price],
+    ['尊宴羔羊肉片', '某厂', '1kg', '200.00']);
+  const noWeight = matchCatalogItem(line({ brand: '某厂尊宴', product: '羔羊肉片' }), rows);
+  assert.equal(noWeight.status, 'ambiguous');
+  assert.equal(priceFor(line({ brand: '某厂尊宴', product: '羔羊肉片' }), rows).price, null);
+  // Homophones may still use the soft series word to select the right package.
+  const bag = priceFor(line({ brand: '甲厂', product: '鱼籽福袋', specification: '锁鲜装' }), rows);
+  assert.deepEqual([bag.product, bag.specification, bag.price, matchCatalogItem(
+    line({ brand: '甲厂', product: '鱼籽福袋', specification: '锁鲜装' }), rows).matchMethod],
+  ['锁鲜鱼子福袋', '150g', '70.00', 'homophone']);
+
+  // A hard weight cannot be traded for a similar one.
+  assert.equal(matchCatalogItem(line({ brand: '安井', product: '鱼豆腐', specification: '500g' }), rows).status,
+    'unmatched');
+  const kiloOnly = rows.filter(row => row.product !== '尊宴羔羊肉片' || row.packaging === '1kg');
+  assert.equal(matchCatalogItem(line({ brand: '某厂尊宴', product: '羔羊肉片', specification: '400g' }), kiloOnly)
+    .status, 'unmatched');
+  assert.equal(priceFor(line({ brand: '安井', product: '鱼豆腐', specification: '500g' }), rows).price, null);
+
+  // An unknown flavor is never silently dropped.
+  const spicy = matchCatalogItem(line({ brand: '安井', product: '鱼豆腐', specification: '麻辣' }), rows);
+  assert.deepEqual([spicy.status, priceFor(line({ brand: '安井', product: '鱼豆腐', specification: '麻辣' }), rows).price],
+    ['unmatched', null]);
+  assert.equal(matchCatalogItem(line({ brand: '甲牌', product: '馄饨' }), rows).status, 'ambiguous');
+  assert.equal(priceFor(line({ brand: '甲牌', product: '馄饨' }), rows).price, null);
+  const flavorMismatch = priceFor(line({ brand: '甲牌', product: '馄饨', specification: '荠菜猪肉', unit: '箱' }), rows);
+  assert.deepEqual([flavorMismatch.catalogStatus, flavorMismatch.price], ['unit_mismatch', null]);
+  assert.match(flavorMismatch.priceHint, /库内仅记 袋 ¥20\.00/);
+
+  // Unit mismatch always leaves the price empty with a reference hint.
+  const unitMismatch = priceFor(line({ brand: '安井', product: '鱼豆腐', specification: '锁鲜装', unit: '盒' }), rows);
+  assert.deepEqual([unitMismatch.catalogStatus, unitMismatch.price], ['unit_mismatch', null]);
+  assert.match(unitMismatch.priceHint, /库内仅记 箱 ¥88\.00/);
+
+  // A known brand plus a short name only suggests a choice, never a price.
+  for (const [input, product] of [
+    [{ brand: '甲牌', product: '烧卖' }, '糯米烧麦'],
+    [{ brand: '甲牌', product: '蟹味棒', specification: '锁鲜装' }, '锁鲜松叶蟹味棒'],
+  ]) {
+    const match = matchCatalogItem(line({ ...input, unit: '袋' }), rows);
+    assert.equal(match.status, 'ambiguous', JSON.stringify(input));
+    assert.equal(match.matchMethod, 'similar');
+    assert.ok(match.candidates.some(candidate => candidate.product === product));
+    assert.equal(priceFor(line({ ...input, unit: '袋' }), rows).price, null);
+  }
+  for (const input of [
+    { product: '奶香芝士棒', unit: '袋' }, { brand: '三全', product: '豆沙包', unit: '袋' },
+    { brand: '乙牌', product: '玉米水饺', unit: '袋' }, { product: '新到带鱼', unit: '箱' },
+    { product: '临时冻虾', unit: '箱' }, { product: '鱼丸', unit: '袋' }, { product: '虾肉', unit: '袋' },
+  ]) {
+    const priced = priceFor(line(input), rows);
+    assert.deepEqual([priced.catalogStatus, priced.price], ['unmatched', null], JSON.stringify(input));
+  }
+  // Numeric specs must not swallow adjacent non-unit Chinese flavor or product words.
+  assert.deepEqual(parseSpecTokens('40-50虾仁'), {
+    fullDetail: '40-50虾仁', hardSpecs: ['40-50'], textSpecs: ['虾仁'], tokens: ['40-50', '虾仁'],
+  });
+  assert.deepEqual(parseSpecTokens('9寸披萨'), {
+    fullDetail: '9寸披萨', hardSpecs: ['9寸'], textSpecs: ['披萨'], tokens: ['9寸', '披萨'],
+  });
+  // Parenthetical notes in catalog packaging still expose the hard weight for matching.
+  const notedRows = variants([record({ code: 'N1', brand: '甲厂', product: '锁鲜鱼籽包', packaging: '240g(详情页标240克)', unit: '袋', price: '9.80' })]);
+  const noted = priceFor(line({ brand: '甲厂', product: '鱼籽包', specification: '锁鲜装 240g', unit: '袋' }), notedRows);
+  assert.deepEqual([noted.catalogStatus, noted.price], ['active', '9.80']);
 });
 
 test('quoted price evidence belongs to the specified item, customer and unit', () => {

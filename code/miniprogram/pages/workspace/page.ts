@@ -120,9 +120,15 @@ Page({
       const linked = tab === 'delivery' ? agentSession.deliveryTarget : null;
       if (tab === 'delivery') agentSession.deliveryTarget = null;
       const target = linked ?? this.data.sheetTarget;
-      if (linked) this.setData({ ...sheetEditor(), sheetTarget: linked, sheet: null, sheetNeedsRefresh: false });
+      if (linked) {
+        this.setData({ ...sheetEditor(), sheetTarget: linked, sheet: null, sheetNeedsRefresh: false });
+        this.syncDeliveryTitle(true);
+      }
       if (target?.tripId === this.data.formal?.id && target) await this.readSheet(generation, token, target, false);
-      else if (target) this.setData({ ...sheetEditor(), sheetTarget: null, sheet: null });
+      else if (target) {
+        this.setData({ ...sheetEditor(), sheetTarget: null, sheet: null });
+        this.syncDeliveryTitle(false);
+      }
     });
   },
 
@@ -167,6 +173,7 @@ Page({
     this.voiceCapture?.cancel();
     this.voiceCapture = null;
     this.voiceFile = null;
+    this.syncDeliveryTitle(false);
     this.setData({ ...initialData(), error, revokeFailed: this.retiredTokens.length > 0 });
     return token;
   },
@@ -635,10 +642,16 @@ Page({
     });
   },
 
+  syncDeliveryTitle(inSheet: boolean) {
+    if (tab !== 'delivery') return;
+    wx.setNavigationBarTitle?.({ title: inSheet ? '门店送货单' : '送货' });
+  },
+
   openSheet(event: WechatMiniprogram.TouchEvent) {
     const { tripId, sheetId } = event.currentTarget.dataset;
     if (!this.token || this.data.busy || this.data.sheetRetry || !tripId || !sheetId) return;
     this.setData({ ...sheetEditor(), sheetTarget: { tripId, sheetId }, sheet: null, sheetNeedsRefresh: false });
+    this.syncDeliveryTitle(true);
     return this.refreshSheet();
   },
 
@@ -646,6 +659,7 @@ Page({
     if (this.data.busy || this.data.sheetRetry) return;
     const close = () => {
       this.setData({ ...sheetEditor(), sheetTarget: null, sheet: null, sheetNeedsRefresh: false, error: '' });
+      this.syncDeliveryTitle(false);
     };
     const { sheetTarget, sheetNeedsRefresh, formal } = this.data;
     if (sheetNeedsRefresh && formal && sheetTarget?.tripId === formal.id) {
@@ -748,6 +762,31 @@ Page({
     this.setData({ error: '', fieldEdit: { id: line.id, receivedQuantity: String(line.receivedQuantity), price: line.price ?? '' } });
   },
 
+  toggleFieldEdit(event: WechatMiniprogram.TouchEvent) {
+    const sheet = this.data.sheet;
+    if (!this.data.deliveryMvp || !sheet || !this.sheetReady() || sheet.reviewed) return;
+    const id = event.currentTarget.dataset.id;
+    if (this.data.fieldEdit?.id === id) {
+      this.setData({ fieldEdit: null, error: '' });
+      return;
+    }
+    const line = sheet.lines.find(line => line.id === id);
+    if (!line) return;
+    this.setData({ error: '', fieldEdit: { id: line.id, receivedQuantity: String(line.receivedQuantity), price: line.price ?? '' } });
+  },
+
+  stepReceivedQuantity(event: WechatMiniprogram.TouchEvent) {
+    const fieldEdit = this.data.fieldEdit;
+    if (!this.data.deliveryMvp || !fieldEdit || !this.sheetReady() || this.data.sheet?.reviewed) return;
+    const delta = Number(event.currentTarget.dataset.delta);
+    if (!Number.isInteger(delta)) return;
+    const raw = fieldEdit.receivedQuantity.trim();
+    const current = /^\d+$/.test(raw) ? Number(raw) : 0;
+    const next = Math.max(0, current + delta);
+    if (!Number.isSafeInteger(next)) return;
+    this.setData({ error: '', fieldEdit: { ...fieldEdit, receivedQuantity: String(next) } });
+  },
+
   editDeliveryField(event: WechatMiniprogram.Input) {
     const { field } = event.currentTarget.dataset;
     if (!this.data.fieldEdit || !this.sheetReady() || (field !== 'receivedQuantity' && field !== 'price')) return;
@@ -764,6 +803,17 @@ Page({
   completeDelivery() {
     const { sheet, fieldEdit } = this.data;
     if (!this.data.deliveryMvp || !sheet || fieldEdit || !this.sheetReady() || sheet.reviewed) return;
+    if (tab === 'delivery') {
+      const missing = sheet.lines.find(line => line.receivedQuantity > 0 && line.price === null);
+      if (missing) {
+        this.setData({
+          error: `「${missing.productLabel}」还缺单价，补完才能锁账`,
+          fieldEdit: { id: missing.id, receivedQuantity: String(missing.receivedQuantity), price: '' },
+        });
+        wx.showToast?.({ title: '请先补填缺价货品单价', icon: 'none' });
+        return;
+      }
+    }
     return this.writeSheet('/delivery/complete', { version: sheet.version, statusRevision: sheet.statusRevision });
   },
 

@@ -705,13 +705,25 @@ test('Agent drops the top strip and keeps the next action only on the latest lin
 test('Delivery MVP lists shops before opening a sheet and picking stays a flat read-only view', async t => {
   const deliveryWxml = fs.readFileSync(require.resolve('../code/dist/pages/trip-delivery/index.wxml'), 'utf8');
   assert.equal(deliveryWxml.includes('order-line'), false);
-  assert.equal(deliveryWxml.includes('原订'), false);
   assert.equal(deliveryWxml.includes('size="mini"'), false);
+  assert.equal(deliveryWxml.includes('cover-view'), false);
+  assert.equal(deliveryWxml.includes('price-tag'), false, '正式送货单不出现草稿价格来源标签');
+  const deliveryDetail = deliveryWxml.slice(0, deliveryWxml.indexOf('progress-card'));
+  const deliveryList = deliveryWxml.slice(deliveryWxml.indexOf('progress-card'));
+  assert.equal(deliveryDetail.includes('原订'), true, '门店详情展示原订数量');
+  assert.equal(deliveryList.includes('原订'), false, '门店列表不展示原订数量');
+  for (const token of ['确认送达并锁账', '点我改数/价', 'stepReceivedQuantity', 'toggleFieldEdit']) {
+    assert.ok(deliveryDetail.includes(token), `门店详情缺少 ${token}`);
+  }
   const pickingWxml = fs.readFileSync(require.resolve('../code/dist/pages/trip-picking/index.wxml'), 'utf8');
   const pickingFragment = fs.readFileSync(require.resolve('../code/dist/pages/workspace/picking.wxml'), 'utf8');
   for (const wxml of [pickingWxml, pickingFragment]) {
     assert.equal(wxml.includes('<checkbox'), false);
     assert.equal(wxml.includes('openSheet'), false);
+  }
+  assert.equal(pickingWxml.includes('size="mini"'), false);
+  for (const token of ['冷库取货单', 'picking-qty-box', 'picking-qty-other']) {
+    assert.ok(pickingWxml.includes(token), `取货单缺少 ${token}`);
   }
 
   const draft = order();
@@ -2475,4 +2487,186 @@ test('6.6-1 ships v2.0 global visual tokens and native bar palette', async () =>
   assert.equal(app.tabBar.color, '#64748B');
   assert.equal(app.tabBar.selectedColor, '#0F6E52');
   assert.equal(app.tabBar.backgroundColor, '#FFFFFF');
+});
+
+test('6.6-3 builds the cold-storage picking summary with box and bag separation', () => {
+  const { formalTripView } = require('../code/dist/pages/workspace/trip-view');
+  const draft = order();
+  const base = draft.customers[0].items[0];
+  draft.customers.push({ id: 'c-2', customer: '老李', partyId: null, items: [
+    { ...base, id: 'i-shared' },
+    { id: 'i-bag', product: '汤圆', brand: '甲牌', specification: '500g', unit: '袋', quantity: '3', price: '10' },
+  ] });
+  const summary = previewTrip(draft, true);
+  const formal = { trip: { id: draft.id, origin: 's2',
+    versions: [{ ...summary, version: 1, savedAt: '2026-11-24T00:00:00Z' }],
+    statuses: statusesFor(summary.customers, 'pending'), statusRevision: 0 },
+  picking: pickingList(summary.customers), deliveryEdits: {}, sheets: [] };
+  const view = formalTripView(formal);
+  assert.equal(view.pickingKindCount, 2);
+  assert.equal(view.pickingTotalQty, 7);
+  assert.deepEqual(view.picking, formal.picking, '既有 picking 原结构保持不变');
+  assert.deepEqual(formal.picking.map(row => row.quantity), [4, 3], '同一货品跨店汇总不变');
+
+  const box = view.pickingRows.find(row => row.unit === '箱');
+  assert.deepEqual(box, { ...formal.picking.find(row => row.unit === '箱'),
+    title: '水饺', specMeta: '2 家要货', isBox: true });
+  const bag = view.pickingRows.find(row => row.unit === '袋');
+  assert.deepEqual(bag, { ...formal.picking.find(row => row.unit === '袋'),
+    title: '甲牌 汤圆', specMeta: '500g · 1 家要货', isBox: false });
+
+  const wxml = fs.readFileSync(require.resolve('../code/dist/pages/trip-picking/index.wxml'), 'utf8');
+  const wxss = fs.readFileSync(require.resolve('../code/dist/pages/trip-picking/index.wxss'), 'utf8');
+  for (const token of ['冷库取货单', '{{formal.pickingKindCount}} 种 · {{formal.pickingTotalQty}} 件',
+    'picking-qty-box', 'picking-qty-other']) {
+    assert.ok(wxml.includes(token), `取货单缺少 ${token}`);
+  }
+  for (const banned of ['<checkbox', 'openSheet', 'size="mini"', 'cover-view', 'safe-area-inset-top', '¥']) {
+    assert.equal(wxml.includes(banned), false, `取货单不得出现 ${banned}`);
+  }
+  assert.ok(wxss.includes('--primary-weak') && wxss.includes('--canvas-sub'), '箱袋底色复用全局令牌');
+  assert.equal(wxss.includes('@import'), false, '取货页不再引入旧 S5 样式');
+  assert.equal(wxss.includes('safe-area-inset-top'), false, '页面根节点不得叠加顶部安全区');
+  const emoji = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{26FF}\u{FE0F}]/u;
+  assert.equal(emoji.test(wxml) || emoji.test(wxss), false, '取货页零 Emoji');
+});
+
+test('6.6-3 shows honest pending totals, progress and blocks locking an unpriced line', async t => {
+  const draft = order();
+  const wang = { id: draft.customers[0].id, lineId: draft.customers[0].items[0].id };
+  draft.customers[0].items[0].price = null;
+  draft.customers.push({ id: 'c-li', customer: '老李', partyId: null,
+    items: [{ id: 'i-li', product: '汤圆', brand: '', specification: '', unit: '箱', quantity: '1', price: null }] });
+  const summary = previewTrip(draft, true);
+  const [wangOrder, liOrder] = summary.customers;
+  const baseStatuses = statusesFor(summary.customers, 'pending');
+  Object.assign(baseStatuses, Object.fromEntries(liOrder.items.map(item => [item.id, 'delivered'])));
+
+  const { pageFor, requests, handle } = setup(t, draft);
+  let edits = {};
+  let revision = 0;
+  let wangDone = false;
+  const statuses = () => wangDone
+    ? { ...baseStatuses, ...Object.fromEntries(wangOrder.items.map(item => [item.id, 'delivered'])) }
+    : baseStatuses;
+  const trip = () => ({
+    trip: { id: draft.id, origin: 's2',
+      versions: [{ ...summary, version: 1, savedAt: '2026-11-24T00:00:00Z' }],
+      statuses: statuses(), statusRevision: revision },
+    picking: pickingList(summary.customers), deliveryEdits: edits,
+    sheets: [
+      { sheetId: wang.id, reviewed: wangDone, deliveryCompleted: wangDone },
+      { sheetId: 'c-li', reviewed: true, deliveryCompleted: true },
+    ],
+  });
+  const details = () => {
+    const lines = deliveryLines(wangOrder, edits).map(line => ({ ...line, status: wangDone ? 'delivered' : 'pending' }));
+    const execution = deliverySummary(lines);
+    return { sheet: { tripId: draft.id, sheetId: wang.id, customer: wangOrder.customer, version: 1, statusRevision: revision,
+      reviewed: wangDone, deliveryCompleted: wangDone, orderCents: wangOrder.totalCents, execution,
+      amounts: { due: wangDone ? execution.totalCents : 0, remaining: 0, paid: 0, excess: 0 }, lines } };
+  };
+  handle(request => {
+    if (request.path === '/workspace') {
+      request.ok({ draft, parties: [], draftConfirmed: true, currentTrip: { id: draft.id } });
+      return true;
+    }
+    if (request.path === `/trips/${draft.id}`) { request.ok(trip()); return true; }
+    if (request.path === `/trips/${draft.id}/sheets/${wang.id}`) { request.ok(details()); return true; }
+    if (request.path === `/trips/${draft.id}/sheets/${wang.id}/delivery/line`) {
+      edits = { ...edits, [request.data.lineId]: { receivedQuantity: Number(request.data.receivedQuantity),
+        unitPriceCents: request.data.price === null ? null : Math.round(Number(request.data.price) * 100) } };
+      revision += 1;
+      request.ok(details());
+      return true;
+    }
+    if (request.path === `/trips/${draft.id}/sheets/${wang.id}/delivery/complete`) {
+      wangDone = true;
+      revision += 1;
+      request.ok(details());
+      return true;
+    }
+    return false;
+  });
+
+  agentSession.token = token;
+  const delivery = pageFor('trip-delivery');
+  await delivery.onShow();
+  assert.equal(delivery.data.formal.deliveryAllPending, true);
+  assert.equal(delivery.data.formal.deliveryTotalTitle, '待补价');
+  assert.equal(delivery.data.formal.deliveryTotalAmount, '待补价');
+  assert.equal(delivery.data.formal.deliveryTotalCents, 0);
+  assert.equal(delivery.data.formal.deliveryPendingCount, 2);
+  assert.equal(delivery.data.formal.deliveryProgressPercent, 50);
+  assert.equal(delivery.data.formal.deliveredCount, 1);
+  const rows = delivery.data.formal.deliveryRows;
+  assert.equal(rows[0].dueLabel, '待补价');
+  assert.notEqual(rows[0].dueLabel, '¥0.00');
+  assert.equal(rows[0].actionHint, '点进核对');
+  assert.equal(rows[1].dueLabel, '待补价');
+  assert.notEqual(rows[1].dueLabel, '¥0.00');
+  assert.equal(rows[1].actionHint, '已锁账');
+  const deliveryWxml = fs.readFileSync(require.resolve('../code/dist/pages/trip-delivery/index.wxml'), 'utf8');
+  for (const token of ['progress-card', 'progress-fill', 'deliveryProgressPercent', 'deliveryAllPending']) {
+    assert.ok(deliveryWxml.includes(token), `送货列表缺少 ${token}`);
+  }
+
+  await delivery.openSheet(tap({ tripId: draft.id, sheetId: wang.id }));
+  assert.equal(delivery.data.sheet.pendingCount, 1);
+  assert.equal(delivery.data.sheet.allPending, true);
+  assert.equal(delivery.data.sheet.dueTitle, '预计本次应收');
+  assert.equal(delivery.data.sheet.dueDisplay, '待补价');
+  assert.notEqual(delivery.data.sheet.dueDisplay, '¥0.00');
+
+  const toasts = [];
+  global.wx.showToast = spec => toasts.push(spec);
+  await delivery.completeDelivery();
+  assert.match(delivery.data.error, /水饺/);
+  assert.equal(delivery.data.fieldEdit.id, wang.lineId);
+  assert.equal(delivery.data.fieldEdit.receivedQuantity, '2');
+  assert.deepEqual(toasts.at(-1), { title: '请先补填缺价货品单价', icon: 'none' });
+  assert.equal(requests.filter(request => request.path.endsWith('/delivery/complete')).length, 0, '缺价拦截不得发锁账请求');
+
+  delivery.toggleFieldEdit(tap({ id: wang.lineId }));
+  assert.equal(delivery.data.fieldEdit, null, '再点同一行收起编辑');
+  delivery.toggleFieldEdit(tap({ id: wang.lineId }));
+  assert.equal(delivery.data.fieldEdit.id, wang.lineId);
+
+  delivery.stepReceivedQuantity(tap({ delta: 1 }));
+  assert.equal(delivery.data.fieldEdit.receivedQuantity, '3');
+  for (let index = 0; index < 4; index += 1) delivery.stepReceivedQuantity(tap({ delta: -1 }));
+  assert.equal(delivery.data.fieldEdit.receivedQuantity, '0');
+  delivery.stepReceivedQuantity(tap({ delta: -1 }));
+  assert.equal(delivery.data.fieldEdit.receivedQuantity, '0', '步进下限锁定 0，不出现负数');
+
+  delivery.editDeliveryField({ ...tap({ field: 'receivedQuantity' }), detail: { value: '0' } });
+  await delivery.saveFieldEdit();
+  assert.equal(edits[wang.lineId].receivedQuantity, 0);
+  assert.equal(edits[wang.lineId].unitPriceCents, null);
+  assert.equal(delivery.data.sheet.lines[0].receivedQuantity, 0);
+  assert.equal(delivery.data.sheet.lines[0].amountLabel, '¥0.00', '实收 0 计零分');
+  assert.equal(delivery.data.fieldEdit, null);
+
+  delivery.toggleFieldEdit(tap({ id: wang.lineId }));
+  delivery.editDeliveryField({ ...tap({ field: 'receivedQuantity' }), detail: { value: '1' } });
+  delivery.editDeliveryField({ ...tap({ field: 'price' }), detail: { value: '82' } });
+  await delivery.saveFieldEdit();
+  assert.deepEqual(edits[wang.lineId], { receivedQuantity: 1, unitPriceCents: 8200 });
+  assert.equal(delivery.data.sheet.lines[0].amountLabel, '¥82.00');
+  assert.equal(delivery.data.sheet.pendingCount, 0);
+  assert.equal(delivery.data.sheet.dueDisplay, '¥82.00');
+  assert.equal(delivery.data.formal.deliveryTotalCents, 8200);
+  assert.equal(delivery.data.formal.deliveryTotalTitle, '已算金额');
+  assert.equal(delivery.data.formal.deliveryTotalAmount, '¥82.00');
+  assert.equal(delivery.data.formal.deliveryProgressPercent, 50);
+  assert.equal(delivery.data.formal.deliveryAllPending, false);
+
+  await delivery.completeDelivery();
+  assert.equal(requests.filter(request => request.path.endsWith('/delivery/complete')).length, 1);
+  assert.equal(delivery.data.sheet.reviewed, true);
+  assert.equal(delivery.data.sheet.dueTitle, '本次实收锁定金额');
+  assert.equal(delivery.data.sheet.dueDisplay, '¥82.00');
+  assert.equal(delivery.data.formal.deliveryProgressPercent, 100);
+  assert.equal(delivery.data.formal.deliveredCount, 2);
+  assert.equal(delivery.data.formal.deliveryTotalCents, 8200);
 });

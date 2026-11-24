@@ -1,40 +1,112 @@
-<view class="container">
-  <view class="title">送货单</view>
+<view class="delivery-page">
   <view wx:if="{{error}}" class="error">{{error}}</view>
   <view wx:if="{{!signedIn}}" class="card">
-    <view class="hint">微信登录后按门店核对送货与本次应收。</view>
+    <view class="empty-title">微信登录后查看送货单</view>
+    <view class="hint">登录后按门店核对送货与本次应收。</view>
     <button class="btn-primary" bindtap="goAssistant">去助手登录</button>
   </view>
   <view wx:elif="{{busy && !draft}}" class="hint">正在读取送货单…</view>
-  <block wx:elif="{{sheetTarget}}"><include src="../workspace/sheet.wxml" /></block>
+  <block wx:elif="{{sheetTarget}}">
+    <view class="sheet-top-bar">
+      <button class="sheet-back-btn" bindtap="closeSheet" disabled="{{busy || sheetRetry}}">‹ 全部门店</button>
+    </view>
+    <view wx:if="{{sheetRetry}}" class="card">
+      <view class="hint">暂未收到保存结果，请重试这次提交</view>
+      <button class="btn-primary" bindtap="retrySheetWrite" disabled="{{busy}}" loading="{{busy}}">重试本次提交</button>
+    </view>
+    <view wx:elif="{{sheetNeedsRefresh || !sheet}}" class="card">
+      <view wx:if="{{busy}}" class="hint">正在读取客户单…</view>
+      <button wx:else class="btn-primary" bindtap="refreshSheet">重新读取客户单</button>
+    </view>
+    <block wx:else>
+      <view class="sheet-hero-card">
+        <view class="sheet-hero-top">
+          <view class="sheet-shop-name">{{sheet.customer}}</view>
+          <view class="status-pill {{sheet.deliveryCompleted ? 'status-done' : 'status-pending'}}">{{sheet.deliveryCompleted ? '已送达 · 已锁账' : '待送达'}}</view>
+        </view>
+        <view class="sheet-due-label">{{sheet.dueTitle}}</view>
+        <view class="sheet-due-amount num {{sheet.allPending ? 'text-warning' : ''}}">{{sheet.dueDisplay}}</view>
+        <view wx:if="{{!sheet.reviewed && sheet.pendingCount}}" class="sheet-pending-tip">另有 {{sheet.pendingCount}} 样待补单价，点货品行直接补</view>
+      </view>
+      <view class="sheet-lines-card">
+        <view wx:for="{{sheet.lines}}" wx:key="id" class="sheet-line {{!sheet.reviewed && fieldEdit && fieldEdit.id === item.id ? 'sheet-line-editing' : ''}}">
+          <view class="sheet-line-head {{!sheet.reviewed ? 'sheet-line-head-editable' : ''}}" bindtap="toggleFieldEdit" data-id="{{item.id}}">
+            <view class="sheet-line-main">
+              <view class="sheet-line-name">{{item.productLabel}}</view>
+              <view class="sheet-line-meta num">原订 {{item.originalQuantity}}{{item.unit}} · <text class="{{item.quantityChanged ? 'qty-changed' : 'qty-same'}}">实收 {{item.receivedQuantity}}{{item.unit}}</text><text wx:if="{{item.unitPriceText}}"> · {{item.unitPriceText}}</text></view>
+            </view>
+            <view class="sheet-line-right">
+              <view class="sheet-line-subtotal num {{item.amountMissing ? 'text-warning' : ''}}">{{item.amountLabel}}</view>
+              <view wx:if="{{!sheet.reviewed}}" class="sheet-line-action">{{fieldEdit && fieldEdit.id === item.id ? '收起' : '点我改数/价'}}</view>
+              <view wx:else class="sheet-line-status">{{item.statusLabel}}</view>
+            </view>
+          </view>
+          <view wx:if="{{!sheet.reviewed && fieldEdit && fieldEdit.id === item.id}}" class="sheet-editor">
+            <view class="editor-row">
+              <view class="editor-label">实收数量（{{item.unit}}）</view>
+              <view class="stepper">
+                <button class="stepper-btn" data-delta="-1" bindtap="stepReceivedQuantity" disabled="{{busy}}">−</button>
+                <input class="stepper-input num" type="number" maxlength="16" value="{{fieldEdit.receivedQuantity}}" data-field="receivedQuantity" bindinput="editDeliveryField" disabled="{{busy}}" />
+                <button class="stepper-btn" data-delta="1" bindtap="stepReceivedQuantity" disabled="{{busy}}">+</button>
+              </view>
+            </view>
+            <view class="editor-row">
+              <view class="editor-label">单价（元）</view>
+              <input class="price-input num" type="digit" maxlength="18" value="{{fieldEdit.price}}" data-field="price" bindinput="editDeliveryField" disabled="{{busy}}" placeholder="待补价" />
+            </view>
+            <view class="editor-actions">
+              <button class="btn-secondary editor-btn" bindtap="cancelSheetAction" disabled="{{busy}}">取消</button>
+              <button class="btn-primary editor-btn" bindtap="saveFieldEdit" disabled="{{busy}}">完成这一行</button>
+            </view>
+          </view>
+        </view>
+      </view>
+      <view wx:if="{{!sheet.reviewed}}" class="sheet-footer-actions">
+        <button class="btn-primary sheet-lock-btn" bindtap="completeDelivery" disabled="{{busy || !!fieldEdit}}" loading="{{busy}}">确认送达并锁账</button>
+        <button wx:if="{{formal && formal.id === sheet.tripId}}" class="btn-secondary sheet-voice-btn" bindtap="goAssistantDelivery" disabled="{{busy || !!fieldEdit || !!sheetRetry}}">去助手语音改单</button>
+      </view>
+    </block>
+  </block>
   <block wx:else>
     <view wx:if="{{!formal}}" class="card">
-      <view class="hint">这趟还没确认出单，出单后在这里逐家核对送货与应收。</view>
+      <view class="empty-title">本趟还没确认出单</view>
+      <view class="hint">确认出单后，在这里逐家核对送货与应收。</view>
       <button class="btn-primary" bindtap="goAssistant">去助手录单</button>
     </view>
     <block wx:else>
-      <view class="delivery-overview">
-        <text class="num">{{formal.deliveredCount}}/{{formal.customers.length}} 家已送达</text>
-        <text class="num">{{formal.totalLabel}}</text>
+      <view class="progress-card">
+        <view class="progress-head">
+          <view class="progress-left">
+            <view class="progress-title">本趟送货进度</view>
+            <view class="progress-count num">{{formal.deliveredCount}} / {{formal.deliveryRows.length}} 家已送达</view>
+          </view>
+          <view class="progress-right">
+            <view class="progress-amount-label">{{formal.deliveryTotalTitle}}</view>
+            <view class="progress-amount num {{formal.deliveryAllPending ? 'text-warning' : 'text-primary'}}">{{formal.deliveryTotalAmount}}</view>
+          </view>
+        </view>
+        <view class="progress-track">
+          <view class="progress-fill" style="width: {{formal.deliveryProgressPercent}}%;"></view>
+        </view>
+        <view wx:if="{{formal.deliveryPendingCount > 0 && !formal.deliveryAllPending}}" class="progress-pending-note">另有 {{formal.deliveryPendingCount}} 样待补单价</view>
       </view>
       <view wx:for="{{formal.deliveryRows}}" wx:key="id"
-        class="card shop-row {{item.completed ? 'shop-row-done' : ''}}"
+        class="shop-card {{item.completed ? 'shop-card-done' : ''}}"
         bindtap="openSheet" data-trip-id="{{formal.id}}" data-sheet-id="{{item.id}}">
         <view class="shop-main">
           <view class="shop-title-row">
-            <text class="shop-name">{{item.customer}}</text>
-            <text class="status-tag {{item.completed ? 'status-done' : 'status-pending'}}">{{item.completed ? '已送达' : '待送达'}}</text>
-            <text wx:if="{{item.pendingPrices}}" class="status-tag status-unpriced num">{{item.pendingPrices}} 项待补价</text>
+            <view class="shop-name">{{item.customer}}</view>
+            <view class="status-pill {{item.completed ? 'status-done' : 'status-pending'}}">{{item.completed ? '已送达' : '待送达'}}</view>
           </view>
-          <view class="shop-meta num">共 {{item.lineCount}} 项货品</view>
+          <view class="shop-meta num">共 {{item.lineCount}} 样货<text wx:if="{{item.pendingPrices}}" class="shop-pending"> · {{item.pendingPrices}} 样待补价</text></view>
         </view>
         <view class="shop-right">
-          <view class="shop-amount-label">{{item.amountTitle}}</view>
-          <view class="shop-amount num {{item.pendingPriceOnly ? 'pending-price' : ''}}">{{item.dueLabel}}</view>
+          <view class="shop-amount num {{item.pendingPriceOnly ? 'text-warning' : ''}}">{{item.dueLabel}}</view>
+          <view class="shop-hint">{{item.actionHint}}</view>
         </view>
         <view class="shop-arrow">›</view>
       </view>
-      <button wx:if="{{draftConfirmed}}" class="{{formal.unfinished.length ? 'btn-secondary' : 'btn-primary'}} next-trip-btn"
+      <button wx:if="{{draftConfirmed}}" class="{{formal.unfinished.length ? 'btn-secondary shop-next-btn-idle' : 'btn-primary'}} shop-next-btn"
         bindtap="nextTrip" disabled="{{busy}}" loading="{{busy}}">开始下一趟</button>
     </block>
   </block>

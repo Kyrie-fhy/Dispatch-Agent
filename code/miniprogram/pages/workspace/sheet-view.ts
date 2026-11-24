@@ -48,10 +48,19 @@ export function sheetPath({ tripId, sheetId }: Sheet) {
 export function sheetView(sheet: ServerSheet, ledger: ServerLedger = { debts: [], receipts: [], remainingCents: 0, otherRemainingCents: 0 }) {
   const labels = new Map(ledger.debts.map(debt => [debt.id, debt.label]));
   const execution = sheet.execution ?? deliverySummary(sheet.lines);
+  const balance = balanceView(sheet.amounts);
+  const allPending = !sheet.reviewed && execution.pendingPrices > 0 && execution.totalCents === 0;
   return {
     ...sheet, executionLabel: amountLabel(execution.totalCents, execution.pendingPrices, '预计应收'),
-    balance: balanceView(sheet.amounts), total: money(sheet.orderCents),
-    lines: sheet.lines.map(line => ({ ...line, ...lineView(line), statusLabel: deliveryLabel[line.status] })),
+    pendingCount: execution.pendingPrices, allPending,
+    dueTitle: sheet.reviewed ? '本次实收锁定金额'
+      : (execution.pendingPrices > 0 && execution.totalCents > 0 ? '已算金额' : '预计本次应收'),
+    dueDisplay: sheet.reviewed ? '¥' + balance.due : (allPending ? '待补价' : '¥' + money(execution.totalCents)),
+    balance, total: money(sheet.orderCents),
+    lines: sheet.lines.map(line => ({ ...line, ...lineView(line), statusLabel: deliveryLabel[line.status],
+      quantityChanged: String(line.receivedQuantity) !== String(line.originalQuantity),
+      priceMissing: line.price === null, amountMissing: line.amountCents === null,
+      unitPriceText: line.price === null ? '' : '¥' + line.price + '/' + line.unit })),
     pending: sheet.lines.filter(line => line.status !== 'delivered').map(lineView),
     hasUnrecorded: sheet.lines.some(line => line.status === 'unrecorded'),
     otherRemaining: money(ledger.otherRemainingCents),

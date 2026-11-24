@@ -1,23 +1,105 @@
-@import "../workspace/index.wxss";
-.picking-header {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 16rpx;
-  padding-bottom: 16rpx;
-  border-bottom: 1rpx solid var(--hairline);
+.picking-page {
+  padding: 32rpx var(--page-x) 60rpx;
 }
-.picking-count { font-size: 26rpx; color: var(--ink-3); white-space: nowrap; }
+.empty-title {
+  font-size: 34rpx;
+  font-weight: 700;
+  color: var(--ink);
+  margin-bottom: 8rpx;
+}
+.picking-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20rpx;
+  margin: 8rpx 0 24rpx;
+}
+.picking-top-main {
+  min-width: 0;
+}
+.picking-title {
+  font-size: 42rpx;
+  font-weight: 700;
+  line-height: 1.2;
+  color: var(--ink);
+}
+.picking-sub {
+  font-size: 26rpx;
+  line-height: 1.45;
+  color: var(--ink-3);
+  margin-top: 6rpx;
+}
+.picking-count-pill {
+  flex: none;
+  padding: 12rpx 22rpx;
+  background: var(--surface);
+  border: 1rpx solid var(--hairline);
+  border-radius: var(--radius-pill);
+  font-size: 28rpx;
+  font-weight: 650;
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+.picking-card {
+  background: var(--surface);
+  border: 1rpx solid var(--hairline);
+  border-radius: var(--radius-lg);
+  padding: 0 28rpx;
+  margin: 24rpx 0;
+  box-shadow: var(--shadow-card);
+}
 .picking-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 24rpx;
-  min-height: 96rpx;
+  min-height: 116rpx;
   padding: 20rpx 0;
+  border-bottom: 1rpx solid var(--hairline);
 }
-.picking-row:last-child { border-bottom: 0; padding-bottom: 0; }
-.picking-info { min-width: 0; }
-.picking-name { font-size: 34rpx; font-weight: 650; color: var(--ink); }
-.picking-spec { font-size: 26rpx; color: var(--ink-2); margin-top: 4rpx; }
-.picking-quantity { font-size: 40rpx; font-weight: 700; color: var(--primary); white-space: nowrap; }
+.picking-row:last-child {
+  border-bottom: 0;
+}
+.picking-info {
+  min-width: 0;
+}
+.picking-name {
+  font-size: 34rpx;
+  font-weight: 700;
+  line-height: 1.35;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.picking-spec {
+  font-size: 26rpx;
+  line-height: 1.45;
+  color: var(--ink-3);
+  margin-top: 6rpx;
+}
+.picking-qty-badge {
+  display: flex;
+  align-items: baseline;
+  justify-content: flex-end;
+  gap: 8rpx;
+  flex: none;
+  min-width: 150rpx;
+  padding: 12rpx 20rpx;
+  border-radius: var(--radius-md);
+}
+.picking-qty-box {
+  background: var(--primary-weak);
+  color: var(--primary);
+}
+.picking-qty-other {
+  background: var(--canvas-sub);
+  color: var(--ink);
+}
+.picking-qty-num {
+  font-size: 48rpx;
+  font-weight: 800;
+  line-height: 1;
+}
+.picking-qty-unit {
+  font-size: 28rpx;
+  font-weight: 700;
+}

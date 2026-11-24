@@ -402,8 +402,6 @@ test('A1 manual form uses the same session and detects an unsaved edit after cha
   await page.onShow();
   await page.login();
   assert.match(page.data.draftSummary.label, /当前整单 · 1 家 1 样/);
-  page.toggleDraft();
-  assert.equal(page.data.draftExpanded, true);
   page.openWorkspace();
   assert.equal(navigation[0], '/pages/workspace/index?from=agent');
   page.onHide();
@@ -635,6 +633,7 @@ test('Agent drops the top strip and keeps the next action only on the latest lin
   assert.equal(wxml.includes('draft-strip'), false);
   assert.equal(wxml.includes('退出登录'), false);
   assert.equal(wxml.includes('size="mini"'), false);
+  assert.ok(wxml.includes('trip-pill'), '顶部常驻本趟单据胶囊');
 
   const draft = order();
   const { page, requests, event, handle, setTurns, setConfirmed, setDelivery, titles, card } = setup(t, draft);
@@ -643,11 +642,12 @@ test('Agent drops the top strip and keeps the next action only on the latest lin
   assert.equal(page.data.turns.length, 0);
   assert.equal(page.data.draftSummary.hasLines, true);
   assert.match(page.data.draftSummary.label, /当前整单 · 1 家 1 样/);
+  assert.equal(page.data.draftSummary.customerCount, 1);
+  assert.equal(page.data.draftSummary.lineCount, 1);
+  assert.equal(page.data.draftSummary.knownTotalLabel, '¥164.00');
+  assert.equal(page.data.draftSummary.hasTodo, false);
+  assert.equal(page.data.draftSummary.todoText, '单价齐全，可直接出单');
   assert.equal(page.data.navTitle, '录单助手');
-  page.toggleDraft();
-  assert.equal(page.data.draftExpanded, true);
-  page.toggleDraft();
-  assert.equal(page.data.draftExpanded, false);
 
   const first = { id: 'turn-1', text: '水饺两箱', materialIds: [], status: 'completed', revision: draft.revision,
     events: [event('change', { lines: ['老王 水饺 数量：1箱 → 2箱'] }),
@@ -657,10 +657,8 @@ test('Agent drops the top strip and keeps the next action only on the latest lin
       event('end', { status: 'completed', text: '草稿已更新。', revision: draft.revision })] };
   setTurns([first, second]);
   await page.onShow();
-  assert.equal(page.data.turns[0].showDraftActions, false);
-  assert.equal(page.data.turns[0].showStandaloneUndo, true);
-  assert.equal(page.data.turns[1].showDraftActions, true);
-  assert.equal(page.data.turns[1].showStandaloneUndo, false);
+  assert.equal(page.data.turns[0].showChangeList, true, '每轮只展示本轮增量微卡');
+  assert.equal(page.data.turns[1].showChangeList, true);
 
   const preview = { ...card, revision: draft.revision };
   const previewTurn = { id: 'preview-turn', text: '生成送货单', materialIds: [], status: 'completed', revision: draft.revision,
@@ -1393,7 +1391,7 @@ test('6.5-2 catalog cards choose a variant or keep external with idempotent post
   ]);
   assert.deepEqual(choice.candidates.map(candidate => candidate.warn), [false, true]);
   const cardWxml = fs.readFileSync(require.resolve('../code/dist/pages/agent/index.wxml'), 'utf8');
-  assert.ok(cardWxml.includes('按库外新货保留'));
+  assert.ok(cardWxml.includes('都不是，按新货记'));
   assert.ok(cardWxml.includes('catalog-choices'));
 
   await page.chooseCatalogVariant(tap({ line: line.id, variant: 'v-300' }));
@@ -1535,7 +1533,7 @@ test('6.5-2 catalog controls keep the native design baseline on both pages', () 
     assert.equal(wxml.includes('size="mini"'), false, `${name} 不得使用 mini 按钮`);
     assert.equal(emoji.test(wxml), false, `${name} 不得出现 Emoji`);
   }
-  for (const token of ['按库外新货保留', '已下架', 'price-tag-history', 'price-tag-catalog']) {
+  for (const token of ['都不是，按新货记', '已下架', 'price-tag-history', 'price-tag-catalog']) {
     assert.ok(agentWxml.includes(token), `缺少 ${token}`);
   }
   assert.ok(profileWxml.includes('货品库'));
@@ -1694,12 +1692,14 @@ test('6.5-8 ships a full-width receipt card without nested scrolling or mini con
   const wxss = fs.readFileSync(require.resolve('../code/dist/pages/agent/index.wxss'), 'utf8');
   assert.equal(/<scroll-view[^>]*draft-inline-body/.test(wxml), false, '明细不再套卡片内滚动框');
   assert.equal(wxss.includes('max-height: 360rpx'), false, '明细不再限高截断');
+  assert.equal(wxml.includes('draft-inline'), false, '聊天流不再塞整单巨无霸卡');
   assert.equal(wxml.includes('avatar helper'), false, '取消左侧助手大头像');
+  assert.equal(wxml.includes('card-header'), false, '取消旧卡头与「助」徽章');
   assert.equal(wxml.includes('size="mini"'), false, '不得使用 mini 按钮');
   assert.equal(/\benv\(safe-area-inset-top\)/.test(wxss), false, '页面根节点不得叠加顶部安全区');
-  for (const token of ['card-header', 'alert-strip', 'copy-bubble-btn', 'card-actions-pair',
-    '预览送货单', '手动改单', '撤回刚发的']) {
-    assert.ok(wxml.includes(token), `缺少全宽小票风结构 ${token}`);
+  for (const token of ['trip-pill', 'order-sheet', 'composer-dock', 'focus-card', 'copy-bubble-btn',
+    '撤回', '都不是，按新货记', '发截图、语音或打字记单…']) {
+    assert.ok(wxml.includes(token), `缺少方案 A 结构 ${token}`);
   }
   const emoji = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{26FF}\u{FE0F}]/u;
   assert.equal(emoji.test(wxml), false, '助手卡片必须是零 Emoji');
@@ -1722,8 +1722,7 @@ test('6.5-8 hides the duplicate change wall and spells out pending prices and di
 
   const card = page.data.turns[0];
   assert.equal(card.summaryText, '已记上 2 样货');
-  assert.equal(card.showDraftSummary, true);
-  assert.equal(card.showChangeList, false, '整单明细已自然展开时不再重复显示本轮改动');
+  assert.equal(card.showChangeList, true, '整单已分离进订单本，聊天流只展示本轮增量');
   const summary = page.data.draftSummary;
   assert.equal(summary.label, '当前整单 · 1 家 2 样');
   assert.equal(summary.lineCount, 2);
@@ -1757,29 +1756,24 @@ test('6.5-8 expands up to eight receipt lines naturally and folds only the overf
   await short.page.onShow();
   await short.page.login();
   const shortSummary = short.page.data.draftSummary;
-  assert.equal(shortSummary.overLimit, false);
-  assert.equal(shortSummary.hiddenCount, 0);
-  assert.equal(shortSummary.previewCustomers.length, 1);
-  assert.equal(shortSummary.previewCustomers[0].lines.length, 8);
+  assert.equal(shortSummary.lineCount, 8);
+  assert.equal(shortSummary.customers.length, 1);
+  assert.equal(shortSummary.customers[0].lines.length, 8);
 
   const long = setup(t, linesOf(10));
   await long.page.onShow();
   await long.page.login();
   const summary = long.page.data.draftSummary;
   assert.equal(summary.lineCount, 10);
-  assert.equal(summary.overLimit, true);
-  assert.equal(summary.hiddenCount, 2);
-  assert.equal(summary.previewCustomers.reduce((sum, customer) => sum + customer.lines.length, 0), 8);
-  assert.equal(summary.customers[0].lines.length, 10);
-  assert.equal(long.page.data.draftExpanded, false);
-  long.page.toggleDraft();
-  assert.equal(long.page.data.draftExpanded, true);
-  long.page.toggleDraft();
-  assert.equal(long.page.data.draftExpanded, false);
+  assert.equal(summary.customerCount, 1);
+  assert.equal(summary.customers[0].lines.length, 10, '订单本展示完整明细，不再聊天内折叠');
+  assert.equal(summary.customers[0].lines[9].nameOnly, '货品10');
 
   const wxml = fs.readFileSync(require.resolve('../code/dist/pages/agent/index.wxml'), 'utf8');
-  assert.ok(wxml.includes('draftSummary.previewCustomers'));
-  assert.ok(wxml.includes('展开其余 '));
+  assert.ok(wxml.includes('draftSummary.customers'));
+  assert.equal(wxml.includes('previewCustomers'), false);
+  assert.equal(wxml.includes('展开其余 '), false);
+  assert.ok(wxml.includes('order-sheet'));
 });
 
 test('6.5-8 copies a user bubble back into the composer and asks before replacing typed text', async t => {
@@ -1981,6 +1975,7 @@ test('6.5-10 fills only pending prices in the drawer and keeps typed input on fa
   const { page, requests, handle, setDraft } = setup(t, draft);
   const toasts = [];
   const puts = [];
+  const previews = [];
   let failOnce = true;
   let current = draft;
   global.wx.showToast = spec => toasts.push(spec);
@@ -1995,6 +1990,15 @@ test('6.5-10 fills only pending prices in the drawer and keeps typed input on fa
       current = { ...current, revision: current.revision + 1, customers: request.data.customers };
       setDraft(current);
       request.ok({ draft: current });
+      return true;
+    }
+    if (request.path === '/trips/preview') {
+      previews.push(request.data);
+      assert.equal(request.data.draftId, current.id);
+      assert.equal(request.data.revision, current.revision);
+      assert.ok(request.data.requestId);
+      request.ok({ preview: { ...previewTrip(current, true), previewId: 'pre-sheet', draftId: current.id,
+        revision: current.revision, choices: [null] } });
       return true;
     }
     return false;
@@ -2063,8 +2067,11 @@ test('6.5-10 fills only pending prices in the drawer and keeps typed input on fa
   await page.savePriceDrawer();
   assert.equal(puts.length, 2);
   assert.equal(puts[1].requestId, puts[0].requestId, '同一份输入复用幂等请求号');
-  assert.equal(page.data.priceDrawerOpen, false);
+  assert.equal(page.data.orderSheetOpen, true, '保存后平滑留在本趟订单本');
+  assert.equal(page.data.orderSheetStep, 'list');
+  assert.equal(page.data.priceDrawerOpen, true, '仍停留在只看待填价页签');
   assert.deepEqual(page.data.priceDrawerRows, []);
+  assert.equal(page.data.priceDrawerDirty, false);
   assert.equal(page.data.draftSummary.pendingCount, 0);
   assert.deepEqual(toasts.at(-1), { title: '已保存修改', icon: 'success' });
   const refLine = puts[1].customers[0].items.find(line => line.id === 'line-ref');
@@ -2073,8 +2080,19 @@ test('6.5-10 fills only pending prices in the drawer and keeps typed input on fa
   assert.deepEqual([plainLine.price, plainLine.unit], ['12', '箱']);
   assert.equal(puts[1].customers[0].items[0].price, '82', '已定价的行保持原价');
 
+  await page.previewInSheet();
+  assert.equal(previews.length, 1);
+  assert.equal(page.data.orderSheetOpen, true);
+  assert.equal(page.data.orderSheetStep, 'preview');
+  assert.equal(page.data.sheetPreview.total, '228.00');
+  assert.equal(page.data.sheetPreview.pendingPrices, 0);
+  page.backToSheetList();
+  assert.equal(page.data.orderSheetStep, 'list');
+  assert.equal(page.data.sheetPreview, null);
+
   page.openPriceDrawer();
   assert.equal(page.data.priceDrawerOpen, false);
+  assert.equal(page.data.orderSheetOpen, false);
   assert.equal(toasts.at(-1).title, '当前没有待填价货品');
 });
 
@@ -2130,11 +2148,11 @@ test('6.5-10 keeps the new sheets native, equal-width and reachable', () => {
     assert.equal(emoji.test(source), false, `${name} 不得出现 Emoji`);
     assert.equal(source.includes('safe-area-inset-top'), false, `${name} 不得叠加顶部安全区`);
   }
-  for (const token of ['openPriceDrawer', 'savePriceDrawer', 'applyRefPrice', 'saveInlineCustomerName',
+  for (const token of ['openOrderSheet', 'savePriceDrawer', 'applyRefPrice', 'saveInlineCustomerName',
     'pickQuickCustomer', 'openCustomerSheet', 'saveCustomerSheet', '改单位/规格',
-    '也可直接发语音一次报多行单价', '待填价货品', 'scroll-into-view="{{priceDrawerFocusId}}"',
-    'id="pf-{{row.lineId}}"', '保存全部', '保存店名', 'drawer-price-input num',
-    '/pages/agent/icons/check.svg', 'class="inline-customer-save"']) {
+    '也可关掉窗口，直接语音一次报多行单价', '只看待填价', 'scroll-into-view="{{priceDrawerFocusId}}"',
+    'id="pf-{{row.lineId}}"', '保存价格', '本趟订单本', '预览并出单', '确认出单', '保存店名',
+    'drawer-price-input num', '/pages/agent/icons/check.svg', 'class="inline-customer-save"']) {
     assert.ok(agentWxml.includes(token), `缺少速填抽屉结构 ${token}`);
   }
   assert.equal(agentWxml.includes('card-btn-primary inline-customer-save'), false,
@@ -2215,6 +2233,164 @@ test('in-place agent actions keep current scroll position instead of jumping to 
   page.editText({ detail: { value: '再加一箱水饺' } });
   await page.send();
   assert.equal(page.data.scrollTo, '', '发送后收到回执不再强行二次跳底');
+});
+
+test('6.6-2 runs the Plan A loop from the trip pill through the order book to confirmation', async t => {
+  const bare = order();
+  bare.customers[0].items[0].price = null;
+  const barePage = setup(t, bare);
+  await barePage.page.onShow();
+  await barePage.page.login();
+  assert.equal(barePage.page.data.draftSummary.hasKnownAmount, false);
+  assert.equal(barePage.page.data.draftSummary.knownTotalCents, 0);
+  assert.equal(barePage.page.data.draftSummary.knownTotalLabel, '待填价', '全单缺价时诚实显示待填价，不误显 ¥0.00');
+  assert.equal(barePage.page.data.draftSummary.pendingCount, 1);
+  assert.equal(barePage.page.data.draftSummary.todoText, '1 样待填价');
+
+  const draft = order();
+  const base = draft.customers[0].items[0];
+  draft.customers[0].items[0] = { ...base, id: 'line-known', product: '水饺', quantity: '2', unit: '箱', price: '82' };
+  draft.customers[0].items.push({ ...base, id: 'line-missing', product: '烧卖', quantity: '3', unit: '箱', price: null });
+  const { page, requests, handle, setDraft, setConfirmed, setDelivery } = setup(t, draft);
+  const toasts = [];
+  let current = draft;
+  global.wx.showToast = spec => toasts.push(spec);
+  handle(request => {
+    if (request.path === `/drafts/${draft.id}`) {
+      assert.equal(request.method, 'PUT');
+      assert.ok(request.data.requestId);
+      current = { ...current, revision: current.revision + 1, customers: request.data.customers };
+      setDraft(current);
+      request.ok({ draft: current });
+      return true;
+    }
+    if (request.path === '/trips/preview') {
+      assert.equal(request.data.draftId, current.id);
+      assert.equal(request.data.revision, current.revision);
+      assert.ok(request.data.requestId, '抽屉预览复用幂等 requestId');
+      request.ok({ preview: { ...previewTrip(current, true), previewId: 'pre-plan-a', draftId: current.id,
+        revision: current.revision, choices: [null] } });
+      return true;
+    }
+    if (request.path === '/trips/confirm') {
+      assert.equal(request.data.previewId, 'pre-plan-a');
+      assert.ok(request.data.requestId, '抽屉确认复用幂等 requestId');
+      setConfirmed(true, 'pre-plan-a');
+      setDelivery({ tripId: draft.id, version: 1, statusRevision: 0, shops: [
+        { sheetId: draft.customers[0].id, customer: '老王', locked: false, totalCents: 20000, pendingPrices: 0 },
+      ] });
+      request.ok({ picking: [] });
+      return true;
+    }
+    return false;
+  });
+  await page.onShow();
+  await page.login();
+  assert.equal(page.data.draftSummary.customerCount, 1);
+  assert.equal(page.data.draftSummary.lineCount, 2);
+  assert.equal(page.data.draftSummary.knownTotalCents, 16400, '整数分累加，不混入缺价行');
+  assert.equal(page.data.draftSummary.knownTotalLabel, '¥164.00');
+  assert.equal(page.data.draftSummary.pendingCount, 1);
+  assert.equal(page.data.draftSummary.hasTodo, true);
+
+  page.setData({ scrollTo: '' });
+  page.openOrderSheet(tap({ tab: 'all' }));
+  assert.equal(page.data.orderSheetOpen, true);
+  assert.equal(page.data.orderSheetTab, 'all');
+  assert.equal(page.data.orderSheetStep, 'list');
+  assert.equal(page.data.scrollTo, '', '打开订单本不跳底');
+
+  page.switchOrderSheetTab(tap({ tab: 'pending' }));
+  assert.equal(page.data.orderSheetTab, 'pending');
+  assert.equal(page.data.priceDrawerOpen, true);
+  assert.deepEqual(page.data.priceDrawerRows.map(row => row.lineId), ['line-missing']);
+  assert.equal(page.data.scrollTo, '');
+
+  page.editPriceDrawerPrice({ ...tap({ line: 'line-missing' }), detail: { value: '12' } });
+  assert.equal(page.data.priceDrawerDirty, true);
+  await page.savePriceDrawer();
+  assert.equal(page.data.orderSheetOpen, true, '保存后平滑留在订单本');
+  assert.equal(page.data.orderSheetTab, 'pending');
+  assert.deepEqual(page.data.priceDrawerRows, []);
+  assert.equal(page.data.priceDrawerDirty, false);
+  assert.equal(page.data.scrollTo, '');
+
+  await page.previewInSheet();
+  assert.equal(page.data.orderSheetStep, 'preview');
+  assert.equal(page.data.orderSheetOpen, true);
+  assert.equal(page.data.sheetPreview.total, '200.00');
+  assert.equal(page.data.sheetPreview.pendingPrices, 0);
+  const previewRequest = requests.find(request => request.path === '/trips/preview');
+  assert.deepEqual([previewRequest.data.draftId, previewRequest.data.revision], [draft.id, 2]);
+
+  await page.confirmSheetPreview();
+  assert.equal(page.data.orderSheetOpen, false);
+  assert.equal(page.data.confirmed, true);
+  assert.equal(page.data.deliverySummary.pillTitle, '送货中 · 0/1 家已送');
+  assert.ok(page.data.deliverySummary.pillSub.startsWith('预计应收 ¥200.00'));
+  assert.deepEqual(toasts.at(-1), { title: '已出单，取货单与送货单已生成', icon: 'none' });
+  assert.ok(requests.some(request => request.path === '/agent/card-actions' && request.data.action === 'confirm'));
+});
+
+test('6.6-2 blocks drawer preview until prices are saved and keeps failures inside the sheet', async t => {
+  const draft = order();
+  const base = draft.customers[0].items[0];
+  draft.customers[0].items[0] = { ...base, id: 'line-only', product: '水饺', quantity: '2', unit: '箱', price: null };
+  const { page, requests, handle, setDraft } = setup(t, draft);
+  let current = draft;
+  let mode = 'validation';
+  handle(request => {
+    if (request.path === `/drafts/${draft.id}`) {
+      current = { ...current, revision: current.revision + 1, customers: request.data.customers };
+      setDraft(current);
+      request.ok({ draft: current });
+      return true;
+    }
+    if (request.path === '/trips/preview') {
+      assert.ok(request.data.requestId);
+      if (mode === 'validation') request.ok({ error: 'invalid_draft', message: '请填写客户名称' }, 400);
+      else request.ok({ error: 'draft_changed', message: '草稿已更新，请重新预览' }, 409);
+      return true;
+    }
+    return false;
+  });
+  await page.onShow();
+  await page.login();
+  await page.onShow();
+  assert.equal(page.data.scrollTo, '');
+
+  page.openOrderSheet(tap({ tab: 'pending' }));
+  assert.equal(page.data.orderSheetOpen, true);
+  assert.equal(page.data.orderSheetTab, 'pending');
+  assert.equal(page.data.scrollTo, '');
+
+  page.editPriceDrawerPrice({ ...tap({ line: 'line-only' }), detail: { value: '8' } });
+  assert.equal(page.data.priceDrawerDirty, true);
+  await page.previewInSheet();
+  assert.equal(requests.some(request => request.path === '/trips/preview'), false, '未保存时不发预览请求');
+  assert.match(page.data.priceDrawerError, /保存价格/);
+  assert.equal(page.data.orderSheetOpen, true);
+  assert.equal(page.data.orderSheetStep, 'list');
+  assert.equal(page.data.priceDrawerRows[0].price, '8', '拦截时保留已填单价');
+  assert.equal(page.data.scrollTo, '');
+
+  await page.savePriceDrawer();
+  assert.equal(page.data.priceDrawerDirty, false);
+  assert.equal(page.data.orderSheetOpen, true);
+
+  await page.previewInSheet();
+  assert.equal(page.data.orderSheetOpen, true, '预览校验失败不关抽屉');
+  assert.equal(page.data.orderSheetStep, 'list');
+  assert.equal(page.data.sheetPreview, null);
+  assert.match(page.data.priceDrawerError, /请填写客户名称/);
+  assert.equal(page.data.scrollTo, '');
+
+  mode = 'changed';
+  await page.previewInSheet();
+  assert.equal(page.data.orderSheetOpen, true, '草稿冲突不关抽屉');
+  assert.equal(page.data.orderSheetStep, 'list');
+  assert.match(page.data.priceDrawerError, /草稿已更新/);
+  assert.equal(page.data.scrollTo, '');
 });
 
 test('6.6-1 ships v2.0 global visual tokens and native bar palette', async () => {

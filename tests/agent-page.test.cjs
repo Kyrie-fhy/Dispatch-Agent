@@ -2216,3 +2216,26 @@ test('in-place agent actions keep current scroll position instead of jumping to 
   await page.send();
   assert.equal(page.data.scrollTo, '', '发送后收到回执不再强行二次跳底');
 });
+
+test('6.6-1 ships v2.0 global visual tokens and native bar palette', async () => {
+  const wxss = fs.readFileSync(require.resolve('../code/dist/app.wxss'), 'utf8');
+  for (const token of [
+    '--canvas: #F5F6F8', '--ink: #0F172A', '--primary: #0F6E52', '--warning: #B45309',
+    '--warning-line: #FDE68A', '--danger: #C81E1E', '--radius-pill: 48rpx', '--shadow-float:',
+    '.num { font-variant-numeric: tabular-nums; font-feature-settings: "tnum"; }',
+    'box-shadow: var(--shadow-card);', '.btn-secondary:active { background: #E2E8F0; }',
+  ]) {
+    assert.ok(wxss.includes(token), `app.wxss 缺少 v2.0 令牌或工具类 ${token}`);
+  }
+  assert.equal(wxss.includes('#12664D'), false, 'app.wxss 仍残留旧主色 #12664D');
+  assert.equal(wxss.includes('safe-area-inset-top'), false, '页面根节点严禁叠加顶部安全区');
+
+  const app = require('../code/dist/app.json');
+  assert.equal(app.tabBar.custom, undefined, '保持原生 tabBar，严禁 custom: true');
+  assert.equal(app.tabBar.list.length, 5, 'tabBar 仍为原生 5 标签');
+  assert.equal(app.window.navigationBarBackgroundColor, '#FFFFFF');
+  assert.equal(app.window.backgroundColor, '#F5F6F8');
+  assert.equal(app.tabBar.color, '#64748B');
+  assert.equal(app.tabBar.selectedColor, '#0F6E52');
+  assert.equal(app.tabBar.backgroundColor, '#FFFFFF');
+});

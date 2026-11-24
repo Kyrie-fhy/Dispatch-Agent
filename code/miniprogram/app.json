@@ -1,9 +1,20 @@
 {
   "pages": ["pages/assistant/index", "pages/picking/index", "pages/delivery/index"],
-  "window": { "navigationBarTitleText": "Dispatch Agent", "navigationBarBackgroundColor": "#f5f7f6", "navigationBarTextStyle": "black", "backgroundColor": "#f5f7f6" },
-  "tabBar": { "color": "#63716b", "selectedColor": "#12664d", "list": [
-    { "pagePath": "pages/assistant/index", "text": "助手" },
-    { "pagePath": "pages/picking/index", "text": "取货" },
-    { "pagePath": "pages/delivery/index", "text": "送货与对账" }
-  ] }
+  "window": {
+    "navigationBarTitleText": "Dispatch Agent",
+    "navigationBarBackgroundColor": "#FFFFFF",
+    "navigationBarTextStyle": "black",
+    "backgroundColor": "#F5F6F8"
+  },
+  "tabBar": {
+    "color": "#64748B",
+    "selectedColor": "#0F6E52",
+    "backgroundColor": "#FFFFFF",
+    "borderStyle": "black",
+    "list": [
+      { "pagePath": "pages/assistant/index", "text": "助手" },
+      { "pagePath": "pages/picking/index", "text": "取货" },
+      { "pagePath": "pages/delivery/index", "text": "送货与对账" }
+    ]
+  }
 }

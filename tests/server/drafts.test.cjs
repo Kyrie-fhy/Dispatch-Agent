@@ -16,7 +16,7 @@ const { configuredSpeechModel, configuredVoiceCorrector, correctVoiceText, sanit
   require('../../code/server-dist/server/voice');
 const { CatalogStore } = require('../../code/server-dist/server/catalog');
 const { catalogCsvColumns } = require('../../code/server-dist/miniprogram/core/catalog');
-const { configuredAgentModel, agentPromptVersion } = require('../../code/server-dist/server/agent/model');
+const { configuredAgentModel, agentPrompt, agentPromptVersion, agentTools } = require('../../code/server-dist/server/agent/model');
 const { configuredIntentModel, intentPromptVersion } = require('../../code/server-dist/server/agent/intent');
 const { configuredDeliveryModel, deliveryPromptVersion } = require('../../code/server-dist/server/agent/delivery-model');
 const { HttpError } = require('../../code/server-dist/server/http-error');
@@ -1857,8 +1857,42 @@ test('voice correction sends a names-only payload and rejects malformed or chang
     model: 'deepseek-flash', temperature: 0, thinking: { type: 'disabled' }, response_format: { type: 'json_object' },
   });
   assert.deepEqual(JSON.parse(messages[1].content), { rawText, vocabulary });
+  assert.equal(messages[0].role, 'system');
+  assert.match(messages[0].content, /明显不通顺/);
+  assert.match(messages[0].content, /同音/);
+  assert.match(messages[0].content, /数量/);
+  assert.match(messages[0].content, /单位/);
+  assert.match(messages[0].content, /单价/);
+  assert.match(messages[0].content, /编造/);
+  assert.doesNotMatch(messages[0].content, /灵石|临时冻虾/);
+  const spoken = '一箱林石带鱼';
+  const smoothed = { text: '一箱临时带鱼', corrections: [{ from: '林石', to: '临时' }] };
+  assert.deepEqual(sanitizeVoiceCorrection(spoken, smoothed), { ...smoothed, rawText: spoken });
+  for (const changed of [
+    { text: '两箱临时带鱼', corrections: smoothed.corrections },
+    { text: '一袋临时带鱼', corrections: smoothed.corrections },
+    { text: '一箱临时带鱼，每箱12元', corrections: smoothed.corrections },
+  ]) assert.deepEqual(sanitizeVoiceCorrection(spoken, changed), { text: spoken, rawText: spoken, corrections: [] });
   content = '{broken json';
   assert.deepEqual(await correctVoiceText(rawText, vocabulary, corrector), fallback);
+});
+
+test('agent product fields keep non-brand modifiers out of brand', () => {
+  assert.equal(agentPromptVersion, 'a1-agent-v5');
+  assert.match(agentPrompt, /不是品牌/);
+  assert.match(agentPrompt, /保留在 product 中/);
+  assert.match(agentPrompt, /只有明确可识别的商标或厂牌名称才写入 brand/);
+  assert.match(agentPrompt, /不确定时 brand 留空字符串/);
+  assert.doesNotMatch(agentPrompt, /灵石|临时冻虾/);
+  const editDraft = agentTools.find(tool => tool.function.name === 'edit_draft');
+  assert.ok(editDraft);
+  const { brand, product } = editDraft.function.parameters.properties.operations.items.properties;
+  assert.match(brand.description, /不是品牌/);
+  assert.match(brand.description, /空字符串/);
+  assert.match(brand.description, /商标、品牌或厂牌/);
+  assert.match(product.description, /非品牌的修饰词/);
+  assert.match(product.description, /排除明确的品牌、规格和订货数量/);
+  assert.doesNotMatch(`${brand.description}${product.description}`, /灵石|临时冻虾/);
 });
 
 test('agent voice correction is account-scoped, falls back, and logs only internal turn events', { timeout: 30_000 }, async t => {

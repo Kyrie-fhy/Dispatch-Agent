@@ -672,7 +672,7 @@ test('admin catalog snapshot keeps read-only token protection and account isolat
 
     const page = await api.request('/admin');
     assert.equal(page.status, 200);
-    for (const token of ['货品库', 'data-left="catalog"', 'catalog-search', 'npm run catalog:import',
+    for (const token of ['货品库', 'data-nav="catalog"', 'catalog-search', '上传 CSV 更新',
       '熟客价', '库内价', '?catalog=1']) {
       assert.ok(page.data.includes(token), `后台缺少货品库结构 ${token}`);
     }

@@ -236,7 +236,7 @@ function deliverySummaryView(progress: DeliveryProgress) {
       (shop.pendingPrices ? ` · ${shop.pendingPrices} 项待补价` : '') })) };
 }
 
-function draftSummary(draft: TripDraft, pending: number) {
+function draftSummary(draft: TripDraft, pending: number, choiceCount = 0, catalogChoiceCount = 0) {
   type SummaryLine = { id: string; product: string; nameOnly: string; metaLabel: string; quantity: string; unit: string;
     price: string; pending: boolean; priceSource: string; priceSourceLabel: string; discontinued: boolean;
     priceHint: string; catalogHint: string; secondaryText: string };
@@ -276,15 +276,22 @@ function draftSummary(draft: TripDraft, pending: number) {
     discontinuedCount ? `${discontinuedCount} 样已下架，请查库存` : ''].filter(Boolean).join(' · ');
   const unnamedCustomers = draft.customers.flatMap((customer, index) => customer.customer.trim()
     ? [] : [{ id: customer.id, label: `第 ${index + 1} 位客户` }]);
+  const unnamedLineCounts: Record<string, number> = {};
+  for (const customer of draft.customers) {
+    unnamedLineCounts[customer.id] = customer.items.filter(line =>
+      line.product || line.quantity || line.price || line.brand || line.specification).length;
+  }
   const unnamedCount = customers.filter(customer => customer.unnamed).length;
   const todoParts = [unnamedCount ? `${unnamedCount} 家待填店名` : '',
+    choiceCount ? `${choiceCount} 家待确认客户` : '',
+    catalogChoiceCount ? `${catalogChoiceCount} 样待选款` : '',
     pendingCount ? `${pendingCount} 样待填价` : '',
     discontinuedCount ? `${discontinuedCount} 样已下架` : ''].filter(Boolean);
   const hasTodo = todoParts.length > 0;
   return { customers, hasLines: lines > 0, customerCount: customers.length, lineCount: lines,
     unnamedCount, pendingCount, discontinuedCount, knownTotalCents, knownTotalLabel, hasKnownAmount,
     todoParts, hasTodo, todoText: hasTodo ? todoParts.join(' · ') : '单价齐全，可直接出单',
-    alertText, unnamedCustomers,
+    alertText, unnamedCustomers, unnamedLineCounts,
     label: `当前整单 · ${customers.length} 家 ${lines} 样${issues ? `，${issues} 处待确认` : ''}` };
 }
 
@@ -307,6 +314,7 @@ Page({
     memoryCustomers: [] as { id: string; name: string }[], quickCustomers: [] as { id: string; name: string }[],
     priceDrawerOpen: false, priceDrawerRows: [] as PriceDrawerRow[], priceDrawerError: '', priceDrawerFocusId: '',
     orderSheetOpen: false, orderSheetTab: 'all' as 'all' | 'pending', orderSheetStep: 'list' as 'list' | 'preview',
+    orderSheetScrollTop: 0,
     sheetPreview: null as SheetPreview | null,
     priceDrawerDirty: false,
     customerSheet: null as CustomerSheet | null, inlineCustomerDrafts: {} as Record<string, string>,
@@ -373,6 +381,7 @@ Page({
       voiceCorrectionHint: '', choices: [], memoryNames: [], rememberOff: {}, memoryFailed: false, notice: '', priceHints: {}, adoptableCount: 0,
       catalogChoices: [], memoryCustomers: [], quickCustomers: [], priceDrawerOpen: false, priceDrawerRows: [],
       priceDrawerError: '', priceDrawerFocusId: '', orderSheetOpen: false, orderSheetTab: 'all', orderSheetStep: 'list',
+      orderSheetScrollTop: 0,
       sheetPreview: null, priceDrawerDirty: false, customerSheet: null, inlineCustomerDrafts: {} });
     applyNavTitle('录单助手');
   },
@@ -443,6 +452,7 @@ Page({
       ...(changedMode || !sameTrip ? { text: '', attachments: [], readyImages: [], uploadRows: [],
         pendingMaterial: '', voiceRetry: false, inputMode: 'text', voiceCorrectionHint: '',
         orderSheetOpen: false, orderSheetTab: 'all', orderSheetStep: 'list', sheetPreview: null,
+        orderSheetScrollTop: 0,
         priceDrawerOpen: false, priceDrawerRows: [], priceDrawerDirty: false, priceDrawerError: '', priceDrawerFocusId: '' } : {}),
       ...(prefill ? { text: `${target.name}：`, focusInput: !active, inputMode: 'text' } : { focusInput: false }) });
     await this.loadMemory(draft, draftConfirmed, generation, token);
@@ -517,7 +527,7 @@ Page({
     const recent = turns[turns.length - 1];
     const deliverySummary = this.delivery ? deliverySummaryView(this.delivery) : null;
     const draftInfo = !this.data.confirmed && this.draft
-      ? draftSummary(this.draft, recent?.canAnswer ? recent.questions.length : 0) : null;
+      ? draftSummary(this.draft, recent?.canAnswer ? recent.questions.length : 0, choices.length, catalogChoices.length) : null;
     const navTitle = !this.data.signedIn || !this.data.confirmed ? '录单助手'
       : (this.delivery && this.delivery.shops.length
         ? `送货助手（${this.delivery.shops.filter(shop => shop.locked).length}/${this.delivery.shops.length} 已送达）`
@@ -805,6 +815,10 @@ Page({
         const result = await this.saveCustomerChoice(draft, payload);
         if (!result) return;
         await this.reload();
+        if (this.data.orderSheetOpen) {
+          this.setData({ priceDrawerError: '',
+            ...(!this.data.priceDrawerDirty ? { priceDrawerRows: this.buildPriceRows() } : {}) });
+        }
         if (result.remembered === true) {
           if (typeof wx.showToast === 'function') wx.showToast({ title: '已记住叫法', icon: 'success' });
         }
@@ -903,11 +917,17 @@ Page({
     }
     await this.run(async () => {
       try {
+        const zeroCustomers = Boolean(this.memory && this.memory.customers.length === 0);
         const customers = draft.customers.map(customer => customer.id === draftCustomerId
-          ? { ...customer, customer: trimmed } : customer);
+          ? { ...customer, customer: trimmed, ...(zeroCustomers ? { partyId: null } : {}) } : customer);
         await this.putRequest(`/drafts/${draft.id}`, { revision: draft.revision, customers });
         onSaved();
         await this.reload();
+        if (this.data.orderSheetOpen) {
+          this.setData({ priceDrawerError: '',
+            ...(!this.data.priceDrawerDirty ? { priceDrawerRows: this.buildPriceRows() } : {}) });
+        }
+        if (this.data.choices.length > 0) this.scrollOrderSheetTop();
         if (typeof wx.showToast === 'function') wx.showToast({ title: '已保存店名', icon: 'success' });
       } catch (error) {
         await this.reloadAfterConflict(error, draftConflicts);
@@ -932,6 +952,10 @@ Page({
       }));
     const customerCount = new Set(rows.map(row => row.draftCustomerId)).size;
     return rows.map(row => ({ ...row, showCustomer: customerCount > 1 }));
+  },
+
+  scrollOrderSheetTop(): void {
+    this.setData({ orderSheetScrollTop: this.data.orderSheetScrollTop === 0 ? 1 : 0 });
   },
 
   openOrderSheet(event?: WechatMiniprogram.TouchEvent): void {
@@ -1087,6 +1111,22 @@ Page({
       this.setData({ priceDrawerError: invalid ? `${invalid}；请先点「保存价格」后再预览` : '请先点「保存价格」后再预览' });
       return;
     }
+    const unnamed = this.data.draftSummary?.unnamedCustomers ?? [];
+    if (unnamed.length > 0) {
+      const first = unnamed[0];
+      const customer = draft.customers.find(entry => entry.id === first.id);
+      this.setData({ priceDrawerError: '', error: '',
+        customerSheet: { id: first.id, label: '未命名客户',
+          value: this.data.inlineCustomerDrafts[first.id] ?? customer?.customer ?? '' } });
+      this.notify('先填上店名就能出单');
+      return;
+    }
+    if (this.data.choices.length > 0) {
+      this.scrollOrderSheetTop();
+      this.setData({ priceDrawerError:
+        `请先在上方确认「${this.data.choices[0].spoken}」是已有熟客还是新建客户` });
+      return;
+    }
     return this.run(async () => {
       try {
         const { preview } = await this.request<{ preview: TripPreview }>('/trips/preview',
@@ -1181,6 +1221,10 @@ Page({
         const result = await this.request<CatalogChoiceResult>('/agent/catalog-choice',
           { draftId: draft.id, revision: draft.revision, draftCustomerId: choice.draftCustomerId, lineId, ...selection });
         await this.reload();
+        if (this.data.orderSheetOpen) {
+          this.setData({ priceDrawerError: '',
+            ...(!this.data.priceDrawerDirty ? { priceDrawerRows: this.buildPriceRows() } : {}) });
+        }
         const updates = (result.priceUpdates ?? []).map(update => update.text).filter(Boolean);
         if (updates.length) this.setData({ notice: `已选定规格：${updates.join('；')}` });
         else if (typeof wx.showToast === 'function') wx.showToast({

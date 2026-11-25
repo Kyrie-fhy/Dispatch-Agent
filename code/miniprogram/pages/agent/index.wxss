@@ -830,6 +830,30 @@ page {
 .customer-entry-name { color: var(--ink-2); }
 .customer-entry-hint { flex: none; color: var(--warning); font-size: 28rpx; font-weight: 650; }
 
+.sheet-todos { display: flex; flex-direction: column; gap: 16rpx; margin-bottom: 16rpx; }
+.sheet-todo-card { width: 100%; }
+.sheet-todo-actions { display: flex; flex-direction: column; gap: 12rpx; }
+.sheet-todo-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 84rpx;
+  margin: 0;
+  padding: 12rpx 20rpx;
+  box-sizing: border-box;
+  background: var(--warning-weak);
+  border: 1rpx solid var(--warning-line);
+  border-radius: var(--radius-md);
+  color: var(--primary);
+  font-size: 30rpx;
+  font-weight: 600;
+  line-height: 1.35;
+}
+.sheet-todo-btn::after { border: 0; }
+.sheet-todo-btn:active { background: var(--canvas-sub); }
+.sheet-todo-btn[disabled] { color: var(--ink-disabled); opacity: 0.6; }
+
 .drawer-body { flex: 1; min-height: 240rpx; }
 .drawer-row { display: flex; flex-direction: column; gap: 12rpx; margin-bottom: 16rpx; padding: 20rpx 22rpx; background: var(--surface); border: 1rpx solid var(--hairline); border-radius: var(--radius-lg); box-shadow: var(--shadow-card); }
 .drawer-row-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12rpx; }

@@ -2670,3 +2670,182 @@ test('6.6-3 shows honest pending totals, progress and blocks locking an unpriced
   assert.equal(delivery.data.formal.deliveredCount, 2);
   assert.equal(delivery.data.formal.deliveryTotalCents, 8200);
 });
+
+test('6.6-4 completes customer naming inside the pending drawer without closing the order book', async t => {
+  const draft = order();
+  const { page, requests, handle, setDraft } = setup(t, draft);
+  const customer = draft.customers[0];
+  Object.assign(customer, { customer: '' });
+  delete customer.partyId;
+  const customerId = customer.id;
+  customer.items[0] = { ...customer.items[0], id: 'line-pending', product: '水饺', quantity: '2', unit: '箱', price: null };
+  const puts = [];
+  const previews = [];
+  const toasts = [];
+  let current = draft;
+  global.wx.showToast = spec => toasts.push(spec);
+  handle(request => {
+    if (request.path === '/agent/memory') {
+      request.ok({ draftId: current.id, revision: current.revision, confirmed: false,
+        customers: [], mentions: [], prices: [], catalogChoices: [] });
+      return true;
+    }
+    if (request.method === 'PUT' && request.path === `/drafts/${draft.id}`) {
+      puts.push(request.data);
+      current = { ...current, revision: current.revision + 1, customers: request.data.customers };
+      setDraft(current);
+      request.ok({ draft: current });
+      return true;
+    }
+    if (request.path === '/trips/preview') {
+      previews.push(request.data);
+      request.ok({ preview: { ...previewTrip(current, true), previewId: 'pre-zero-name', draftId: current.id,
+        revision: current.revision, choices: [null] } });
+      return true;
+    }
+    return false;
+  });
+  await page.onShow();
+  await page.login();
+  assert.equal(page.data.draftSummary.unnamedCustomers.length, 1);
+  assert.equal(page.data.draftSummary.pendingCount, 1);
+
+  page.openOrderSheet(tap({ tab: 'pending' }));
+  assert.equal(page.data.orderSheetOpen, true);
+  assert.equal(page.data.orderSheetTab, 'pending');
+  assert.deepEqual(page.data.priceDrawerRows.map(row => row.lineId), ['line-pending']);
+
+  page.editPriceDrawerPrice({ ...tap({ line: 'line-pending' }), detail: { value: '8' } });
+  await page.savePriceDrawer();
+  assert.equal(page.data.orderSheetOpen, true);
+  assert.deepEqual(page.data.priceDrawerRows, []);
+
+  await page.previewInSheet();
+  assert.equal(previews.length, 0, '未填店名时不得直接发预览请求');
+  assert.equal(page.data.orderSheetOpen, true, '自动弹出补店名弹层前抽屉保持打开');
+  assert.equal(page.data.customerSheet.id, customerId);
+  assert.equal(page.data.customerSheet.label, '未命名客户');
+  assert.equal(page.data.customerSheet.value, '');
+  assert.ok(toasts.some(toast => toast.title === '先填上店名就能出单'));
+
+  page.editSheetCustomerName({ detail: { value: '老白餐饮' } });
+  await page.saveCustomerSheet();
+  assert.equal(puts.length, 2);
+  assert.equal(puts.at(-1).customers[0].customer, '老白餐饮');
+  assert.equal(puts.at(-1).customers[0].partyId, null, '零熟客账号保存店名即按新建客户处理');
+  assert.equal(page.data.customerSheet, null);
+  assert.equal(page.data.orderSheetOpen, true, '保存店名后订单本仍保持打开');
+  assert.equal(page.data.choices.length, 0);
+  assert.equal(page.data.priceDrawerError, '');
+
+  await page.previewInSheet();
+  assert.equal(previews.length, 1, '补好店名后一次通过预览');
+  assert.equal(page.data.orderSheetOpen, true);
+  assert.equal(page.data.orderSheetStep, 'preview');
+  assert.equal(page.data.priceDrawerError, '');
+  assert.ok(requests.some(request => request.path === '/trips/preview'));
+});
+
+test('6.6-4 keeps choice and catalog cards, drawer scroll and pill todos in sync inside the order book', async t => {
+  const draft = order();
+  const customer = draft.customers[0];
+  Object.assign(customer, { customer: '老白餐饮' });
+  delete customer.partyId;
+  const customerId = customer.id;
+  const line = customer.items[0];
+  Object.assign(line, { id: 'line-catalog', product: '鸭血', brand: '', specification: '', unit: '盒',
+    quantity: '2', price: null, priceSource: null, catalogStatus: 'ambiguous', priceHint: null });
+  const { page, requests, handle, setDraft } = setup(t, draft);
+  const previews = [];
+  const choices = [];
+  const catalogs = [];
+  let current = draft;
+  global.wx.showToast = () => {};
+  const pendingMention = () => ({ draftCustomerId: customerId, resolution: { status: 'candidate_only', customerId: null,
+    candidates: [{ customerId: 'p-strong', canonicalName: '强记面馆' }] } });
+  const catalogChoice = () => ({ draftCustomerId: customerId, lineId: line.id, status: 'ambiguous', priceHint: null,
+    candidates: [{ productId: 'p-duck', variantId: 'v-300', product: '鸭血', brand: '甲牌', specification: '300g',
+      unit: '盒', priceCents: 700, status: 'active' }] });
+  handle(request => {
+    if (request.path === '/agent/memory') {
+      const state = current.customers[0];
+      request.ok({ draftId: current.id, revision: current.revision, confirmed: false,
+        customers: [{ id: 'p-strong', name: '强记面馆' }],
+        mentions: state.partyId === undefined ? [pendingMention()] : [], prices: [],
+        catalogChoices: state.items[0].catalogStatus === 'ambiguous' ? [catalogChoice()] : [] });
+      return true;
+    }
+    if (request.path === '/agent/customer-choice') {
+      choices.push(request.data);
+      current = { ...current, revision: current.revision + 1, customers: current.customers.map(entry =>
+        entry.id === customerId ? { ...entry, partyId: null } : entry) };
+      setDraft(current);
+      request.ok({ revision: current.revision, remembered: null });
+      return true;
+    }
+    if (request.path === '/agent/catalog-choice') {
+      catalogs.push(request.data);
+      current = { ...current, revision: current.revision + 1, customers: current.customers.map(entry =>
+        entry.id === customerId ? { ...entry, items: entry.items.map(item => item.id === line.id
+          ? { ...item, price: '7.00', priceSource: 'catalog', catalogStatus: null } : item) } : entry) };
+      setDraft(current);
+      request.ok({ revision: current.revision, item: current.customers[0].items[0],
+        priceUpdates: [{ draftCustomerId: customerId, lineId: line.id, product: '鸭血', beforePrice: null,
+          beforeSource: null, price: '7.00', priceSource: 'catalog', text: '鸭血：待补价 → 库内价 ¥7.00' }] });
+      return true;
+    }
+    if (request.path === '/trips/preview') {
+      previews.push(request.data);
+      request.ok({ preview: { ...previewTrip(current, true), previewId: 'pre-choice', draftId: current.id,
+        revision: current.revision, choices: [null] } });
+      return true;
+    }
+    return false;
+  });
+  await page.onShow();
+  await page.login();
+  assert.equal(page.data.choices.length, 1);
+  assert.equal(page.data.catalogChoices.length, 1);
+  assert.match(page.data.draftSummary.todoText, /待确认客户/);
+  assert.match(page.data.draftSummary.todoText, /待选款/);
+
+  page.openOrderSheet(tap({ tab: 'pending' }));
+  assert.equal(page.data.orderSheetOpen, true);
+  const beforeTop = page.data.orderSheetScrollTop;
+  await page.previewInSheet();
+  assert.equal(previews.length, 0, '待确认客户时不得发预览请求');
+  assert.match(page.data.priceDrawerError, /请先在上方确认「老白餐饮」是已有熟客还是新建客户/);
+  assert.notEqual(page.data.orderSheetScrollTop, beforeTop, '提示同时把订单本滚回顶部露出选店卡');
+  assert.equal(page.data.orderSheetOpen, true);
+
+  await page.newCustomer(tap({ customer: customerId }));
+  assert.deepEqual(choices.map(choice => choice.choice), ['new']);
+  assert.equal(page.data.orderSheetOpen, true);
+  assert.equal(page.data.priceDrawerError, '');
+  assert.deepEqual(page.data.priceDrawerRows.map(row => row.lineId), ['line-catalog'], '选店后待填价列表原地刷新');
+  assert.equal(page.data.choices.length, 0);
+
+  await page.chooseCatalogVariant(tap({ line: line.id, variant: 'v-300' }));
+  assert.equal(catalogs.length, 1);
+  assert.equal(catalogs[0].variantId, 'v-300');
+  assert.equal(page.data.orderSheetOpen, true);
+  assert.equal(page.data.priceDrawerError, '');
+  assert.deepEqual(page.data.priceDrawerRows, [], '选款带回价格后待填价列表同步清空');
+  assert.equal(page.data.catalogChoices.length, 0);
+
+  await page.previewInSheet();
+  assert.equal(previews.length, 1);
+  assert.equal(page.data.orderSheetOpen, true);
+  assert.equal(page.data.orderSheetStep, 'preview');
+  assert.ok(requests.some(request => request.path === '/trips/preview'));
+
+  const wxml = fs.readFileSync(require.resolve('../code/dist/pages/agent/index.wxml'), 'utf8');
+  const emoji = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{26FF}\u{FE0F}]/u;
+  assert.ok(wxml.includes('sheet-pending-actions'));
+  assert.ok(wxml.includes('scroll-top="{{orderSheetScrollTop}}"'));
+  assert.ok(wxml.includes('id="pf-{{row.lineId}}"'), '待填价定位锚点保持');
+  assert.equal(wxml.includes('size="mini"'), false);
+  assert.equal(wxml.includes('cover-view'), false);
+  assert.equal(wxml.includes('safe-area-inset-top'), false);
+  assert.equal(emoji.test(wxml), false);
+});

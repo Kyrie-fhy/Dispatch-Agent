@@ -3182,3 +3182,83 @@ test('6.8-3 gate pages keep the cold-chain v2.0 high-contrast native baseline', 
     }
   }
 });
+
+test('UX & Motion: order sheet guards unsaved prices, voice pad explains tap flow, unlink scrolls, profile confirms logout', async t => {
+  const read = file => fs.readFileSync(require.resolve(`../code/dist/${file}`), 'utf8');
+  const appWxss = read('app.wxss');
+  for (const token of ['--ease-out:', '--ease-spring:', '--dur-press:', '--dur-sheet:',
+    'prefers-reduced-motion: reduce', '.skeleton-card']) {
+    assert.ok(appWxss.includes(token), `app.wxss 缺少统一动效或骨架令牌 ${token}`);
+  }
+  const agentWxml = read('pages/agent/index.wxml');
+  for (const token of ['scroll-with-animation="{{true}}"', 'confirm-type="done"', 'voice-pad-text',
+    'orderSheetMounted', 'customerSheetRender', 'requestCloseOrderSheet', '点一下开始说', '点一下结束']) {
+    assert.ok(agentWxml.includes(token), `助手页缺少体验/动效结构 ${token}`);
+  }
+  const deliveryWxml = read('pages/trip-delivery/index.wxml');
+  assert.ok(deliveryWxml.includes("disabled=\"{{busy || fieldEdit.receivedQuantity === '0'}}\""), '数量为 0 时减号禁用');
+  assert.ok(deliveryWxml.includes('sheet-lock-hint'), '编辑行时提示先保存这一行再锁账');
+
+  const draft = order();
+  draft.customers[0].items[0].price = null;
+  draft.customers[0].partyId = 'p-wang';
+  const { page, pageFor, navigation, event, handle, setTurns } = setup(t, draft);
+  const linkTurn = { id: 'turn-link', text: '老王水饺2箱', materialIds: [], revision: draft.revision, status: 'completed',
+    events: [event('customer_links', { links: [{ draftCustomerId: draft.customers[0].id, customerId: 'p-wang', spoken: '老王', canonicalName: '王记餐饮', merged: false }] }),
+      event('end', { status: 'completed', text: '已记上', revision: draft.revision })] };
+  setTurns([linkTurn]);
+  handle(request => {
+    if (request.path === '/agent/customer-choice') {
+      draft.customers[0].partyId = undefined;
+      draft.revision += 1;
+      request.ok({ revision: draft.revision, remembered: null });
+      return true;
+    }
+    return false;
+  });
+
+  await page.onShow();
+  await page.login();
+
+  // 1. Order sheet anti-loss guard when dirty + interruptible reopen
+  page.openOrderSheet(tap({ tab: 'pending' }));
+  assert.equal(page.data.orderSheetOpen, true);
+  assert.equal(page.data.orderSheetMounted, true);
+  page.editPriceDrawerPrice({ ...tap({ line: draft.customers[0].items[0].id }), detail: { value: '88' } });
+  assert.equal(page.data.priceDrawerDirty, true);
+  let modal = null;
+  wx.showModal = spec => { modal = spec; };
+  page.requestCloseOrderSheet();
+  assert.ok(modal, '有未保存单价时关闭抽屉应弹二次确认');
+  assert.ok(modal.confirmText.length <= 4, 'confirmText 须 ≤ 4 字');
+  modal.success({ confirm: false });
+  assert.equal(page.data.orderSheetOpen, true, '取消放弃后抽屉保持打开');
+  assert.equal(page.data.priceDrawerRows[0].price, '88', '已填单价未丢失');
+  modal.success({ confirm: true });
+  assert.equal(page.data.orderSheetOpen, false, '确认放弃后抽屉关闭');
+  // Interruptible reopen during exit transition
+  page.openOrderSheet(tap({ tab: 'all' }));
+  assert.equal(page.data.orderSheetOpen, true);
+  assert.equal(page.data.orderSheetMounted, true);
+  page.closeOrderSheet();
+
+  // 2. Unlinking customer ("不是他") scrolls choice card into view
+  await page.notHim(tap({ turn: linkTurn.id, customer: draft.customers[0].id }));
+  assert.equal(page.data.scrollTo, 'latest', '点不是他后自动滚动露出选店卡');
+
+  // 3. Profile stage card navigation + logout confirmation guard
+  const profile = pageFor('profile');
+  await profile.onShow();
+  assert.equal(profile.data.loaded, true);
+  profile.goCurrentStage();
+  assert.equal(navigation.at(-1), '/pages/agent/index', '晚间录单中点阶段卡直达助手页');
+  modal = null;
+  wx.showModal = spec => { modal = spec; };
+  profile.logout();
+  assert.ok(modal, '真机环境下退出登录先弹确认防误碰');
+  assert.ok(modal.confirmText.length <= 4, '退出确认按钮须 ≤ 4 字');
+  assert.equal(profile.data.signedIn, true, '未点确认前保持登录');
+  modal.success({ confirm: true });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(profile.data.signedIn, false, '确认后正常退出登录');
+});

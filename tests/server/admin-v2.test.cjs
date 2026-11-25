@@ -23,6 +23,7 @@ const { migrate } = require('../../code/server-dist/server/migrate');
 const { adminDataScript } = require('../../code/server-dist/server/admin/page-data');
 const { adminOpsScript } = require('../../code/server-dist/server/admin/page-ops');
 const { adminShellHtml, adminShellScript } = require('../../code/server-dist/server/admin/page-shell');
+const { adminStyles } = require('../../code/server-dist/server/admin/page-styles');
 
 const adminToken = 'test-admin-v2-isolated-secret';
 const appId = 'wx0123456789abcdef';
@@ -1337,4 +1338,72 @@ test('admin v2 through the normal routes on an isolated PostgreSQL database', { 
       await tsServer.stop();
     }
   });
+});
+
+test('UX & Motion: admin v2 ships dark theme, reduced-motion, no-flash partial updates, enter query and search reset', async () => {
+  for (const token of ['prefers-color-scheme: dark', '[data-theme="dark"]', 'prefers-reduced-motion: reduce',
+    '--ease-out:', '--ease-spring:', '.is-closing', '.is-leaving', '.skeleton-bar', '.is-copied']) {
+    assert.ok(adminStyles.includes(token), `adminStyles 缺少主题或动效定义 ${token}`);
+  }
+
+  let toggledStatus = 'active';
+  const records = [
+    { id: 'c1', remarkName: '老张', status: 'unused', codeHint: 'DZ-1111', createdAt: '2026-10-01T10:00:00Z' },
+    { id: 'c2', remarkName: '老李', status: 'redeemed', codeHint: 'DZ-2222', createdAt: '2026-10-01T11:00:00Z', redeemedAt: '2026-10-01T12:00:00Z' },
+  ];
+  const harness = createAdminHarness({
+    records,
+    handler(call) {
+      if (call.method === 'GET' && call.url === '/admin/api/accounts/A/catalog') {
+        const base = adminCatalogFixture();
+        base.items[0].status = toggledStatus;
+        return adminJson(200, base);
+      }
+      if (call.method === 'PATCH' && call.url.endsWith('/catalog/variants/v-fish')) {
+        toggledStatus = call.body.status;
+        return adminJson(200, { catalogRevision: 8, item: { ...adminCatalogFixture().items[0], status: toggledStatus } });
+      }
+      if (call.method === 'POST' && call.url === '/admin/api/accounts/A/catalog/test-query') {
+        return adminJson(200, { status: 'active', priceCents: 1980, priceSource: 'catalog', item: null, candidates: [], reason: 'enter-hit' });
+      }
+      return undefined;
+    },
+  });
+
+  // 1. Accounts page: changing codeFilter preserves in-progress activationRemark without wiping the form
+  await harness.openSection('accounts');
+  await harness.waitFor(() => harness.document.querySelector('#codeRows'), 'code rows');
+  const remarkInput = harness.document.querySelector('#activationRemark');
+  remarkInput.value = '正在输入的备注';
+  const filterSelect = harness.document.querySelector('#codeFilter');
+  filterSelect.value = 'unused';
+  harness.fire(filterSelect, 'change');
+  assert.equal(harness.document.querySelector('#activationRemark').value, '正在输入的备注', '切换开通码筛选不得清空顶部表单输入');
+  assert.ok(harness.document.querySelector('#codeRows').textContent.includes('DZ-1111'));
+  assert.equal(harness.document.querySelector('#codeRows').textContent.includes('DZ-2222'), false);
+
+  // 2. Catalog page: Enter triggers test-query; toggle updates in-place keeping search filter; search clear/reset work
+  await harness.openSection('catalog');
+  await harness.waitFor(() => harness.document.querySelector('#catalogRows'), 'catalog rows');
+  const queryInput = harness.document.querySelector('#catalog-query-text');
+  queryInput.value = '安井鱼豆腐';
+  harness.fire(queryInput, 'keydown', { key: 'Enter' });
+  await harness.waitFor(() => harness.document.querySelector('#catalog-query-result').textContent.includes('enter-hit'), 'enter query result');
+
+  const searchInput = harness.document.querySelector('#catalog-search');
+  searchInput.value = '鱼豆腐';
+  harness.fire(searchInput, 'input');
+  assert.equal(harness.document.querySelector('#catalogSearchClear').classList.contains('hidden'), false, '有搜索词时显示一键清空按钮');
+  harness.fire(harness.document.querySelector('[data-catalog-toggle="v-fish"]'), 'click');
+  await harness.waitFor(() => harness.document.querySelector('#catalogRows').textContent.includes('已下架'), 'in-place toggled status');
+  assert.equal(harness.document.querySelector('#catalog-search').value, '鱼豆腐', '快速下架局部刷新不丢失当前搜索词');
+
+  // Empty search -> one-click reset button
+  searchInput.value = '不存在的货品xyz';
+  harness.fire(searchInput, 'input');
+  const resetBtn = harness.document.querySelector('[data-catalog-reset]');
+  assert.ok(resetBtn, '筛选无结果时提供一键重置筛选按钮');
+  harness.fire(resetBtn, 'click');
+  assert.equal(harness.document.querySelector('#catalog-search').value, '');
+  assert.ok(harness.document.querySelector('#catalogRows').textContent.includes('鱼豆腐'));
 });

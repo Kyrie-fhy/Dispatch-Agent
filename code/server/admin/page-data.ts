@@ -31,7 +31,7 @@ export const adminDataScript = `
     return '<div class="notice' + (warn ? ' warn' : '') + '">' + esc(text) + '</div>';
   };
   var loading = function (text) {
-    return '<div class="loading-card"><span class="spinner"></span>' + esc(text || '正在加载…') + '</div>';
+    return App.loadingCard ? App.loadingCard(text) : '<div class="loading-card"><span class="spinner"></span>' + esc(text || '正在加载…') + '</div>';
   };
   var emptyCard = function (title, text, nav, action) {
     return '<div class="empty-card"><h2>' + esc(title) + '</h2><p>' + esc(text) + '</p>' +
@@ -187,9 +187,12 @@ export const adminDataScript = `
     if (unit === null || unit === undefined || unit === '') return '<span class="badge warn">缺单位</span>';
     return '<span class="unit-chip">' + esc(unit) + '</span>';
   };
-  var catalogRowsHtml = function (items) {
+  var catalogRowsHtml = function (items, highlightVariantId) {
     if (!items.length) {
-      return '<tr><td colspan="7" class="table-empty">没有符合条件的货品。可以清除搜索或切换筛选。</td></tr>';
+      var hasFilter = Boolean(catalogView.search.trim() || catalogView.category || catalogView.status !== 'all');
+      return '<tr><td colspan="7" class="table-empty">' +
+        (hasFilter ? '没有符合条件的货品。<button type="button" class="btn btn-small btn-secondary" style="margin-left:8px" data-catalog-reset="1">重置筛选</button>'
+          : '没有符合条件的货品。') + '</td></tr>';
     }
     return items.map(function (item) {
       var aliases = (item.aliases || []).join('、');
@@ -198,7 +201,9 @@ export const adminDataScript = `
       if (aliases) sub.push('俗称：' + aliases);
       if (brandAliases) sub.push('品牌别名：' + brandAliases);
       var status = catalogStatusLabel[item.status] || item.status || '未知';
-      return '<tr class="catalog-row' + (item.unit === null ? ' missing-unit' : '') + '">' +
+      var rowClass = 'catalog-row' + (item.unit === null ? ' missing-unit' : '') +
+        (highlightVariantId && item.variantId === highlightVariantId ? ' is-updated' : '');
+      return '<tr class="' + rowClass + '" data-catalog-row="' + esc(item.variantId) + '">' +
         '<td><span class="cell-main">' + esc(item.product) + '</span>' +
         '<span class="line-sub">' + esc(sub.join(' · ')) + '</span>' +
         '<span class="line-sub mono">' + esc(catalogCodeText(item.productCode, item.variantCode)) + '</span></td>' +
@@ -216,13 +221,16 @@ export const adminDataScript = `
   var catalogEmptyRow = function () {
     return '<tr><td colspan="7" class="table-empty">当前还没有货品。点右上角「+ 新增货品」或「上传 CSV 更新」开始维护。</td></tr>';
   };
-  var renderCatalogRows = function () {
+  var renderCatalogRows = function (highlightVariantId) {
     var body = el('catalogRows');
     if (!body) return;
+    var allItems = catalogItems();
     var items = catalogFiltered();
-    body.innerHTML = items.length ? catalogRowsHtml(items) : catalogEmptyRow();
+    body.innerHTML = allItems.length ? catalogRowsHtml(items, highlightVariantId) : catalogEmptyRow();
     var count = el('catalogCount');
     if (count) count.textContent = '当前显示 ' + items.length + ' 条规格';
+    var clearBtn = el('catalogSearchClear');
+    if (clearBtn) clearBtn.classList.toggle('hidden', !catalogView.search.trim());
     Array.prototype.forEach.call(document.querySelectorAll('[data-catalog-status]'), function (node) {
       node.classList.toggle('active', node.getAttribute('data-catalog-status') === catalogView.status);
     });
@@ -290,14 +298,10 @@ export const adminDataScript = `
       if (isCurrent('catalog', accountId)) catalogView.customers = [];
     });
   };
-  var renderCatalogView = function () {
-    var account = current();
-    if (!account || !catalogView.data) { loadCatalogView(); return; }
-    var data = catalogView.data;
+  var renderCatalogOverviewInner = function (data) {
     var summary = data.summary || {};
     var missing = num(summary.missingUnitVariantCount);
-    var html = pageHead('货品与价格库', '维护 227+ 货品的价格、单位与上下架，支持一句话试查和 CSV 增量预演。', badge('价格底库', 'info'));
-    html += '<section class="card catalog-overview"><div class="card-head"><div><span class="section-kicker">货品库概览</span>' +
+    return '<div class="card-head"><div><span class="section-kicker">货品库概览</span>' +
       '<h2>' + num(summary.productCount) + ' 个商品 · ' + num(summary.variantCount) + ' 条规格</h2>' +
       '<p>' + (data.importedAt ? '最近一次 CSV 导入：' + esc(fmtTime(data.importedAt)) : '还没有导入过 CSV，可先新增单品。') +
       ' · 当前版本 ' + num(data.catalogRevision) + '</p></div>' +
@@ -312,14 +316,20 @@ export const adminDataScript = `
       metric('在售', num(summary.activeVariantCount) + ' 条', '') +
       metric('已下架', num(summary.discontinuedVariantCount) + ' 条', '') +
       metric('缺单位', missing ? '<span class="text-amber">' + missing + '</span> 条' : '0 条',
-        missing ? '未填单位时 AI 会留空防算错价，补上即可自动配价' : '单位已齐') +
+        missing ? '补齐后即可自动配价' : '单位已齐') +
       '</div>' +
-      (missing ? notice('未填单位时 AI 会留空防算错价，补上即可自动配价。点「去补单位」只看缺单位货品。', true) : '') +
-      (missing ? '<div class="row-actions" style="margin-top:6px"><button type="button" class="btn btn-small btn-primary-outline" data-nav="catalog" data-missing-unit="1">去补单位 ›</button></div>' : '') +
-      '</section>';
+      (missing ? '<div class="catalog-alert-bar"><span>有 ' + missing + ' 条货品未标计价单位，AI 会自动留空防算错价。</span>' +
+        '<button type="button" class="btn btn-small btn-primary-outline" data-catalog-status="missing">只看缺单位 ›</button></div>' : '');
+  };
+  var renderCatalogView = function () {
+    var account = current();
+    if (!account || !catalogView.data) { loadCatalogView(); return; }
+    var data = catalogView.data;
+    var html = pageHead('货品与价格库', '维护 227+ 货品的价格、单位与上下架，支持一句话试查和 CSV 增量预演。', badge('价格底库', 'info'));
+    html += '<section class="card catalog-overview" id="catalogOverview">' + renderCatalogOverviewInner(data) + '</section>';
 
     html += '<section class="card sandbox-card"><div class="card-head"><div><span class="section-kicker">一句话试查小沙盒</span>' +
-      '<h2>模拟客户这句话，AI 会怎么认货配价</h2><p>只读演示，绝不写库；也不消耗真实对话。</p></div></div>' +
+      '<h2>模拟客户这句话，AI 会怎么认货配价</h2><p>只读演示，绝不写库；按回车即可立即试查。</p></div></div>' +
       '<div class="query-row"><label class="field grow" for="catalog-query-text"><span class="field-label">客户原话</span>' +
       '<input id="catalog-query-text" class="text-input" value="' + esc(catalogView.queryText) +
       '" placeholder="例如：安井鱼豆腐500g 2箱" autocomplete="off"></label>' +
@@ -328,7 +338,7 @@ export const adminDataScript = `
       (catalogView.customers || []).map(function (customer) {
         return '<option value="' + esc(customer.id) + '">' + esc(customer.name) + '</option>';
       }).join('') + '</select></label>' +
-      '<button type="button" class="btn btn-primary" data-catalog-query="1">立即试查</button></div>' +
+      '<button type="button" class="btn btn-primary" id="catalogQueryBtn" data-catalog-query="1">立即试查</button></div>' +
       '<details class="soft-details"><summary>按字段精确试查（品名 / 品牌 / 规格 / 单位）</summary>' +
       '<div class="field-grid four" style="margin-top:10px">' +
       field('品名', 'catalog-query-product', '', '', '例如：鱼豆腐') +
@@ -339,8 +349,10 @@ export const adminDataScript = `
 
     html += '<section class="card"><div class="card-head"><div><span class="section-kicker">货品明细</span>' +
       '<h2>宽屏货品表</h2><p id="catalogCount">当前显示 ' + catalogFiltered().length + ' 条规格</p></div></div>' +
-      '<div class="filter-bar"><input id="catalog-search" class="text-input grow" value="' + esc(catalogView.search) +
+      '<div class="filter-bar"><div class="search-wrap"><input id="catalog-search" class="text-input" value="' + esc(catalogView.search) +
       '" placeholder="搜索品名 / 品牌 / 规格 / 别名 / 货号" autocomplete="off">' +
+      '<button type="button" id="catalogSearchClear" class="search-clear' + (catalogView.search.trim() ? '' : ' hidden') +
+      '" data-catalog-clear-search="1" aria-label="清空搜索">×</button></div>' +
       '<select id="catalog-category" class="select"><option value="">全部分类</option>' +
       (data.categories || []).map(function (category) {
         return '<option value="' + esc(category) + '"' + (catalogView.category === category ? ' selected' : '') + '>' +
@@ -351,13 +363,37 @@ export const adminDataScript = `
         return '<button type="button" class="pill-filter' + (catalogView.status === pair[0] ? ' active' : '') +
           '" data-catalog-status="' + pair[0] + '">' + pair[1] + '</button>';
       }).join('') + '</div></div>' +
-      '<div class="table-wrap catalog-table-wrap"><table class="catalog-table"><thead><tr><th>标准品名</th><th>品牌</th>' +
+      '<div class="table-wrap catalog-table-wrap" id="catalogTableWrap"><table class="catalog-table"><thead><tr><th>标准品名</th><th>品牌</th>' +
       '<th>规格</th><th>计价单位</th><th class="num">挂牌价</th><th>状态</th><th>操作</th></tr></thead>' +
       '<tbody id="catalogRows"></tbody></table></div></section>';
-    viewRoot().innerHTML = html;
+    viewRoot().innerHTML = '<div class="view-stage">' + html + '</div>';
     renderCatalogRows();
     renderCatalogQuery();
     loadCatalogCustomers(account.id);
+  };
+  var refreshCatalogInPlace = function (accountId, highlightVariantId) {
+    var tableWrap = el('catalogTableWrap');
+    var scrollTop = tableWrap ? tableWrap.scrollTop : 0;
+    return request(accountPath(accountId, '/catalog')).then(function (data) {
+      if (!isCurrent('catalog', accountId)) return;
+      catalogView.data = data;
+      var overview = el('catalogOverview');
+      if (overview) {
+        overview.innerHTML = renderCatalogOverviewInner(data);
+        var catSelect = el('catalog-category');
+        if (catSelect) {
+          catSelect.innerHTML = '<option value="">全部分类</option>' + (data.categories || []).map(function (category) {
+            return '<option value="' + esc(category) + '"' + (catalogView.category === category ? ' selected' : '') + '>' +
+              esc(category) + '</option>';
+          }).join('');
+        }
+        renderCatalogRows(highlightVariantId);
+        var wrap = el('catalogTableWrap');
+        if (wrap) wrap.scrollTop = scrollTop;
+      } else {
+        renderCatalogView();
+      }
+    });
   };
   var loadCatalogView = function (accountId) {
     var account = current();
@@ -451,12 +487,14 @@ export const adminDataScript = `
         var cents = parseYuanToCents(priceText);
         if (!product) {
           if (errorNode) errorNode.textContent = '请填写标准品名。';
-          toast('请填写标准品名。', 'error');
+          if (App.shakeNode) App.shakeNode(el('catProduct'));
+          if (el('catProduct')) el('catProduct').focus();
           return false;
         }
         if (cents === null || cents <= 0) {
           if (errorNode) errorNode.textContent = '挂牌价必须是大于 0、最多两位小数的金额。';
-          toast('挂牌价必须是大于 0、最多两位小数的金额。', 'error');
+          if (App.shakeNode) App.shakeNode(el('catPrice'));
+          if (el('catPrice')) el('catPrice').focus();
           return false;
         }
         if (errorNode) errorNode.textContent = '';
@@ -494,11 +532,12 @@ export const adminDataScript = `
           path = accountPath(targetAccountId, '/catalog/items');
           method = 'POST';
         }
-        return request(path, { method: method, body: body }).then(function () {
+        return request(path, { method: method, body: body }).then(function (saved) {
           toast(editing ? '这条规格已保存。' : '新货品已保存。', 'success');
           App.loadAccounts().catch(function () {});
           if (state.accountId !== targetAccountId) return;
-          return loadCatalogView(targetAccountId);
+          var focusId = editing ? variant.variantId : (saved && saved.item && saved.item.variantId);
+          return refreshCatalogInPlace(targetAccountId, focusId);
         }, function (error) {
           var message = error.status === 409 ? '货品库已在别处更新，请关闭弹窗后刷新列表再改。' : error.message;
           if (errorNode) errorNode.textContent = message;
@@ -534,10 +573,12 @@ export const adminDataScript = `
       aliasBaseline = { aliases: aliasesText, brandAliases: brandAliasesText };
     });
   };
-  var toggleCatalogVariant = function (variant, accountId) {
+  var toggleCatalogVariant = function (variant, accountId, trigger) {
     var targetAccountId = accountId || state.accountId;
     if (state.accountId !== targetAccountId) throw new Error('当前查看的配送员已切换，请重新操作');
     var next = variant.status === 'active' ? 'discontinued' : 'active';
+    var origLabel = trigger ? trigger.textContent : '';
+    if (trigger) { trigger.disabled = true; trigger.textContent = '处理中…'; }
     request(accountPath(targetAccountId, '/catalog/variants/' + encodeURIComponent(variant.variantId)), {
       method: 'PATCH',
       body: { priceCents: variant.priceCents, status: next, expectedRevision: num(catalogView.data.catalogRevision) }
@@ -545,8 +586,9 @@ export const adminDataScript = `
       toast(next === 'active' ? '已重新上架。' : '已快速下架。', 'success');
       App.loadAccounts().catch(function () {});
       if (state.accountId !== targetAccountId) return;
-      return loadCatalogView(targetAccountId);
+      return refreshCatalogInPlace(targetAccountId, variant.variantId);
     }, function (error) {
+      if (trigger && trigger.isConnected) { trigger.disabled = false; trigger.textContent = origLabel; }
       toast(error.status === 409 ? '货品库已在别处更新，请刷新后再操作。' : error.message, 'error');
     });
   };
@@ -714,7 +756,7 @@ export const adminDataScript = `
       '<div class="row-actions">' +
       '<button type="button" class="btn btn-small btn-primary-outline" data-customer-alias-add="' + esc(customer.id) +
       '" data-customer-name="' + esc(customer.name) + '">+ 加叫法</button>' +
-      '<button type="button" class="btn btn-small btn-secondary" data-customer-prices="' + esc(customer.id) + '">查看历史成交价 ▾</button>' +
+      '<button type="button" class="btn btn-small btn-secondary" data-customer-prices="' + esc(customer.id) + '">查看历史成交价 <span class="price-chevron" aria-hidden="true">▾</span></button>' +
       '</div></div>' +
       '<div class="alias-row">' + (aliases.length ? aliases.map(function (alias) {
         return '<span class="alias-chip">' + esc(alias.alias) +
@@ -731,6 +773,8 @@ export const adminDataScript = `
     box.innerHTML = list.length ? list.map(customerCardHtml).join('') : notice('没有匹配的熟客。换个店名或叫法再搜。');
     var count = el('customerCount');
     if (count) count.textContent = '当前显示 ' + list.length + ' 位熟客';
+    var clearBtn = el('customerSearchClear');
+    if (clearBtn) clearBtn.classList.toggle('hidden', !customersView.search.trim());
   };
   var renderCustomersView = function () {
     if (!customersView.data) { loadCustomersView(); return; }
@@ -739,11 +783,13 @@ export const adminDataScript = `
     var html = pageHead('熟客与叫法', '维护熟客的口语叫法和最近历史成交价，只影响以后录单认人。', badge('只读历史', 'info'));
     html += '<section class="card"><div class="card-head"><div><h2>熟客档案</h2>' +
       '<p>这里维护熟客口语叫法，只影响以后录单认人，绝不改动历史正式送货单。</p></div></div>' +
-      '<div class="filter-bar"><input id="customer-search" class="text-input grow" value="' + esc(customersView.search) +
-      '" placeholder="按店名或叫法搜索" autocomplete="off"><span class="muted" id="customerCount">当前显示 ' +
+      '<div class="filter-bar"><div class="search-wrap"><input id="customer-search" class="text-input" value="' + esc(customersView.search) +
+      '" placeholder="按店名或叫法搜索" autocomplete="off">' +
+      '<button type="button" id="customerSearchClear" class="search-clear' + (customersView.search.trim() ? '' : ' hidden') +
+      '" data-customer-clear-search="1" aria-label="清空搜索">×</button></div><span class="muted" id="customerCount">当前显示 ' +
       filteredCustomers().length + ' 位熟客</span></div>' +
       '<div id="customerList">' + (all.length ? filteredCustomers().map(customerCardHtml).join('') : notice('还没有熟客档案。等配送员出过正式单后，这里会自动出现。')) + '</div></section>';
-    viewRoot().innerHTML = html;
+    viewRoot().innerHTML = '<div class="view-stage">' + html + '</div>';
   };
   var loadCustomersView = function (accountId) {
     var account = current();
@@ -793,12 +839,14 @@ export const adminDataScript = `
     if (customersView.expanded[customerId]) {
       customersView.expanded[customerId] = false;
       box.classList.add('hidden');
-      button.textContent = '查看历史成交价 ▾';
+      button.classList.remove('is-open');
+      button.innerHTML = '查看历史成交价 <span class="price-chevron" aria-hidden="true">▾</span>';
       return;
     }
     customersView.expanded[customerId] = true;
     box.classList.remove('hidden');
-    button.textContent = '收起历史成交价 ▴';
+    button.classList.add('is-open');
+    button.innerHTML = '收起历史成交价 <span class="price-chevron" aria-hidden="true">▾</span>';
     if (customersView.prices[customerId]) {
       box.innerHTML = pricesTableHtml(customersView.prices[customerId]);
       return;
@@ -1130,7 +1178,7 @@ export const adminDataScript = `
       '</section>';
     html += turns.length ? turns.map(qualityCardHtml).join('') : emptyCard('这个筛选下没有对话回合',
       '可以切到「全部回合」看看，或者换一个时间范围。');
-    viewRoot().innerHTML = html;
+    viewRoot().innerHTML = '<div class="view-stage">' + html + '</div>';
     fillQualityThumbs(viewRoot());
     if (qualityView.highlightTurnId) {
       setTimeout(function () {
@@ -1234,11 +1282,11 @@ export const adminDataScript = `
       }
     });
   };
-  var copyTurnCase = function (turnId) {
+  var copyTurnCase = function (turnId, trigger) {
     var targetAccountId = state.accountId;
     request(accountPath(targetAccountId, '/turns/' + encodeURIComponent(turnId) + '/eval-case?catalog=1')).then(function (data) {
       if (!isCurrent('quality', targetAccountId)) return;
-      copyText(JSON.stringify(data, null, 2), '已复制这一轮的回合 Case JSON（如需脱敏冻结请先点“记为错题”）。');
+      copyText(JSON.stringify(data, null, 2), '已复制这一轮的回合 Case JSON（如需脱敏冻结请先点“记为错题”）。', trigger);
     }, function (error) {
       if (!isCurrent('quality', targetAccountId)) return;
       toast(error.message, 'error');
@@ -1252,7 +1300,7 @@ export const adminDataScript = `
   var mistakesFilters = [['open', '待修复'], ['resolved', '已修复'], ['all', '全部']];
   var mistakeCardHtml = function (mistake) {
     var status = mistake.status === 'resolved' ? 'resolved' : 'open';
-    return '<article class="mistake-card"><div class="card-head"><div><span class="badge info">' +
+    return '<article class="mistake-card" data-mistake-card="' + esc(mistake.turnId) + '"><div class="card-head"><div><span class="badge info">' +
       esc(mistake.category) + '</span> ' + badge(mistakeStatusLabel[status], status === 'open' ? 'warn' : 'ok') +
       '<span class="line-sub">记录于 ' + esc(fmtTime(mistake.createdAt)) + '</span></div>' +
       '<div class="row-actions">' +
@@ -1281,10 +1329,10 @@ export const adminDataScript = `
         return '<button type="button" class="pill-filter' + (mistakesView.status === pair[0] ? ' active' : '') +
           '" data-mistake-filter="' + pair[0] + '">' + pair[1] + '</button>';
       }).join('') + '</div></div>' +
-      (list.length ? list.map(mistakeCardHtml).join('') : emptyCard('这个状态下的错题本还是空的',
+      '<div id="mistakesList">' + (list.length ? list.map(mistakeCardHtml).join('') : emptyCard('这个状态下的错题本还是空的',
         '去「对话质检」里把 AI 录错的回合记进来，就能在这里集中修复。')) +
-      '</section>';
-    viewRoot().innerHTML = html;
+      '</div></section>';
+    viewRoot().innerHTML = '<div class="view-stage">' + html + '</div>';
   };
   var loadMistakesView = function (accountId) {
     var account = current();
@@ -1312,16 +1360,42 @@ export const adminDataScript = `
     }
   };
 
-  var patchMistake = function (turnId, body, message, accountId) {
+  var refreshMistakesInPlace = function (accountId) {
+    return request(accountPath(accountId, '/mistakes?status=' + encodeURIComponent(mistakesView.status)))
+      .then(function (data) {
+        if (!isCurrent('mistakes', accountId)) return;
+        mistakesView.list = data && Array.isArray(data.mistakes) ? data.mistakes : [];
+        var listBox = el('mistakesList');
+        if (listBox) {
+          listBox.innerHTML = mistakesView.list.length ? mistakesView.list.map(mistakeCardHtml).join('')
+            : emptyCard('这个状态下的错题本还是空的', '去「对话质检」里把 AI 录错的回合记进来，就能在这里集中修复。');
+        } else {
+          renderMistakesView();
+        }
+      });
+  };
+  var patchMistake = function (turnId, body, message, accountId, trigger) {
     var targetAccountId = accountId || state.accountId;
     if (state.accountId !== targetAccountId) throw new Error('当前查看的配送员已切换，请重新操作');
+    var card = document.querySelector('[data-mistake-card="' + turnId + '"]');
+    var willLeaveList = body.status && mistakesView.status !== 'all' && mistakesView.status !== body.status;
+    if (trigger) trigger.disabled = true;
     return request(accountPath(targetAccountId, '/mistakes/' + encodeURIComponent(turnId)), {
       method: 'PATCH', body: body
     }).then(function () {
       toast(message, 'success');
       App.loadAccounts().catch(function () {});
       if (state.accountId !== targetAccountId) return;
-      return loadMistakesView(targetAccountId);
+      if (card && willLeaveList && typeof window.requestAnimationFrame === 'function') {
+        card.classList.add('is-removing');
+        return new Promise(function (resolve) { setTimeout(resolve, 165); }).then(function () {
+          return refreshMistakesInPlace(targetAccountId);
+        });
+      }
+      return refreshMistakesInPlace(targetAccountId);
+    }, function (error) {
+      if (trigger && trigger.isConnected) trigger.disabled = false;
+      throw error;
     });
   };
   var openMistakeEdit = function (mistake) {
@@ -1356,8 +1430,55 @@ export const adminDataScript = `
     });
   };
 
+  var runCatalogQuery = function () {
+    var reqAccountId = state.accountId;
+    var reqSeq = ++catalogQuerySeq;
+    var text = el('catalog-query-text') ? el('catalog-query-text').value.trim() : '';
+    var customerId = el('catalog-query-customer') ? el('catalog-query-customer').value : '';
+    var body = {};
+    if (text) body.query = text;
+    else {
+      body.product = el('catalog-query-product') ? el('catalog-query-product').value.trim() : '';
+      body.brand = el('catalog-query-brand') ? el('catalog-query-brand').value.trim() : '';
+      body.specification = el('catalog-query-spec') ? el('catalog-query-spec').value.trim() : '';
+      body.unit = el('catalog-query-unit') ? el('catalog-query-unit').value.trim() : '';
+      if (!body.product) {
+        toast('请输入一句客户原话，或至少填写品名。', 'error');
+        if (App.shakeNode) App.shakeNode(el('catalog-query-text'));
+        if (el('catalog-query-text')) el('catalog-query-text').focus();
+        return;
+      }
+    }
+    if (customerId) body.customerId = customerId;
+    var btn = el('catalogQueryBtn');
+    if (btn) { btn.disabled = true; btn.textContent = '试查中…'; }
+    var resultBox = el('catalog-query-result');
+    if (resultBox) resultBox.innerHTML = '<div class="loading-inline"><span class="spinner" style="margin-right:6px"></span>正在按当前货品库试查…</div>';
+    request(accountPath(reqAccountId, '/catalog/test-query'), { method: 'POST', body: body })
+      .then(function (result) {
+        if (btn && btn.isConnected) { btn.disabled = false; btn.textContent = '立即试查'; }
+        if (!isCurrent('catalog') || state.accountId !== reqAccountId || reqSeq !== catalogQuerySeq) return;
+        catalogView.queryResult = result;
+        renderCatalogQuery();
+      }, function (error) {
+        if (btn && btn.isConnected) { btn.disabled = false; btn.textContent = '立即试查'; }
+        if (!isCurrent('catalog') || state.accountId !== reqAccountId || reqSeq !== catalogQuerySeq) return;
+        if (resultBox) resultBox.innerHTML = '<div class="error-card inline"><h2>试查没有完成</h2><p>' +
+          esc(error.message) + '</p></div>';
+      });
+  };
+
   /* ================= 事件绑定 ================= */
 
+  document.addEventListener('keydown', function (event) {
+    if (event.key !== 'Enter') return;
+    var target = event.target;
+    if (!target || !target.id) return;
+    if (['catalog-query-text', 'catalog-query-product', 'catalog-query-brand', 'catalog-query-spec', 'catalog-query-unit'].indexOf(target.id) >= 0 && isCurrent('catalog')) {
+      event.preventDefault();
+      runCatalogQuery();
+    }
+  });
   document.addEventListener('input', function (event) {
     var target = event.target;
     if (!target) return;
@@ -1396,6 +1517,31 @@ export const adminDataScript = `
       renderCatalogRows();
       return;
     }
+    if (target.closest('[data-catalog-clear-search]') && isCurrent('catalog')) {
+      catalogView.search = '';
+      var s = el('catalog-search');
+      if (s) { s.value = ''; s.focus(); }
+      renderCatalogRows();
+      return;
+    }
+    if (target.closest('[data-catalog-reset]') && isCurrent('catalog')) {
+      catalogView.search = '';
+      catalogView.category = '';
+      catalogView.status = 'all';
+      var searchInput = el('catalog-search');
+      if (searchInput) searchInput.value = '';
+      var catSelect = el('catalog-category');
+      if (catSelect) catSelect.value = '';
+      renderCatalogRows();
+      return;
+    }
+    if (target.closest('[data-customer-clear-search]') && isCurrent('customers')) {
+      customersView.search = '';
+      var cs = el('customer-search');
+      if (cs) { cs.value = ''; cs.focus(); }
+      renderCustomerList();
+      return;
+    }
     if (target.closest('[data-catalog-add]') && isCurrent('catalog')) {
       openCatalogEditor(null);
       return;
@@ -1427,39 +1573,11 @@ export const adminDataScript = `
     if (node && isCurrent('catalog')) {
       var toggled = catalogVariantById(node.getAttribute('data-catalog-toggle'));
       var toggleAccountId = state.accountId;
-      if (toggled) toggleCatalogVariant(toggled, toggleAccountId);
+      if (toggled) toggleCatalogVariant(toggled, toggleAccountId, node);
       return;
     }
     if (target.closest('[data-catalog-query]') && isCurrent('catalog')) {
-      var reqAccountId = state.accountId;
-      var reqSeq = ++catalogQuerySeq;
-      var text = el('catalog-query-text') ? el('catalog-query-text').value.trim() : '';
-      var customerId = el('catalog-query-customer') ? el('catalog-query-customer').value : '';
-      var body = {};
-      if (text) body.query = text;
-      else {
-        body.product = el('catalog-query-product') ? el('catalog-query-product').value.trim() : '';
-        body.brand = el('catalog-query-brand') ? el('catalog-query-brand').value.trim() : '';
-        body.specification = el('catalog-query-spec') ? el('catalog-query-spec').value.trim() : '';
-        body.unit = el('catalog-query-unit') ? el('catalog-query-unit').value.trim() : '';
-        if (!body.product) {
-          toast('请输入一句客户原话，或至少填写品名。', 'error');
-          return;
-        }
-      }
-      if (customerId) body.customerId = customerId;
-      var resultBox = el('catalog-query-result');
-      if (resultBox) resultBox.innerHTML = '<div class="loading-inline">正在按当前货品库试查…</div>';
-      request(accountPath(reqAccountId, '/catalog/test-query'), { method: 'POST', body: body })
-        .then(function (result) {
-          if (!isCurrent('catalog') || state.accountId !== reqAccountId || reqSeq !== catalogQuerySeq) return;
-          catalogView.queryResult = result;
-          renderCatalogQuery();
-        }, function (error) {
-          if (!isCurrent('catalog') || state.accountId !== reqAccountId || reqSeq !== catalogQuerySeq) return;
-          if (resultBox) resultBox.innerHTML = '<div class="error-card inline"><h2>试查没有完成</h2><p>' +
-            esc(error.message) + '</p></div>';
-        });
+      runCatalogQuery();
       return;
     }
     node = target.closest('[data-customer-alias-add]');
@@ -1487,7 +1605,7 @@ export const adminDataScript = `
     }
     node = target.closest('[data-quality-case]');
     if (node && isCurrent('quality')) {
-      copyTurnCase(node.getAttribute('data-quality-case'));
+      copyTurnCase(node.getAttribute('data-quality-case'), node);
       return;
     }
     node = target.closest('[data-mistake-add]');
@@ -1511,7 +1629,7 @@ export const adminDataScript = `
       var statusAccountId = state.accountId;
       try {
         patchMistake(node.getAttribute('data-mistake-status'), { status: next },
-          next === 'resolved' ? '已标为修复。' : '已重开为待修复。', statusAccountId);
+          next === 'resolved' ? '已标为修复。' : '已重开为待修复。', statusAccountId, node);
       } catch (error) {
         toast(error && error.message ? error.message : '操作失败', 'error');
       }
@@ -1528,10 +1646,11 @@ export const adminDataScript = `
     node = target.closest('[data-mistake-copy]');
     if (node && isCurrent('mistakes')) {
       var copyAccountId = state.accountId;
+      var copyTrigger = node;
       request(accountPath(copyAccountId, '/mistakes/' + encodeURIComponent(node.getAttribute('data-mistake-copy')) + '/export'))
         .then(function (data) {
           if (!isCurrent('mistakes', copyAccountId)) return;
-          copyText(JSON.stringify(data, null, 2), '已复制脱敏 Case JSON。');
+          copyText(JSON.stringify(data, null, 2), '已复制脱敏 Case JSON。', copyTrigger);
         }, function (error) {
           if (!isCurrent('mistakes', copyAccountId)) return;
           toast(error.message, 'error');

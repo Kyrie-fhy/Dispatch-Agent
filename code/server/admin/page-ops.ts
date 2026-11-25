@@ -38,7 +38,7 @@ export const adminOpsScript = `
     return '<div class="notice' + (warn ? ' warn' : '') + '">' + esc(text) + '</div>';
   };
   var loading = function (text) {
-    return '<div class="loading-card"><span class="spinner"></span>' + esc(text || '正在加载…') + '</div>';
+    return App.loadingCard ? App.loadingCard(text) : '<div class="loading-card"><span class="spinner"></span>' + esc(text || '正在加载…') + '</div>';
   };
   var emptyCard = function (title, text, nav, action) {
     return '<div class="empty-card"><h2>' + esc(title) + '</h2><p>' + esc(text) + '</p>' +
@@ -198,7 +198,7 @@ export const adminOpsScript = `
       todoCard('mistakes', num(todos.openMistakeCount), '待处理的错题本',
         '已经把 AI 录错的话收进错题本，集中修复更省心。', '去错题本', 'data-status="open"') +
       '</div></section>';
-    root.innerHTML = html;
+    root.innerHTML = '<div class="view-stage">' + html + '</div>';
   };
 
   views.dashboard = { mount: function () { loadDashboard(); } };
@@ -331,7 +331,7 @@ export const adminOpsScript = `
             '<span class="trip-go">查看 ›</span></button>';
         }).join('') + '</div></details>';
     }
-    root.innerHTML = html;
+    root.innerHTML = '<div class="view-stage">' + html + '</div>';
   };
 
   var loadTripDetail = function (scopeId) {
@@ -526,9 +526,30 @@ export const adminOpsScript = `
       turns.length + ' 轮</span></button></div>';
     var body = state.tripTab === 'picking' ? pickingHtml(document)
       : state.tripTab === 'chat' ? chatHtml(turns) : sheetsHtml(document);
-    html += '<section class="card">' + body + '</section>';
-    root.innerHTML = html;
+    html += '<section class="card view-stage" id="tripTabPanel">' + body + '</section>';
+    root.innerHTML = '<div class="view-stage">' + html + '</div>';
     if (state.tripTab === 'chat') loadChatThumbs();
+  };
+
+  var switchTripTab = function (nextTab) {
+    if (!state.scope || state.tripTab === nextTab) return;
+    state.tripTab = nextTab;
+    var panel = el('tripTabPanel');
+    if (!panel) { renderTripDetail(); return; }
+    Array.prototype.forEach.call(document.querySelectorAll('[data-trip-tab]'), function (node) {
+      node.classList.toggle('active', node.getAttribute('data-trip-tab') === nextTab);
+    });
+    var documentData = state.scope.document || {};
+    var turns = state.scope.turns || [];
+    panel.innerHTML = nextTab === 'picking' ? pickingHtml(documentData)
+      : nextTab === 'chat' ? chatHtml(turns) : sheetsHtml(documentData);
+    panel.classList.remove('view-stage');
+    if (typeof window.requestAnimationFrame === 'function') {
+      window.requestAnimationFrame(function () { panel.classList.add('view-stage'); });
+    } else {
+      panel.classList.add('view-stage');
+    }
+    if (nextTab === 'chat') loadChatThumbs();
   };
 
   views.trips = { mount: function () { loadTrips(); } };
@@ -680,15 +701,15 @@ export const adminOpsScript = `
           codeStatus[key].text + '</option>';
       }).join('') + '</select></div></div>' +
       '<div class="table-wrap"><table><thead><tr><th>脱敏提示码</th><th>配送员备注名</th><th>状态</th>' +
-      '<th>创建时间</th><th>激活时间</th><th>绑定账号</th><th>操作</th></tr></thead><tbody>' +
+      '<th>创建时间</th><th>激活时间</th><th>绑定账号</th><th>操作</th></tr></thead><tbody id="codeRows">' +
       codeRowsHtml(records) + '</tbody></table></div></section>';
 
     html += '<section class="card"><div class="card-head"><div><h2>已开通配送员</h2>' +
       '<p>停用会立即踢下线并让旧登录凭证永久失效；历史单据与资料不会被删除。</p></div>' +
-      '<span class="muted">共 ' + state.accounts.length + ' 位</span></div>' +
+      '<span class="muted" id="accountsCount">共 ' + state.accounts.length + ' 位</span></div>' +
       '<div class="table-wrap"><table><thead><tr><th>配送员</th><th>登录方式与脱敏标识</th><th>状态</th>' +
       '<th>最近活跃</th><th class="num">趟数</th><th class="num">货品数</th><th class="num">待处理错题</th><th>操作</th>' +
-      '</tr></thead><tbody>' + accountsRowsHtml() + '</tbody></table></div></section>';
+      '</tr></thead><tbody id="accountsRows">' + accountsRowsHtml() + '</tbody></table></div></section>';
 
     var costDescription = system.costRates && system.costRates.description
       ? system.costRates.description : '按已记录模型事件的输入和输出用量估算。';
@@ -697,19 +718,34 @@ export const adminOpsScript = `
       '<p class="metric-note" style="margin-top:10px">费用估算口径：' + esc(costDescription) + '</p>' +
       '<details class="soft-details" id="aiRulesDetails"><summary>AI 内部规则（只读参考）</summary>' +
       '<div id="aiRulesBody" class="loading-inline">展开后加载当前 7 组提示词与工具 Schema。</div></details></section>';
-    root.innerHTML = html;
+    root.innerHTML = '<div class="view-stage">' + html + '</div>';
     bindAiRules();
+  };
+
+  var renderCodeRowsOnly = function () {
+    var tbody = el('codeRows');
+    if (!tbody) { renderAccountsPage(); return; }
+    var records = state.activationCodes && Array.isArray(state.activationCodes.records)
+      ? state.activationCodes.records : [];
+    tbody.innerHTML = codeRowsHtml(records);
+  };
+  var renderAccountRowsOnly = function () {
+    var tbody = el('accountsRows');
+    if (!tbody) { renderAccountsPage(); return; }
+    tbody.innerHTML = accountsRowsHtml();
+    var count = el('accountsCount');
+    if (count) count.textContent = '共 ' + state.accounts.length + ' 位';
   };
 
   var reloadCodes = function () {
     return api('/activation-codes').then(function (data) {
       state.activationCodes = data;
-      if (isCurrent('accounts')) renderAccountsPage();
+      if (isCurrent('accounts')) renderCodeRowsOnly();
     });
   };
   var reloadAccounts = function () {
     return App.loadAccounts().then(function () {
-      if (isCurrent('accounts')) renderAccountsPage();
+      if (isCurrent('accounts')) renderAccountRowsOnly();
     });
   };
 
@@ -728,7 +764,8 @@ export const adminOpsScript = `
         var errorNode = el('renameError');
         if (!value) {
           if (errorNode) errorNode.textContent = '备注名不能为空。';
-          toast('备注名不能为空。', 'error');
+          if (App.shakeNode) App.shakeNode(input);
+          if (input) input.focus();
           return false;
         }
         if (errorNode) errorNode.textContent = '';
@@ -804,6 +841,7 @@ export const adminOpsScript = `
     var remark = input ? input.value.trim() : '';
     if (!remark) {
       toast('请先填写配送员中文备注名。', 'error');
+      if (App.shakeNode) App.shakeNode(input);
       if (input) input.focus();
       return;
     }
@@ -830,7 +868,7 @@ export const adminOpsScript = `
   document.addEventListener('change', function (event) {
     if (event.target && event.target.id === 'codeFilter') {
       state.codeFilter = event.target.value;
-      if (isCurrent('accounts')) renderAccountsPage();
+      if (isCurrent('accounts')) renderCodeRowsOnly();
     }
   });
 
@@ -853,8 +891,7 @@ export const adminOpsScript = `
     }
     var tripTab = target.closest('[data-trip-tab]');
     if (tripTab) {
-      state.tripTab = tripTab.getAttribute('data-trip-tab');
-      renderTripDetail();
+      switchTripTab(tripTab.getAttribute('data-trip-tab'));
       return;
     }
     var jump = target.closest('[data-quality-turn]');
@@ -893,7 +930,7 @@ export const adminOpsScript = `
     }
     var switchAccount = target.closest('[data-account-switch]');
     if (switchAccount) {
-      App.closeModal();
+      App.closeModal(true);
       App.clearMaterialUrls();
       state.accountId = switchAccount.getAttribute('data-account-switch');
       state.dashboard = null;
@@ -915,7 +952,7 @@ export const adminOpsScript = `
       var text = (entry.prompts || []).map(function (prompt) {
         return '【' + prompt.label + '】\\n' + prompt.text;
       }).join('\\n\\n');
-      copyText(text, '已复制「' + entry.title + '」全文。');
+      copyText(text, '已复制「' + entry.title + '」全文。', copyRule);
     }
   });
 

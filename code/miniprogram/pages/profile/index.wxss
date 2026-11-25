@@ -88,6 +88,7 @@
   border: 1rpx solid var(--hairline);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-card);
+  animation: dp-fade-up var(--dur-base) var(--ease-out);
 }
 .identity-main {
   display: flex;
@@ -135,6 +136,12 @@
   border: 1rpx solid var(--hairline);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-card);
+  transition: transform var(--dur-press) var(--ease-out), background-color var(--dur-fast) var(--ease-out);
+  animation: dp-fade-up var(--dur-base) var(--ease-out);
+}
+.trip-status-card-link:active {
+  background: var(--surface-sunken);
+  transform: scale(0.986);
 }
 .trip-status-head {
   display: flex;
@@ -147,11 +154,19 @@
   width: 20rpx;
   height: 20rpx;
   border-radius: 50%;
+  transition: background-color var(--dur-base) var(--ease-in-out);
 }
 .dot-idle { background: var(--ink-disabled); }
 .dot-warning { background: var(--warning); }
 .dot-done { background: var(--primary); }
-.trip-status-main { min-width: 0; }
+.trip-status-main { flex: 1; min-width: 0; }
+.trip-status-go {
+  flex: none;
+  font-size: 28rpx;
+  font-weight: 600;
+  color: var(--primary);
+  white-space: nowrap;
+}
 .trip-status-label {
   font-size: 26rpx;
   line-height: 1.4;
@@ -188,6 +203,7 @@
   border: 1rpx solid var(--hairline);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-card);
+  animation: dp-fade-up var(--dur-base) var(--ease-out);
 }
 .metric-label {
   font-size: 26rpx;

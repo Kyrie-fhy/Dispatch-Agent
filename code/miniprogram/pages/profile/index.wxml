@@ -39,13 +39,14 @@
       <view class="identity-tag">已同步</view>
     </view>
 
-    <view class="trip-status-card">
+    <view class="trip-status-card {{loaded ? 'trip-status-card-link' : ''}}" bindtap="goCurrentStage">
       <view class="trip-status-head">
         <view class="trip-status-dot {{!loaded ? 'dot-idle' : canEditForm ? 'dot-warning' : 'dot-done'}}"></view>
         <view class="trip-status-main">
           <view class="trip-status-label">本趟阶段</view>
           <view class="trip-status-value">{{loaded ? tripMode : '正在同步…'}}</view>
         </view>
+        <view wx:if="{{loaded}}" class="trip-status-go">{{canEditForm ? '去录单 ›' : '去送货 ›'}}</view>
       </view>
       <view wx:if="{{tripDetail}}" class="trip-status-detail num">{{tripDetail}}</view>
     </view>

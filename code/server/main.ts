@@ -1,6 +1,6 @@
 import { AgentRuntime } from './agent/runtime';
 import { AgentModel, configuredAgentModel } from './agent/model';
-import { configuredAdminToken, handleAdmin } from './admin';
+import { configuredAdminOrigins, configuredAdminToken, handleAdmin, parseAdminOrigin } from './admin';
 import type { AdminRuntime } from './admin/routes';
 import { configuredCostRates } from './admin/quality';
 import { ActivationCodes, configuredActivation } from './activation';
@@ -78,11 +78,11 @@ function resourceId(path: string, collection: 'drafts' | 'trips'): string | null
 async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery: DeliveryStore, ledger: LedgerStore, amendments: AmendmentStore,
   materials: MaterialStore, textOrders: TextOrders, agent: AgentRuntime, memory: MemoryStore, catalog: CatalogStore, request: IncomingMessage, response: ServerResponse,
   wechat?: WechatLogin, speechModel?: SpeechModel, adminToken?: string, voiceCorrector?: VoiceCorrector, adminRuntime?: AdminRuntime): Promise<void> {
+  if (await handleAdmin(pool, adminToken, request, response, adminRuntime)) return;
   const host = request.headers.host ?? '';
   if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host)) {
     throw new HttpError(400, 'invalid_host', '请通过本机地址访问草稿服务');
   }
-  if (await handleAdmin(pool, adminToken, request, response, adminRuntime)) return;
   const method = request.method;
   const path = request.url?.split('?')[0] ?? '';
 
@@ -370,6 +370,7 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
 type LocalServerOptions = {
   requireActivation?: boolean;
   activationPepper?: string;
+  adminOrigins?: readonly string[];
   modelNames?: Partial<Record<keyof AdminRuntime['models'], string>>;
   costRates?: AdminRuntime['rates'];
 };
@@ -378,6 +379,7 @@ export async function startLocalServer(pool: Pool, port: number, wechat?: Wechat
   imageModel?: ImageModel, speechModel?: SpeechModel, agentModel?: AgentModel, intentModel?: IntentModel, deliveryModel?: DeliveryModel,
   adminToken?: string, voiceCorrector?: VoiceCorrector, options: LocalServerOptions = {}): Promise<Server> {
   adminToken = configuredAdminToken({ DISPATCH_ADMIN_TOKEN: adminToken });
+  const adminOrigins = [...new Set((options.adminOrigins ?? []).map(parseAdminOrigin))];
   await requireApplicationRole(pool);
   const codes = new ActivationCodes(options.activationPepper || adminToken);
   const requireActivation = options.requireActivation ?? false;
@@ -388,6 +390,7 @@ export async function startLocalServer(pool: Pool, port: number, wechat?: Wechat
     models: { text: modelStatus('text', Boolean(textModel)), image: modelStatus('image', Boolean(imageModel)),
       voice: modelStatus('voice', Boolean(speechModel)), agent: modelStatus('agent', Boolean(agentModel)) },
     rates: options.costRates ?? configuredCostRates({}),
+    adminOrigins,
   };
   const store = new DraftStore(pool, requireActivation, codes);
   const trips = new TripStore(pool);
@@ -429,6 +432,7 @@ async function main(): Promise<void> {
   const wechat = configuredWechatLogin(process.env);
   if (trial && !wechat) throw new Error('试用环境必须配置微信登录');
   const adminToken = configuredAdminToken(process.env);
+  const adminOrigins = configuredAdminOrigins(process.env);
   const pool = new Pool(databaseOptions('DISPATCH_DB_URL'));
   pool.on('error', () => console.error('PostgreSQL 空闲连接已断开，后续请求会重新连接'));
   try {
@@ -436,6 +440,7 @@ async function main(): Promise<void> {
       configuredImageModel(process.env), configuredSpeechModel(process.env), configuredAgentModel(process.env),
       configuredIntentModel(process.env, 'A'), configuredDeliveryModel(process.env), adminToken, configuredVoiceCorrector(process.env), {
         ...configuredActivation(process.env),
+        adminOrigins,
         modelNames: { text: process.env.DISPATCH_TEXT_MODEL?.trim() || 'deepseek-flash',
           agent: process.env.DISPATCH_AGENT_MODEL?.trim() || 'deepseek-flash' },
         costRates: configuredCostRates(process.env),

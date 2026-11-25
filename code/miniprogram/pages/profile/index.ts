@@ -222,6 +222,21 @@ Page({
 
   logout(): Promise<void> | undefined {
     if (this.data.busy) return;
+    if (this.data.signedIn && !this.data.revokeFailed && typeof wx.showModal === 'function') {
+      wx.showModal({
+        title: '退出登录',
+        content: '退出后需要重新微信登录，已保存的单据与资料不会丢失。',
+        confirmText: '确认退出',
+        success: ({ confirm }) => { if (confirm) void this.performLogout(); },
+        fail: () => this.setData({ error: '确认框打开失败，请重试。' }),
+      });
+      return;
+    }
+    return this.performLogout();
+  },
+
+  performLogout(): Promise<void> | undefined {
+    if (this.data.busy) return;
     this.retiredToken = agentSession.token || this.retiredToken;
     clearAgentSession();
     this.generation += 1;
@@ -258,6 +273,7 @@ Page({
     return this.run(async () => {
       await workspaceRequest('POST', '/customer-aliases/unbind', agentSession.token, { requestId: newId(), alias });
       await this.reload();
+      wx.showToast?.({ title: '已解绑叫法', icon: 'success' });
     });
   },
 
@@ -265,6 +281,11 @@ Page({
     if (agentSession.token && !this.data.busy && this.data.canEditForm) {
       wx.navigateTo({ url: '/pages/workspace/index?from=agent' });
     }
+  },
+
+  goCurrentStage(): void {
+    if (!this.data.loaded || this.data.busy) return;
+    wx.switchTab({ url: this.data.canEditForm ? '/pages/agent/index' : '/pages/trip-delivery/index' });
   },
 
   goAssistant(): void {

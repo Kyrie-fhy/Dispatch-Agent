@@ -3182,3 +3182,117 @@ test('6.8-3 gate pages keep the cold-chain v2.0 high-contrast native baseline', 
     }
   }
 });
+
+test('UX & Motion: order sheet guards unsaved prices, voice pad explains tap flow, unlink scrolls, profile confirms logout', async t => {
+  const read = file => fs.readFileSync(require.resolve(`../code/dist/${file}`), 'utf8');
+  const appWxss = read('app.wxss');
+  for (const token of ['--ease-out:', '--ease-spring:', '--dur-press:', '--dur-sheet:',
+    'prefers-reduced-motion: reduce', '.skeleton-card']) {
+    assert.ok(appWxss.includes(token), `app.wxss 缺少统一动效或骨架令牌 ${token}`);
+  }
+  const appWxssNoComments = appWxss.replace(/\/\*[\s\S]*?\*\//g, '');
+  assert.equal(/\*/.test(appWxssNoComments), false, 'WXSS 不支持通配符 * 选择器，会导致微信开发者工具编译报错');
+  const agentWxml = read('pages/agent/index.wxml');
+  for (const token of ['scroll-with-animation="{{true}}"', 'confirm-type="done"', 'voice-pad-text',
+    'orderSheetMounted', 'customerSheetRender', 'requestCloseOrderSheet', '点一下开始说', '点一下结束']) {
+    assert.ok(agentWxml.includes(token), `助手页缺少体验/动效结构 ${token}`);
+  }
+  const deliveryWxml = read('pages/trip-delivery/index.wxml');
+  assert.ok(deliveryWxml.includes("disabled=\"{{busy || fieldEdit.receivedQuantity === '0'}}\""), '数量为 0 时减号禁用');
+  assert.ok(deliveryWxml.includes('sheet-lock-hint'), '编辑行时提示先保存这一行再锁账');
+
+  const draft = order();
+  draft.customers[0].items[0].price = null;
+  draft.customers[0].partyId = 'p-wang';
+  const { page, pageFor, navigation, event, handle, setTurns } = setup(t, draft);
+  const linkTurn = { id: 'turn-link', text: '老王水饺2箱', materialIds: [], revision: draft.revision, status: 'completed',
+    events: [event('customer_links', { links: [{ draftCustomerId: draft.customers[0].id, customerId: 'p-wang', spoken: '老王', canonicalName: '王记餐饮', merged: false }] }),
+      event('end', { status: 'completed', text: '已记上', revision: draft.revision })] };
+  setTurns([linkTurn]);
+  handle(request => {
+    if (request.path === '/agent/customer-choice') {
+      draft.customers[0].partyId = undefined;
+      draft.revision += 1;
+      request.ok({ revision: draft.revision, remembered: null });
+      return true;
+    }
+    return false;
+  });
+
+  await page.onShow();
+  await page.login();
+
+  // 1. Order sheet anti-loss guard when dirty + interruptible reopen
+  page.openOrderSheet(tap({ tab: 'pending' }));
+  assert.equal(page.data.orderSheetOpen, true);
+  assert.equal(page.data.orderSheetMounted, true);
+  page.editPriceDrawerPrice({ ...tap({ line: draft.customers[0].items[0].id }), detail: { value: '88' } });
+  assert.equal(page.data.priceDrawerDirty, true);
+  let modal = null;
+  wx.showModal = spec => { modal = spec; };
+  page.requestCloseOrderSheet();
+  assert.ok(modal, '有未保存单价时关闭抽屉应弹二次确认');
+  assert.ok(modal.confirmText.length <= 4, 'confirmText 须 ≤ 4 字');
+  modal.success({ confirm: false });
+  assert.equal(page.data.orderSheetOpen, true, '取消放弃后抽屉保持打开');
+  assert.equal(page.data.priceDrawerRows[0].price, '88', '已填单价未丢失');
+  modal.success({ confirm: true });
+  assert.equal(page.data.orderSheetOpen, false, '确认放弃后抽屉关闭');
+  // Interruptible reopen during exit transition & preview exit does not snap back to list
+  page.openOrderSheet(tap({ tab: 'all' }));
+  assert.equal(page.data.orderSheetOpen, true);
+  assert.equal(page.data.orderSheetMounted, true);
+  page.setData({ orderSheetStep: 'preview', sheetPreview: { id: 'p-exit', customers: [], totalCents: 0, pendingPrices: 0, allPending: false, displayTotal: '¥0.00' } });
+  page.closeOrderSheet();
+  assert.equal(page.data.orderSheetOpen, false);
+  assert.equal(page.data.orderSheetStep, 'preview', '退场动画期间保持预览态，不闪回列表');
+  assert.equal(page.confirmSheetPreview(), undefined, '退场期间阻止误点确认出单');
+  page.onHide();
+  assert.equal(page.data.orderSheetMounted, false);
+  assert.equal(page.data.orderSheetStep, 'list');
+  assert.equal(page.data.sheetPreview, null);
+
+  // 2. Unlinking customer ("不是他") scrolls choice card into view
+  await page.notHim(tap({ turn: linkTurn.id, customer: draft.customers[0].id }));
+  assert.equal(page.data.scrollTo, 'latest', '点不是他后自动滚动露出选店卡');
+
+  // 2b. Customer sheet preserves typed draft across backdrop close & reopen
+  draft.customers[0].customer = '';
+  page.openCustomerSheet(tap({ customer: draft.customers[0].id }));
+  page.editSheetCustomerName({ detail: { value: '鲜味居砂锅' } });
+  page.closeCustomerSheet();
+  assert.equal(page.data.customerSheet, null);
+  page.openCustomerSheet(tap({ customer: draft.customers[0].id }));
+  assert.equal(page.data.customerSheet.value, '鲜味居砂锅', '补店名抽屉关闭后再打开保留未提交输入');
+  page.closeCustomerSheet();
+
+  // 2c. Retry clears stale voiceMeta and voiceCorrectionHint before replacing text
+  const failedTurn = { id: 'turn-fail', text: '旧失败消息', materialIds: [], revision: draft.revision, status: 'failed', events: [] };
+  page.turns.push(failedTurn);
+  page.voiceMeta = { rawText: '安景鱼豆腐', corrections: [{ from: '安景', to: '安井' }] };
+  page.setData({ text: '安井鱼豆腐', voiceCorrectionHint: '已自动纠正：安景→安井' });
+  let retryModal = null;
+  wx.showModal = spec => { retryModal = spec; };
+  page.retry(tap({ id: 'turn-fail' }));
+  assert.ok(retryModal, '输入框已有内容点重试先弹替换确认');
+  retryModal.success({ confirm: true });
+  assert.equal(page.data.text, '旧失败消息');
+  assert.equal(page.voiceMeta, null, '替换重发必须清空被替换语音的 voiceMeta');
+  assert.equal(page.data.voiceCorrectionHint, '', '替换重发同步清空语音纠偏提示');
+
+  // 3. Profile stage card navigation + logout confirmation guard
+  const profile = pageFor('profile');
+  await profile.onShow();
+  assert.equal(profile.data.loaded, true);
+  profile.goCurrentStage();
+  assert.equal(navigation.at(-1), '/pages/agent/index', '晚间录单中点阶段卡直达助手页');
+  modal = null;
+  wx.showModal = spec => { modal = spec; };
+  profile.logout();
+  assert.ok(modal, '真机环境下退出登录先弹确认防误碰');
+  assert.ok(modal.confirmText.length <= 4, '退出确认按钮须 ≤ 4 字');
+  assert.equal(profile.data.signedIn, true, '未点确认前保持登录');
+  modal.success({ confirm: true });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(profile.data.signedIn, false, '确认后正常退出登录');
+});

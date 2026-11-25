@@ -13,6 +13,7 @@
   justify-content: space-between;
   gap: 20rpx;
   margin: 8rpx 0 24rpx;
+  animation: dp-fade-up var(--dur-base) var(--ease-out);
 }
 .picking-top-main {
   min-width: 0;
@@ -47,6 +48,7 @@
   padding: 0 28rpx;
   margin: 24rpx 0;
   box-shadow: var(--shadow-card);
+  animation: dp-fade-up var(--dur-base) var(--ease-out);
 }
 .picking-row {
   display: flex;

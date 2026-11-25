@@ -23,6 +23,7 @@ const { migrate } = require('../../code/server-dist/server/migrate');
 const { adminDataScript } = require('../../code/server-dist/server/admin/page-data');
 const { adminOpsScript } = require('../../code/server-dist/server/admin/page-ops');
 const { adminShellHtml, adminShellScript } = require('../../code/server-dist/server/admin/page-shell');
+const { adminStyles } = require('../../code/server-dist/server/admin/page-styles');
 
 const adminToken = 'test-admin-v2-isolated-secret';
 const appId = 'wx0123456789abcdef';
@@ -501,8 +502,9 @@ function createAdminHarness(options = {}) {
     navigator: {},
     URL: { createObjectURL: () => 'blob:admin', revokeObjectURL() {} },
     ...(options.FileReader ? { FileReader: options.FileReader } : {}),
+    ...(options.raf ? { requestAnimationFrame: options.raf } : {}),
     console,
-    setTimeout: (callback, delay) => (delay >= 1000 ? 0 : setTimeout(callback, 0)),
+    setTimeout: (callback, delay) => (delay >= 1000 ? 0 : (options.raf && delay === 155 ? 0 : setTimeout(callback, 0))),
     clearTimeout,
   };
   sandbox.window = sandbox;
@@ -1337,4 +1339,181 @@ test('admin v2 through the normal routes on an isolated PostgreSQL database', { 
       await tsServer.stop();
     }
   });
+});
+
+test('UX & Motion: admin v2 ships dark theme, reduced-motion, no-flash partial updates, enter query and search reset', async () => {
+  for (const token of ['prefers-color-scheme: dark', '[data-theme="dark"]', 'prefers-reduced-motion: reduce',
+    '--ease-out:', '--ease-spring:', '.is-closing', '.is-leaving', '.skeleton-bar', '.is-copied']) {
+    assert.ok(adminStyles.includes(token), `adminStyles 缺少主题或动效定义 ${token}`);
+  }
+
+  let toggledStatus = 'active';
+  const records = [
+    { id: 'c1', remarkName: '老张', status: 'unused', codeHint: 'DZ-1111', createdAt: '2026-10-01T10:00:00Z' },
+    { id: 'c2', remarkName: '老李', status: 'redeemed', codeHint: 'DZ-2222', createdAt: '2026-10-01T11:00:00Z', redeemedAt: '2026-10-01T12:00:00Z' },
+  ];
+  const harness = createAdminHarness({
+    records,
+    handler(call) {
+      if (call.method === 'GET' && call.url === '/admin/api/accounts/A/catalog') {
+        const base = adminCatalogFixture();
+        base.items[0].status = toggledStatus;
+        return adminJson(200, base);
+      }
+      if (call.method === 'PATCH' && call.url.endsWith('/catalog/variants/v-fish')) {
+        toggledStatus = call.body.status;
+        return adminJson(200, { catalogRevision: 8, item: { ...adminCatalogFixture().items[0], status: toggledStatus } });
+      }
+      if (call.method === 'POST' && call.url === '/admin/api/accounts/A/catalog/test-query') {
+        return adminJson(200, { status: 'active', priceCents: 1980, priceSource: 'catalog', item: null, candidates: [], reason: 'enter-hit' });
+      }
+      return undefined;
+    },
+  });
+
+  // 1. Accounts page: changing codeFilter preserves in-progress activationRemark without wiping the form
+  await harness.openSection('accounts');
+  await harness.waitFor(() => harness.document.querySelector('#codeRows'), 'code rows');
+  const remarkInput = harness.document.querySelector('#activationRemark');
+  remarkInput.value = '正在输入的备注';
+  const filterSelect = harness.document.querySelector('#codeFilter');
+  filterSelect.value = 'unused';
+  harness.fire(filterSelect, 'change');
+  assert.equal(harness.document.querySelector('#activationRemark').value, '正在输入的备注', '切换开通码筛选不得清空顶部表单输入');
+  assert.ok(harness.document.querySelector('#codeRows').textContent.includes('DZ-1111'));
+  assert.equal(harness.document.querySelector('#codeRows').textContent.includes('DZ-2222'), false);
+
+  // 2. Catalog page: Enter triggers test-query; toggle updates in-place keeping search filter; search clear/reset work
+  await harness.openSection('catalog');
+  await harness.waitFor(() => harness.document.querySelector('#catalogRows'), 'catalog rows');
+  const queryInput = harness.document.querySelector('#catalog-query-text');
+  queryInput.value = '安井鱼豆腐';
+  harness.fire(queryInput, 'keydown', { key: 'Enter' });
+  await harness.waitFor(() => harness.document.querySelector('#catalog-query-result').textContent.includes('enter-hit'), 'enter query result');
+
+  const searchInput = harness.document.querySelector('#catalog-search');
+  searchInput.value = '鱼豆腐';
+  harness.fire(searchInput, 'input');
+  assert.equal(harness.document.querySelector('#catalogSearchClear').classList.contains('hidden'), false, '有搜索词时显示一键清空按钮');
+  harness.fire(harness.document.querySelector('[data-catalog-toggle="v-fish"]'), 'click');
+  await harness.waitFor(() => harness.document.querySelector('#catalogRows').textContent.includes('已下架'), 'in-place toggled status');
+  assert.equal(harness.document.querySelector('#catalog-search').value, '鱼豆腐', '快速下架局部刷新不丢失当前搜索词');
+
+  // Empty search -> one-click reset button
+  searchInput.value = '不存在的货品xyz';
+  harness.fire(searchInput, 'input');
+  const resetBtn = harness.document.querySelector('[data-catalog-reset]');
+  assert.ok(resetBtn, '筛选无结果时提供一键重置筛选按钮');
+  harness.fire(resetBtn, 'click');
+  assert.equal(harness.document.querySelector('#catalog-search').value, '');
+  assert.ok(harness.document.querySelector('#catalogRows').textContent.includes('鱼豆腐'));
+});
+
+test('UX & Motion guards: modal blocks Enter while closing or IME composing, and ignores stale catalog/mistake refreshes', async () => {
+  // 1. Modal closing (155ms .is-closing window) + IME composing guard
+  const baseHarness = createAdminHarness({
+    catalog: adminCatalogFixture(),
+    raf: cb => cb(),
+  });
+  await baseHarness.openSection('catalog');
+  await baseHarness.waitFor(() => baseHarness.document.querySelector('[data-catalog-edit="v-fish"]'), 'edit button');
+  baseHarness.fire(baseHarness.document.querySelector('[data-catalog-edit="v-fish"]'), 'click');
+  const unitInput = baseHarness.document.querySelector('#catUnit');
+  unitInput.value = '';
+  baseHarness.fire(unitInput, 'keydown', { key: 'Enter', isComposing: true });
+  await adminFlush();
+  assert.equal(baseHarness.calls.some(call => call.method === 'PATCH'), false, '输入法选词回车不得误提交');
+  const modalRoot = baseHarness.document.querySelector('#modalRoot');
+  baseHarness.App.closeModal();
+  assert.equal(modalRoot.classList.contains('is-closing'), true, '开启 rAF 时弹窗进入 155ms 退场态');
+  baseHarness.fire(unitInput, 'keydown', { key: 'Enter' });
+  await adminFlush();
+  assert.equal(baseHarness.calls.some(call => call.method === 'PATCH'), false, '退场 155ms 期间回车不得触发 PATCH');
+
+  // 2. Catalog toggle: stale refresh dropped + 503 refresh restores button
+  let releaseOldCatalog;
+  let catalogGetCount = 0;
+  let failNextCatalog = false;
+  const raceHarness = createAdminHarness({
+    catalog: adminCatalogFixture(),
+    handler(call) {
+      if (call.method === 'GET' && call.url === '/admin/api/accounts/A/catalog') {
+        catalogGetCount += 1;
+        if (failNextCatalog) {
+          failNextCatalog = false;
+          return adminJson(503, { error: 'service_unavailable', message: '暂时繁忙' });
+        }
+        if (catalogGetCount === 2) {
+          return new Promise(resolve => {
+            releaseOldCatalog = () => resolve(adminJson(200, { ...adminCatalogFixture(), catalogRevision: 8 }));
+          });
+        }
+        if (catalogGetCount === 3) {
+          return adminJson(200, { ...adminCatalogFixture(), catalogRevision: 9 });
+        }
+        return adminJson(200, adminCatalogFixture());
+      }
+      if (call.method === 'PATCH' && call.url.endsWith('/catalog/variants/v-fish')) {
+        return adminJson(200, { catalogRevision: 8, item: { ...adminCatalogFixture().items[0], status: 'discontinued' } });
+      }
+      return undefined;
+    },
+  });
+  await raceHarness.openSection('catalog');
+  await raceHarness.waitFor(() => raceHarness.document.querySelector('[data-catalog-toggle="v-fish"]'), 'toggle btn');
+  raceHarness.fire(raceHarness.document.querySelector('[data-catalog-toggle="v-fish"]'), 'click');
+  await raceHarness.waitFor(() => Boolean(releaseOldCatalog), 'delayed in-place catalog refresh');
+  // Newer full reload returns revision 9 before the delayed revision 8 finishes
+  raceHarness.App.renderCurrent();
+  await raceHarness.waitFor(() => raceHarness.document.querySelector('#catalogOverview')?.textContent.includes('当前版本 9'), 'revision 9');
+  releaseOldCatalog();
+  await adminFlush(25);
+  assert.ok(raceHarness.document.querySelector('#catalogOverview').textContent.includes('当前版本 9'), '过期局部刷新不得回退版本号');
+
+  // 503 on post-toggle refresh restores button cleanly
+  failNextCatalog = true;
+  const btn = raceHarness.document.querySelector('[data-catalog-toggle="v-fish"]');
+  raceHarness.fire(btn, 'click');
+  await raceHarness.waitFor(() => !btn.disabled && btn.textContent === '快速下架', 'button restored after refresh 503');
+
+  // 3. Mistakes filter race: delayed open refresh must not overwrite resolved tab
+  let releaseOpenRefresh;
+  let openGets = 0;
+  const mistakeHarness = createAdminHarness({
+    handler(call) {
+      if (call.method === 'GET' && call.url === '/admin/api/accounts/A/mistakes?status=open') {
+        openGets += 1;
+        if (openGets === 1) {
+          return adminJson(200, { mistakes: [{ turnId: 't1', category: '货品认错', status: 'open', expectedOutcome: '应为2箱', createdAt: '2026-10-01T10:00:00Z' }] });
+        }
+        return new Promise(resolve => {
+          releaseOpenRefresh = () => resolve(adminJson(200, { mistakes: [{ turnId: 't-stale', category: '旧待修复', status: 'open', expectedOutcome: '旧数据', createdAt: '2026-10-01T10:00:00Z' }] }));
+        });
+      }
+      if (call.method === 'GET' && call.url === '/admin/api/accounts/A/mistakes?status=resolved') {
+        return adminJson(200, { mistakes: [{ turnId: 't-done', category: '已修复条目', status: 'resolved', expectedOutcome: '已完成', createdAt: '2026-10-01T10:00:00Z' }] });
+      }
+      if (call.method === 'PATCH' && call.url.endsWith('/mistakes/t1')) {
+        return adminJson(200, { ok: true });
+      }
+      return undefined;
+    },
+  });
+  await mistakeHarness.openSection('mistakes');
+  await mistakeHarness.waitFor(() => mistakeHarness.document.querySelector('[data-mistake-status="t1"]'), 'mistake status btn');
+  mistakeHarness.fire(mistakeHarness.document.querySelector('[data-mistake-status="t1"]'), 'click');
+  await mistakeHarness.waitFor(() => Boolean(releaseOpenRefresh), 'delayed open mistakes refresh');
+  mistakeHarness.fire(mistakeHarness.document.querySelector('[data-mistake-filter="resolved"]'), 'click');
+  await mistakeHarness.waitFor(() => mistakeHarness.document.querySelector('#mistakesList')?.textContent.includes('已修复条目'), 'resolved list');
+  releaseOpenRefresh();
+  await adminFlush(25);
+  const listText = mistakeHarness.document.querySelector('#mistakesList').textContent;
+  assert.ok(listText.includes('已修复条目'), '已修复列表应保持');
+  assert.equal(listText.includes('旧待修复'), false, '过期的待修复局部刷新不得覆盖已修复列表');
+
+  // 4. Refresh button accessibility label & brand-mark specificity guard
+  const refreshBtn = baseHarness.document.querySelector('#refreshBtn');
+  assert.equal(refreshBtn.getAttribute('aria-label'), '刷新最新数据');
+  assert.ok(adminStyles.includes('.side-brand > div > span'), '品牌标 D 不被侧栏副标题样式误覆盖');
+  assert.ok(adminStyles.includes('content-visibility: auto'), '长货品列表启用视口外跳过绘制');
 });

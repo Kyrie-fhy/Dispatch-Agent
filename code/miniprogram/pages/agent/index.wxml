@@ -141,7 +141,7 @@
       </view>
     </view>
 
-    <scroll-view scroll-y class="conversation" scroll-into-view="{{scrollTo}}">
+    <scroll-view scroll-y scroll-with-animation="{{true}}" class="conversation" scroll-into-view="{{scrollTo}}">
       <view wx:if="{{!turns.length}}" class="turn">
         <view class="card starter-card">
           <block wx:if="{{!confirmed}}">
@@ -240,7 +240,8 @@
                 <text class="inline-customer-label">{{unnamed.label}}</text>
                 <view class="inline-customer-line">
                   <input class="inline-customer-input" value="{{inlineCustomerDrafts[unnamed.id]}}" placeholder="输入客户店名"
-                    data-customer="{{unnamed.id}}" bindinput="editInlineCustomerName" />
+                    confirm-type="done" data-customer="{{unnamed.id}}" bindinput="editInlineCustomerName"
+                    bindconfirm="saveInlineCustomerName" />
                   <button class="inline-customer-save" aria-label="保存店名" disabled="{{busy || polling}}"
                     data-customer="{{unnamed.id}}" bindtap="saveInlineCustomerName">
                     <image class="inline-customer-save-icon" src="/pages/agent/icons/check.svg" />
@@ -360,15 +361,16 @@
       <view id="latest" />
     </scroll-view>
 
-    <view wx:if="{{orderSheetOpen}}" class="sheet-mask order-sheet-mask">
-      <view class="order-sheet">
+    <view wx:if="{{orderSheetMounted}}" class="sheet-mask order-sheet-mask {{orderSheetOpen ? 'is-open' : 'is-closing'}}"
+      bindtap="onOrderSheetMaskTap">
+      <view class="order-sheet {{orderSheetOpen ? 'is-open' : 'is-closing'}}" catchtap="noop">
         <view class="order-sheet-head">
           <view class="sheet-grab" />
           <view class="order-sheet-titles">
             <text class="sheet-title">本趟订单本</text>
             <text wx:if="{{draftSummary}}" class="sheet-sub num">{{draftSummary.customerCount}} 家门店 · {{draftSummary.lineCount}} 样货 · {{draftSummary.hasKnownAmount ? '已算 ' + draftSummary.knownTotalLabel : (draftSummary.pendingCount ? '待填价' : '已算 ¥0.00')}}</text>
           </view>
-          <button class="sheet-close-icon" aria-label="关闭订单本" bindtap="closeOrderSheet">
+          <button class="sheet-close-icon" aria-label="关闭订单本" bindtap="requestCloseOrderSheet">
             <image class="sheet-close-image" src="/pages/agent/icons/close.svg" />
           </button>
         </view>
@@ -380,7 +382,7 @@
           </view>
         </view>
 
-        <scroll-view wx:if="{{orderSheetStep === 'list' && orderSheetTab === 'all'}}" scroll-y class="order-sheet-body"
+        <scroll-view wx:if="{{orderSheetStep === 'list' && orderSheetTab === 'all'}}" scroll-y scroll-with-animation="{{true}}" class="order-sheet-body sheet-stage"
           scroll-top="{{orderSheetScrollTop}}">
           <template is="sheet-pending-actions" data="{{draftSummary: draftSummary, choices: choices, catalogChoices: catalogChoices, memoryNames: memoryNames, busy: busy, polling: polling}}" />
           <view wx:if="{{adoptableCount}}" class="sheet-adopt">
@@ -425,7 +427,7 @@
           </view>
         </scroll-view>
 
-        <scroll-view wx:if="{{orderSheetStep === 'list' && orderSheetTab === 'pending'}}" scroll-y class="order-sheet-body drawer-body"
+        <scroll-view wx:if="{{orderSheetStep === 'list' && orderSheetTab === 'pending'}}" scroll-y scroll-with-animation="{{true}}" class="order-sheet-body drawer-body sheet-stage"
           scroll-top="{{orderSheetScrollTop}}" scroll-into-view="{{priceDrawerFocusId}}">
           <template is="sheet-pending-actions" data="{{draftSummary: draftSummary, choices: choices, catalogChoices: catalogChoices, memoryNames: memoryNames, busy: busy, polling: polling}}" />
           <view wx:if="{{!priceDrawerRows.length}}" class="sheet-empty">
@@ -458,7 +460,7 @@
           </block>
         </scroll-view>
 
-        <scroll-view wx:if="{{orderSheetStep === 'preview' && sheetPreview}}" scroll-y class="order-sheet-body">
+        <scroll-view wx:if="{{orderSheetStep === 'preview' && sheetPreview}}" scroll-y scroll-with-animation="{{true}}" class="order-sheet-body sheet-stage">
           <view class="preview-total">
             <text class="preview-total-label">本趟预览总金额</text>
             <text class="preview-total-amount num {{sheetPreview.allPending ? 'pending-price' : ''}}">{{sheetPreview.displayTotal}}</text>
@@ -492,7 +494,7 @@
 
         <view class="order-sheet-foot">
           <block wx:if="{{orderSheetStep === 'list' && orderSheetTab === 'pending' && priceDrawerDirty}}">
-            <button class="card-btn-ghost order-sheet-secondary" bindtap="closeOrderSheet">取消</button>
+            <button class="card-btn-ghost order-sheet-secondary" bindtap="requestCloseOrderSheet">取消</button>
             <button class="order-sheet-primary" disabled="{{busy}}" bindtap="savePriceDrawer">保存价格</button>
           </block>
           <block wx:elif="{{orderSheetStep === 'list'}}">
@@ -508,30 +510,32 @@
       </view>
     </view>
 
-    <view wx:if="{{customerSheet}}" class="sheet-mask sheet-mask-top">
-      <view class="sheet-panel">
+    <view wx:if="{{customerSheetRender}}" class="sheet-mask sheet-mask-top {{customerSheet ? 'is-open' : 'is-closing'}}"
+      bindtap="closeCustomerSheet">
+      <view class="sheet-panel {{customerSheet ? 'is-open' : 'is-closing'}}" catchtap="noop">
         <view class="sheet-header">
           <text class="sheet-title">补客户店名</text>
           <button class="card-btn-ghost sheet-close" bindtap="closeCustomerSheet">关闭</button>
         </view>
-        <text class="sheet-tip">{{customerSheet.label}}：{{memoryCustomers.length ? '填上店名，或直接点下面的常用熟客。' : '输入这家店的店名，保存后直接按新客户记。'}}</text>
-        <input class="drawer-price-input sheet-name-input" value="{{customerSheet.value}}" placeholder="输入客户店名"
-          data-customer="{{customerSheet.id}}" bindinput="editSheetCustomerName" />
+        <text class="sheet-tip">{{customerSheetRender.label}}：{{memoryCustomers.length ? '填上店名，或直接点下面的常用熟客。' : '输入这家店的店名，保存后直接按新客户记。'}}</text>
+        <input class="drawer-price-input sheet-name-input" value="{{customerSheet ? customerSheet.value : customerSheetRender.value}}" placeholder="输入客户店名"
+          confirm-type="done" data-customer="{{customerSheetRender.id}}" bindinput="editSheetCustomerName"
+          bindconfirm="saveCustomerSheet" />
         <view wx:if="{{quickCustomers.length}}" class="quick-customers">
           <text class="quick-customers-label">点选常用熟客</text>
           <view class="quick-customers-list">
             <button wx:for="{{quickCustomers}}" wx:for-item="party" wx:key="id" class="option-btn quick-customer-btn"
-              disabled="{{busy || polling}}" data-customer="{{customerSheet.id}}" data-party="{{party.id}}"
+              disabled="{{busy || polling}}" data-customer="{{customerSheetRender.id}}" data-party="{{party.id}}"
               bindtap="pickQuickCustomer">{{party.name}}</button>
           </view>
         </view>
         <picker wx:if="{{memoryNames.length > 8}}" mode="selector" range="{{memoryNames}}" disabled="{{busy || polling}}"
-          data-customer="{{customerSheet.id}}" bindchange="pickCustomerForUnnamed">
+          data-customer="{{customerSheetRender.id}}" bindchange="pickCustomerForUnnamed">
           <view class="choice-select">从全部熟客里选</view>
         </picker>
         <text wx:if="{{error}}" class="drawer-error">{{error}}</text>
         <button class="card-btn-primary sheet-save" disabled="{{busy || polling}}"
-          data-customer="{{customerSheet.id}}" bindtap="saveCustomerSheet">保存店名</button>
+          data-customer="{{customerSheetRender.id}}" bindtap="saveCustomerSheet">保存店名</button>
         <button class="card-btn-ghost sheet-cancel" bindtap="closeCustomerSheet">取消</button>
       </view>
     </view>
@@ -581,6 +585,7 @@
           <view class="voice-pad {{voicePhase === '录音中' ? 'recording' : ''}}" bindtap="voiceTap">
             <image class="voice-icon" src="{{voicePhase === '录音中' ? '/pages/agent/icons/stop.svg' : '/pages/agent/icons/mic.svg'}}" />
             <view wx:if="{{voicePhase === '录音中'}}" class="recording-dot" />
+            <text class="voice-pad-text">{{voicePhase === '录音中' ? '点一下结束' : '点一下开始说'}}</text>
           </view>
           <button wx:if="{{voiceRetry}}" class="retry-button" aria-label="重试转写" disabled="{{busy || polling}}" bindtap="retryVoice">
             <image class="retry-icon" src="/pages/agent/icons/retry.svg" />

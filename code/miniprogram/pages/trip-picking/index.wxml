@@ -5,7 +5,11 @@
     <view class="hint">登录后自动按本趟出单快照汇总整车应取货品。</view>
     <button class="btn-primary" bindtap="goAssistant">去助手登录</button>
   </view>
-  <view wx:elif="{{busy && !draft}}" class="hint">正在读取取货清单…</view>
+  <view wx:elif="{{busy && !draft}}" class="skeleton-card" aria-label="正在读取取货清单">
+    <view class="skeleton-line skeleton-line-lg"></view>
+    <view class="skeleton-line skeleton-line-md"></view>
+    <view class="skeleton-line skeleton-line-sm"></view>
+  </view>
   <view wx:elif="{{!formal}}" class="card">
     <view class="empty-title">本趟还没确认出单</view>
     <view class="hint">确认出单后，这里会自动汇总整车应取货品。</view>

@@ -314,17 +314,20 @@ Page({
     catalogChoices: [] as CatalogChoiceView[],
     memoryCustomers: [] as { id: string; name: string }[], quickCustomers: [] as { id: string; name: string }[],
     priceDrawerOpen: false, priceDrawerRows: [] as PriceDrawerRow[], priceDrawerError: '', priceDrawerFocusId: '',
-    orderSheetOpen: false, orderSheetTab: 'all' as 'all' | 'pending', orderSheetStep: 'list' as 'list' | 'preview',
+    orderSheetOpen: false, orderSheetMounted: false, orderSheetTab: 'all' as 'all' | 'pending', orderSheetStep: 'list' as 'list' | 'preview',
     orderSheetScrollTop: 0,
     sheetPreview: null as SheetPreview | null,
     priceDrawerDirty: false,
-    customerSheet: null as CustomerSheet | null, inlineCustomerDrafts: {} as Record<string, string>,
+    customerSheet: null as CustomerSheet | null, customerSheetRender: null as CustomerSheet | null,
+    inlineCustomerDrafts: {} as Record<string, string>,
   },
   draft: null as TripDraft | null,
   turns: [] as AgentTurn[],
   generation: 0,
   visible: false,
   timer: null as ReturnType<typeof setTimeout> | null,
+  orderSheetTimer: null as ReturnType<typeof setTimeout> | null,
+  customerSheetTimer: null as ReturnType<typeof setTimeout> | null,
   confirmedPreviewId: '',
   delivery: null as DeliveryProgress | null,
   memory: null as AgentMemory | null,
@@ -352,9 +355,23 @@ Page({
     if (!this.data.busy) return this.run(() => this.reload());
   },
 
+  noop() {},
+
+  clearSheetTimers() {
+    if (this.orderSheetTimer !== null) clearTimeout(this.orderSheetTimer);
+    if (this.customerSheetTimer !== null) clearTimeout(this.customerSheetTimer);
+    this.orderSheetTimer = null;
+    this.customerSheetTimer = null;
+  },
+
   onHide() {
     this.visible = false;
     this.stopPolling();
+    this.clearSheetTimers();
+    if (!this.data.orderSheetOpen && this.data.orderSheetMounted) {
+      this.setData({ orderSheetMounted: false, orderSheetTab: 'all', orderSheetStep: 'list', sheetPreview: null, priceDrawerRows: [] });
+    }
+    if (!this.data.customerSheet && this.data.customerSheetRender) this.setData({ customerSheetRender: null });
     this.voiceCapture?.cancel();
     this.pauseUpload = true;
   },
@@ -369,6 +386,7 @@ Page({
   clear() {
     this.generation++;
     this.stopPolling();
+    this.clearSheetTimers();
     clearAgentSession();
     this.draft = null;
     this.turns = [];
@@ -385,9 +403,9 @@ Page({
       issuedCard: false, voiceRetry: false, inputMode: 'text', revokeFailed: !!this.retiredToken,
       voiceCorrectionHint: '', choices: [], memoryNames: [], rememberOff: {}, memoryFailed: false, notice: '', priceHints: {}, adoptableCount: 0,
       catalogChoices: [], memoryCustomers: [], quickCustomers: [], priceDrawerOpen: false, priceDrawerRows: [],
-      priceDrawerError: '', priceDrawerFocusId: '', orderSheetOpen: false, orderSheetTab: 'all', orderSheetStep: 'list',
+      priceDrawerError: '', priceDrawerFocusId: '', orderSheetOpen: false, orderSheetMounted: false, orderSheetTab: 'all', orderSheetStep: 'list',
       orderSheetScrollTop: 0,
-      sheetPreview: null, priceDrawerDirty: false, customerSheet: null, inlineCustomerDrafts: {} });
+      sheetPreview: null, priceDrawerDirty: false, customerSheet: null, customerSheetRender: null, inlineCustomerDrafts: {} });
     applyNavTitle('录单助手');
   },
 
@@ -534,12 +552,13 @@ Page({
     if (changedMode || !sameTrip) {
       this.voiceFile = null;
       this.voiceMeta = null;
+      this.clearSheetTimers();
     }
     this.setData({ confirmed: draftConfirmed, draftsAvailable: true, polling: !!active,
       ...(changedMode || !sameTrip ? { text: '', attachments: [], readyImages: [], uploadRows: [],
         pendingMaterial: '', voiceRetry: false, inputMode: 'text', voiceCorrectionHint: '',
-        orderSheetOpen: false, orderSheetTab: 'all', orderSheetStep: 'list', sheetPreview: null,
-        orderSheetScrollTop: 0,
+        orderSheetOpen: false, orderSheetMounted: false, orderSheetTab: 'all', orderSheetStep: 'list', sheetPreview: null,
+        orderSheetScrollTop: 0, customerSheet: null, customerSheetRender: null,
         priceDrawerOpen: false, priceDrawerRows: [], priceDrawerDirty: false, priceDrawerError: '', priceDrawerFocusId: '' } : {}),
       ...(prefill ? { text: `${target.name}：`, focusInput: !active, inputMode: 'text' } : { focusInput: false }) });
     await this.loadMemory(draft, draftConfirmed, generation, token);
@@ -901,7 +920,7 @@ Page({
       try {
         const result = await this.saveCustomerChoice(draft, payload);
         if (!result) return;
-        await this.reload();
+        await this.reload(payload.choice === 'unlink' && !this.data.orderSheetOpen);
         if (this.data.orderSheetOpen) {
           this.setData({ priceDrawerError: '',
             ...(!this.data.priceDrawerDirty ? { priceDrawerRows: this.buildPriceRows() } : {}) });
@@ -923,17 +942,31 @@ Page({
     });
   },
 
+  showCustomerSheet(sheet: CustomerSheet): void {
+    if (this.customerSheetTimer !== null) {
+      clearTimeout(this.customerSheetTimer);
+      this.customerSheetTimer = null;
+    }
+    this.setData({ error: '', customerSheet: sheet, customerSheetRender: sheet });
+  },
+
   openCustomerSheet(event: WechatMiniprogram.TouchEvent): void {
     if (this.data.confirmed || this.data.busy || this.data.polling) return;
     const id = String(event.currentTarget.dataset.customer ?? '');
     const customer = this.draft?.customers.find(entry => entry.id === id);
     if (!customer) return;
-    this.setData({ error: '', customerSheet: { id, label: customer.customer.trim() || '未命名客户',
-      value: this.data.inlineCustomerDrafts[id] ?? customer.customer } });
+    this.showCustomerSheet({ id, label: customer.customer.trim() || '未命名客户',
+      value: this.data.inlineCustomerDrafts[id] ?? customer.customer });
   },
 
   closeCustomerSheet(): void {
+    if (this.customerSheetTimer !== null) clearTimeout(this.customerSheetTimer);
     this.setData({ customerSheet: null });
+    if (!this.data.customerSheetRender) return;
+    this.customerSheetTimer = setTimeout(() => {
+      this.customerSheetTimer = null;
+      if (!this.data.customerSheet) this.setData({ customerSheetRender: null });
+    }, 220);
   },
 
   editInlineCustomerName(event: WechatMiniprogram.Input) {
@@ -944,7 +977,10 @@ Page({
 
   editSheetCustomerName(event: WechatMiniprogram.Input) {
     if (!this.data.customerSheet) return;
-    this.setData({ customerSheet: { ...this.data.customerSheet, value: event.detail.value } });
+    const value = event.detail.value;
+    const updated = { ...this.data.customerSheet, value };
+    this.setData({ customerSheet: updated, customerSheetRender: updated,
+      inlineCustomerDrafts: { ...this.data.inlineCustomerDrafts, [updated.id]: value } });
   },
 
   saveInlineCustomerName(event: WechatMiniprogram.TouchEvent): Promise<void> | undefined {
@@ -960,7 +996,12 @@ Page({
   saveCustomerSheet(): Promise<void> | undefined {
     const sheet = this.data.customerSheet;
     if (!sheet) return;
-    return this.saveCustomerName(sheet.id, sheet.value, () => this.setData({ customerSheet: null }));
+    return this.saveCustomerName(sheet.id, sheet.value, () => {
+      const rest = { ...this.data.inlineCustomerDrafts };
+      delete rest[sheet.id];
+      this.setData({ inlineCustomerDrafts: rest });
+      this.closeCustomerSheet();
+    });
   },
 
   pickQuickCustomer(event: WechatMiniprogram.TouchEvent): Promise<void> | undefined {
@@ -982,7 +1023,8 @@ Page({
     if (this.data.error) return;
     const rest = { ...this.data.inlineCustomerDrafts };
     delete rest[draftCustomerId];
-    this.setData({ customerSheet: null, inlineCustomerDrafts: rest });
+    this.closeCustomerSheet();
+    this.setData({ inlineCustomerDrafts: rest });
   },
 
   async saveCustomerName(draftCustomerId: string, raw: string, onSaved: () => void): Promise<void> {
@@ -1047,11 +1089,15 @@ Page({
 
   openOrderSheet(event?: WechatMiniprogram.TouchEvent): void {
     if (!this.draft || this.data.confirmed || this.data.busy || this.data.polling) return;
+    if (this.orderSheetTimer !== null) {
+      clearTimeout(this.orderSheetTimer);
+      this.orderSheetTimer = null;
+    }
     const tab = event?.currentTarget?.dataset?.tab === 'pending' ? 'pending' : 'all';
     const lineId = String(event?.currentTarget?.dataset?.line ?? '');
     const keepDirty = Boolean(this.data.orderSheetOpen && this.data.priceDrawerDirty);
     const rows = keepDirty ? this.data.priceDrawerRows : this.buildPriceRows();
-    this.setData({ error: '', orderSheetOpen: true, orderSheetTab: tab, orderSheetStep: 'list', sheetPreview: null,
+    this.setData({ error: '', orderSheetMounted: true, orderSheetOpen: true, orderSheetTab: tab, orderSheetStep: 'list', sheetPreview: null,
       priceDrawerOpen: tab === 'pending', priceDrawerRows: rows, priceDrawerDirty: keepDirty, priceDrawerError: '',
       priceDrawerFocusId: tab === 'pending' && lineId && rows.some(row => row.lineId === lineId) ? `pf-${lineId}` : '' });
   },
@@ -1060,13 +1106,16 @@ Page({
     if (!this.draft || this.data.confirmed || this.data.busy || this.data.polling) return;
     const rows = this.buildPriceRows();
     if (!rows.length) {
-      this.setData({ priceDrawerOpen: false, orderSheetOpen: false, priceDrawerRows: [], priceDrawerFocusId: '',
-        priceDrawerDirty: false, priceDrawerError: '' });
+      this.closeOrderSheet();
       this.notify('当前没有待填价货品');
       return;
     }
+    if (this.orderSheetTimer !== null) {
+      clearTimeout(this.orderSheetTimer);
+      this.orderSheetTimer = null;
+    }
     const lineId = String(event?.currentTarget.dataset.line ?? '');
-    this.setData({ error: '', orderSheetOpen: true, orderSheetTab: 'pending', orderSheetStep: 'list', sheetPreview: null,
+    this.setData({ error: '', orderSheetMounted: true, orderSheetOpen: true, orderSheetTab: 'pending', orderSheetStep: 'list', sheetPreview: null,
       priceDrawerOpen: true, priceDrawerRows: rows, priceDrawerDirty: false, priceDrawerError: '',
       priceDrawerFocusId: lineId && rows.some(row => row.lineId === lineId) ? `pf-${lineId}` : '' });
   },
@@ -1081,9 +1130,40 @@ Page({
       priceDrawerRows, priceDrawerError: '', priceDrawerFocusId: '' });
   },
 
+  onOrderSheetMaskTap(): void {
+    if (this.data.busy) return;
+    this.requestCloseOrderSheet();
+  },
+
+  requestCloseOrderSheet(): void {
+    if (this.data.busy) return;
+    if (this.data.priceDrawerDirty && typeof wx.showModal === 'function') {
+      wx.showModal({
+        title: '放弃未保存单价',
+        content: '刚填的单价还没保存，直接关闭会丢失，确定放弃吗？',
+        confirmText: '放弃修改',
+        success: ({ confirm }) => { if (confirm) this.closeOrderSheet(); },
+        fail: () => {},
+      });
+      return;
+    }
+    this.closeOrderSheet();
+  },
+
   closeOrderSheet(): void {
-    this.setData({ orderSheetOpen: false, orderSheetTab: 'all', orderSheetStep: 'list', sheetPreview: null,
-      priceDrawerOpen: false, priceDrawerRows: [], priceDrawerDirty: false, priceDrawerError: '', priceDrawerFocusId: '' });
+    if (this.orderSheetTimer !== null) clearTimeout(this.orderSheetTimer);
+    if (!this.data.orderSheetMounted) {
+      this.setData({ orderSheetOpen: false, orderSheetTab: 'all', orderSheetStep: 'list', sheetPreview: null,
+        priceDrawerOpen: false, priceDrawerRows: [], priceDrawerDirty: false, priceDrawerError: '', priceDrawerFocusId: '' });
+      return;
+    }
+    this.setData({ orderSheetOpen: false, priceDrawerOpen: false, priceDrawerDirty: false, priceDrawerError: '', priceDrawerFocusId: '' });
+    this.orderSheetTimer = setTimeout(() => {
+      this.orderSheetTimer = null;
+      if (!this.data.orderSheetOpen) {
+        this.setData({ orderSheetMounted: false, orderSheetTab: 'all', orderSheetStep: 'list', sheetPreview: null, priceDrawerRows: [] });
+      }
+    }, 240);
   },
 
   closePriceDrawer(): void {
@@ -1202,9 +1282,9 @@ Page({
     if (unnamed.length > 0) {
       const first = unnamed[0];
       const customer = draft.customers.find(entry => entry.id === first.id);
-      this.setData({ priceDrawerError: '', error: '',
-        customerSheet: { id: first.id, label: '未命名客户',
-          value: this.data.inlineCustomerDrafts[first.id] ?? customer?.customer ?? '' } });
+      this.setData({ priceDrawerError: '' });
+      this.showCustomerSheet({ id: first.id, label: '未命名客户',
+        value: this.data.inlineCustomerDrafts[first.id] ?? customer?.customer ?? '' });
       this.notify('先填上店名就能出单');
       return;
     }
@@ -1257,7 +1337,7 @@ Page({
 
   confirmSheetPreview(): Promise<void> | undefined {
     const preview = this.data.sheetPreview;
-    if (!preview || this.data.busy || this.data.polling) return;
+    if (!this.data.orderSheetOpen || !preview || this.data.busy || this.data.polling) return;
     this.card('confirm');
     return this.run(async () => {
       try {
@@ -1374,9 +1454,28 @@ Page({
 
   retry(event: WechatMiniprogram.TouchEvent) {
     const turn = this.turns.find(item => item.id === event.currentTarget.dataset.id);
-    if (!turn || this.data.busy || this.data.polling || this.data.text.trim() || this.data.attachments.length) return;
-    this.card('retry');
-    this.setData({ text: turn.text, attachments: turn.materialIds.map((id, index) => ({ id, name: `图片 ${index + 1}` })) });
+    if (!turn || this.data.busy || this.data.polling) return;
+    const apply = () => {
+      this.card('retry');
+      this.voiceMeta = null;
+      this.setData({ text: turn.text, inputMode: 'text', focusInput: true, voiceCorrectionHint: '',
+        attachments: turn.materialIds.map((id, index) => ({ id, name: `图片 ${index + 1}` })) });
+    };
+    if (this.data.text.trim() || this.data.attachments.length) {
+      if (typeof wx.showModal === 'function') {
+        wx.showModal({
+          title: '替换输入框内容',
+          content: '输入框里已有内容，要换成这条未发成功的消息吗？',
+          confirmText: '替换重发',
+          success: ({ confirm }) => { if (confirm) apply(); },
+          fail: () => {},
+        });
+      } else {
+        this.notify('输入框已有内容，请先发送或清空');
+      }
+      return;
+    }
+    apply();
   },
 
   undo(event: WechatMiniprogram.TouchEvent) {

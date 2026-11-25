@@ -122,8 +122,10 @@
     </block>
 
     <block wx:else>
-      <view wx:if="{{turnsLoading || (busy && turnsLoadedId !== formal.id)}}" class="card">
-        <view class="hint">正在读取当趟对话记录…</view>
+      <view wx:if="{{turnsLoading || (busy && turnsLoadedId !== formal.id)}}" class="skeleton-card" aria-label="正在读取当趟对话记录">
+        <view class="skeleton-line skeleton-line-lg"></view>
+        <view class="skeleton-line skeleton-line-md"></view>
+        <view class="skeleton-line skeleton-line-sm"></view>
       </view>
       <view wx:elif="{{!tripTurns.length}}" class="card">
         <view class="hint">这一趟没有对话记录（通过手动表单出单）。</view>

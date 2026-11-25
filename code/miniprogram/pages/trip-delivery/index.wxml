@@ -5,7 +5,11 @@
     <view class="hint">登录后按门店核对送货与本次应收。</view>
     <button class="btn-primary" bindtap="goAssistant">去助手登录</button>
   </view>
-  <view wx:elif="{{busy && !draft}}" class="hint">正在读取送货单…</view>
+  <view wx:elif="{{busy && !draft}}" class="skeleton-card" aria-label="正在读取送货单">
+    <view class="skeleton-line skeleton-line-lg"></view>
+    <view class="skeleton-line skeleton-line-md"></view>
+    <view class="skeleton-line skeleton-line-sm"></view>
+  </view>
   <block wx:elif="{{sheetTarget}}">
     <view class="sheet-top-bar">
       <button class="sheet-back-btn" bindtap="closeSheet" disabled="{{busy || sheetRetry}}">‹ 全部门店</button>
@@ -15,7 +19,11 @@
       <button class="btn-primary" bindtap="retrySheetWrite" disabled="{{busy}}" loading="{{busy}}">重试本次提交</button>
     </view>
     <view wx:elif="{{sheetNeedsRefresh || !sheet}}" class="card">
-      <view wx:if="{{busy}}" class="hint">正在读取客户单…</view>
+      <view wx:if="{{busy}}" class="sheet-skeleton">
+        <view class="skeleton-line skeleton-line-lg"></view>
+        <view class="skeleton-line skeleton-line-md"></view>
+        <view class="skeleton-line skeleton-line-sm"></view>
+      </view>
       <button wx:else class="btn-primary" bindtap="refreshSheet">重新读取客户单</button>
     </view>
     <block wx:else>
@@ -45,14 +53,14 @@
             <view class="editor-row">
               <view class="editor-label">实收数量（{{item.unit}}）</view>
               <view class="stepper">
-                <button class="stepper-btn" data-delta="-1" bindtap="stepReceivedQuantity" disabled="{{busy}}">−</button>
+                <button class="stepper-btn" data-delta="-1" bindtap="stepReceivedQuantity" disabled="{{busy || fieldEdit.receivedQuantity === '0'}}">−</button>
                 <input class="stepper-input num" type="number" maxlength="16" value="{{fieldEdit.receivedQuantity}}" data-field="receivedQuantity" bindinput="editDeliveryField" disabled="{{busy}}" />
                 <button class="stepper-btn" data-delta="1" bindtap="stepReceivedQuantity" disabled="{{busy}}">+</button>
               </view>
             </view>
             <view class="editor-row">
               <view class="editor-label">单价（元）</view>
-              <input class="price-input num" type="digit" maxlength="18" value="{{fieldEdit.price}}" data-field="price" bindinput="editDeliveryField" disabled="{{busy}}" placeholder="待补价" />
+              <input class="price-input num" type="digit" maxlength="18" value="{{fieldEdit.price}}" data-field="price" bindinput="editDeliveryField" confirm-type="done" bindconfirm="saveFieldEdit" disabled="{{busy}}" placeholder="待补价" />
             </view>
             <view class="editor-actions">
               <button class="btn-secondary editor-btn" bindtap="cancelSheetAction" disabled="{{busy}}">取消</button>
@@ -62,6 +70,7 @@
         </view>
       </view>
       <view wx:if="{{!sheet.reviewed}}" class="sheet-footer-actions">
+        <view wx:if="{{fieldEdit}}" class="sheet-lock-hint">请先点上方「完成这一行」保存修改，再锁账</view>
         <button class="btn-primary sheet-lock-btn" bindtap="completeDelivery" disabled="{{busy || !!fieldEdit}}" loading="{{busy}}">确认送达并锁账</button>
         <button wx:if="{{formal && formal.id === sheet.tripId}}" class="btn-secondary sheet-voice-btn" bindtap="goAssistantDelivery" disabled="{{busy || !!fieldEdit || !!sheetRetry}}">去助手语音改单</button>
       </view>

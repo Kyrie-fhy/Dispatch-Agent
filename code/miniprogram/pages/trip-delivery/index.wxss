@@ -16,6 +16,7 @@
   padding: 28rpx;
   margin: 8rpx 0 24rpx;
   box-shadow: var(--shadow-card);
+  animation: dp-fade-up var(--dur-base) var(--ease-out);
 }
 .progress-head {
   display: flex;
@@ -62,6 +63,7 @@
   height: 100%;
   border-radius: inherit;
   background: var(--primary);
+  transition: width 360ms var(--ease-out);
 }
 .progress-pending-note {
   margin-top: 14rpx;
@@ -81,9 +83,15 @@
   border: 1rpx solid var(--hairline);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-card);
+  transition: transform var(--dur-press) var(--ease-out), background-color var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out), opacity var(--dur-base) var(--ease-out);
+  animation: dp-fade-up var(--dur-base) var(--ease-out);
 }
 .shop-card:active {
   background: var(--surface-sunken);
+  transform: scale(0.986);
+}
+.shop-card:active .shop-arrow {
+  transform: translateX(4rpx);
 }
 .shop-card-done {
   background: rgba(255, 255, 255, 0.72);
@@ -138,6 +146,7 @@
   flex: none;
   font-size: 38rpx;
   color: var(--ink-3);
+  transition: transform var(--dur-press) var(--ease-out);
 }
 .shop-next-btn {
   margin-top: 28rpx;
@@ -184,12 +193,19 @@
   font-size: 30rpx;
   font-weight: 600;
   color: var(--ink-2);
+  transition: transform var(--dur-press) var(--ease-out), background-color var(--dur-fast) var(--ease-out);
 }
 .sheet-back-btn::after {
   border: 0;
 }
 .sheet-back-btn:active {
   background: var(--surface-sunken);
+  transform: translateX(-4rpx) scale(0.975);
+}
+.sheet-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 18rpx;
 }
 
 /* ---- 门店详情 · 应收抬头 ---- */
@@ -200,6 +216,7 @@
   padding: 28rpx;
   margin: 8rpx 0 24rpx;
   box-shadow: var(--shadow-card);
+  animation: dp-fade-up var(--dur-base) var(--ease-out);
 }
 .sheet-hero-top {
   display: flex;
@@ -246,9 +263,11 @@
   padding: 0 28rpx;
   margin: 0 0 24rpx;
   box-shadow: var(--shadow-card);
+  animation: dp-fade-up var(--dur-base) var(--ease-out);
 }
 .sheet-line {
   border-bottom: 1rpx solid var(--hairline);
+  transition: background-color var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out);
 }
 .sheet-line:last-child {
   border-bottom: 0;
@@ -260,9 +279,11 @@
   gap: 20rpx;
   min-height: 104rpx;
   padding: 22rpx 0;
+  transition: opacity var(--dur-press) var(--ease-out), background-color var(--dur-fast) var(--ease-out);
 }
 .sheet-line-head-editable:active {
   background: var(--surface-sunken);
+  opacity: 0.85;
 }
 .sheet-line-main {
   flex: 1;
@@ -318,6 +339,7 @@
   border-radius: var(--radius-md);
   padding: 20rpx;
   margin-bottom: 20rpx;
+  animation: dp-fade-up var(--dur-fast) var(--ease-out);
 }
 .editor-row {
   display: flex;
@@ -353,13 +375,22 @@
   font-weight: 600;
   line-height: 1;
   color: var(--ink);
+  transition: transform var(--dur-press) var(--ease-out), background-color var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out);
 }
 .stepper-btn::after {
   border: 0;
 }
 .stepper-btn:active {
   background: var(--primary-weak);
+  border-color: var(--primary);
   color: var(--primary);
+  transform: scale(0.92);
+}
+.stepper-btn[disabled] {
+  color: var(--ink-disabled);
+  background: var(--canvas-sub);
+  border-color: var(--hairline);
+  transform: none;
 }
 .stepper-input {
   box-sizing: border-box;
@@ -408,6 +439,17 @@
   margin-top: 28rpx;
   padding: 20rpx 0 calc(20rpx + env(safe-area-inset-bottom));
   background: var(--canvas);
+}
+.sheet-lock-hint {
+  font-size: 26rpx;
+  line-height: 1.45;
+  text-align: center;
+  color: var(--warning);
+  padding: 8rpx 16rpx;
+  background: var(--warning-weak);
+  border: 1rpx solid var(--warning-line);
+  border-radius: var(--radius-sm);
+  animation: dp-fade-up var(--dur-fast) var(--ease-out);
 }
 .sheet-lock-btn {
   height: 96rpx;

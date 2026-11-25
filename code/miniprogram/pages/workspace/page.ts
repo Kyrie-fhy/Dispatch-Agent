@@ -735,7 +735,7 @@ Page({
     }
   },
 
-  writeSheet(route: string, input: object) {
+  writeSheet(route: string, input: object, successToast?: string) {
     const target = this.data.sheetTarget;
     if (!target || !this.token) return;
     return this.run(async generation => {
@@ -761,6 +761,9 @@ Page({
       catch (error) {
         if (error instanceof WorkspaceError && error.status === 401) throw error;
         throw new Error('本次操作已保存，请重新读取单据');
+      }
+      if (successToast && generation === this.generation) {
+        wx.showToast?.({ title: successToast, icon: 'success' });
       }
     });
   },
@@ -813,7 +816,8 @@ Page({
     const { sheet, fieldEdit } = this.data;
     if (!sheet || !fieldEdit || !this.sheetReady() || sheet.reviewed) return;
     return this.writeSheet('/delivery/line', { version: sheet.version, statusRevision: sheet.statusRevision,
-      lineId: fieldEdit.id, receivedQuantity: fieldEdit.receivedQuantity.trim(), price: nullablePrice(fieldEdit.price) });
+      lineId: fieldEdit.id, receivedQuantity: fieldEdit.receivedQuantity.trim(), price: nullablePrice(fieldEdit.price) },
+      '已保存这一行');
   },
 
   completeDelivery() {
@@ -830,7 +834,8 @@ Page({
         return;
       }
     }
-    return this.writeSheet('/delivery/complete', { version: sheet.version, statusRevision: sheet.statusRevision });
+    return this.writeSheet('/delivery/complete', { version: sheet.version, statusRevision: sheet.statusRevision },
+      '已确认送达并锁账');
   },
 
   markDelivery(event: WechatMiniprogram.TouchEvent) {

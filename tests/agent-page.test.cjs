@@ -2849,3 +2849,122 @@ test('6.6-4 keeps choice and catalog cards, drawer scroll and pill todos in sync
   assert.equal(wxml.includes('safe-area-inset-top'), false);
   assert.equal(emoji.test(wxml), false);
 });
+
+test('6.7-1 history archive ships the v2.0 read-only visual and honest trip totals', async t => {
+  const read = file => fs.readFileSync(require.resolve(`../code/dist/${file}`), 'utf8');
+  const wxml = read('pages/history/index.wxml');
+  const wxss = read('pages/history/index.wxss');
+  const emoji = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{26FF}\u{FE0F}]/u;
+
+  assert.equal(wxss.includes('@import'), false, '历史页不再引入旧 S5 workspace 样式');
+  assert.equal(wxml.includes('<include'), false, '历史页不再内联 workspace 取货模板');
+  assert.equal(wxml.includes('picking.wxml'), false, '历史页彻底脱离 workspace/picking.wxml');
+  for (const token of ['avatar', 'avatar mine', 'avatar helper', 'class="title"']) {
+    assert.equal(wxml.includes(token), false, `历史页不得保留旧版 ${token}`);
+  }
+  for (const token of ['picking-qty-box', 'picking-qty-other', 'deliveryProgressPercent', 'back-pill',
+    'sheet-hero-card', 'sheet-lines-card', 'status-pill', 'trip-hero-card', 'trip-card', 'turn-card',
+    '当时的待确认', '只读档案']) {
+    assert.ok(wxml.includes(token), `历史页缺少 v2.0 结构 ${token}`);
+  }
+  for (const banned of ['size="mini"', 'cover-view', 'safe-area-inset-top', '欠款', '收款',
+    '<input', 'bindinput', 'saveFieldEdit', '编辑货品']) {
+    assert.equal(wxml.includes(banned), false, `历史页只读红线被破坏：${banned}`);
+  }
+  assert.equal(emoji.test(wxml) || emoji.test(wxss), false, '历史页零 Emoji');
+  for (const token of ['.history-page', 'padding: 24rpx var(--page-x) calc(48rpx + env(safe-area-inset-bottom))',
+    '--primary-weak', '--warning-weak', 'height: 80rpx', '.trip-progress-fill']) {
+    assert.ok(wxss.includes(token), `历史页缺少 v2.0 样式 ${token}`);
+  }
+
+  const draft = order();
+  const summary = previewTrip(draft, true);
+  const formal = { trip: { id: 'trip-current', origin: 's2',
+    versions: [{ ...summary, version: 1, savedAt: '2026-11-19T00:00:00Z' }],
+    statuses: statusesFor(summary.customers, 'pending'), statusRevision: 0 },
+  picking: pickingList(summary.customers), deliveryEdits: {}, sheets: [] };
+  const rows = [
+    { id: 'trip-current', issuedAt: '2026-11-25T10:30:00Z', customers: 2, lines: 3, totalCents: 16400,
+      pendingPrices: 0, delivered: 0, current: true },
+    { id: 'trip-all-pending', issuedAt: '2026-11-24T10:30:00Z', customers: 1, lines: 1, totalCents: 0,
+      pendingPrices: 2, delivered: 1, current: false },
+    { id: 'trip-partial', issuedAt: '2026-11-23T10:30:00Z', customers: 3, lines: 4, totalCents: 8200,
+      pendingPrices: 1, delivered: 1, current: false },
+    { id: 'trip-done', issuedAt: '2026-11-22T10:30:00Z', customers: 2, lines: 2, totalCents: 16400,
+      pendingPrices: 0, delivered: 2, current: false },
+    { id: 'trip-unfinished', issuedAt: '2026-11-21T10:30:00Z', customers: 2, lines: 2, totalCents: 16400,
+      pendingPrices: 0, delivered: 1, current: false },
+  ];
+  const { page, pageFor, handle, titles } = setup(t, draft);
+  handle(request => {
+    if (request.path === '/trips') { request.ok({ trips: rows, nextBefore: null }); return true; }
+    if (request.path === '/trips/trip-current') { request.ok(formal); return true; }
+    if (request.path === '/trips/trip-current/turns') { request.ok({ tripId: 'trip-current', turns: [] }); return true; }
+    return false;
+  });
+  await page.login();
+  const history = pageFor('history');
+  await history.onShow();
+  const [current, allPending, partial, done, unfinished] = history.data.trips;
+
+  assert.equal(current.allPending, false);
+  assert.equal(current.amountDisplay, '¥164.00');
+  assert.equal(current.pendingNote, '');
+  assert.equal(current.statusLabel, '进行中');
+  assert.equal(current.statusTone, 'current');
+
+  assert.equal(allPending.allPending, true);
+  assert.equal(allPending.amountDisplay, '待补价', '全单缺价诚实显示待补价，绝不混同为 ¥0.00');
+  assert.equal(allPending.pendingNote, '');
+  assert.equal(allPending.statusLabel, '已全部送达');
+  assert.equal(allPending.statusTone, 'done');
+
+  assert.equal(partial.allPending, false);
+  assert.equal(partial.amountDisplay, '¥82.00');
+  assert.equal(partial.pendingNote, '另有 1 样待补价');
+  assert.match(partial.total, /待补价/);
+  assert.equal(partial.statusLabel, '未送完');
+  assert.equal(partial.statusTone, 'pending');
+
+  assert.equal(done.statusLabel, '已全部送达');
+  assert.equal(done.statusTone, 'done');
+  assert.equal(unfinished.statusLabel, '未送完');
+  assert.equal(unfinished.statusTone, 'pending');
+
+  await history.openTrip(tap({ id: 'trip-current' }));
+  assert.equal(history.data.formal.id, 'trip-current');
+  assert.equal(titles.at(-1), '趟次档案', '切进单趟档案同步导航标题');
+  await history.openHistoryShop(tap({ sheetId: draft.customers[0].id }));
+  assert.equal(history.data.selectedShop.customer, '老王');
+  assert.equal(titles.at(-1), '门店送货单', '只读门店详情同步导航标题');
+  history.closeHistoryShop();
+  assert.equal(history.data.selectedShop, null);
+  assert.equal(titles.at(-1), '趟次档案', '返回单趟门店列表恢复趟次档案标题');
+  history.backToList();
+  assert.equal(history.data.formal, null);
+  assert.equal(titles.at(-1), '历史', '返回趟次列表恢复历史标题');
+  assert.equal(history.saveFieldEdit, undefined, '历史页绝不出现写操作');
+});
+
+test('6.7-1 profile ships the trip status bar, side-by-side metrics and full-width retry', () => {
+  const read = file => fs.readFileSync(require.resolve(`../code/dist/${file}`), 'utf8');
+  const wxml = read('pages/profile/index.wxml');
+  const wxss = read('pages/profile/index.wxss');
+  const emoji = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{26FF}\u{FE0F}]/u;
+
+  for (const token of ['trip-status-card', 'metrics-grid', 'metric-card', 'retry-banner',
+    '记住的叫法', '货品库', '{{catalogSummary.productCount}} 种', '尚未导入', '正在同步',
+    'bindtap="login"', 'bindtap="logout"', 'bindtap="retryLoad"', 'bindtap="unbindAlias"',
+    'bindtap="openWorkspace"', '{{partyCount}} 家', '{{aliases.length}} 条', '本趟阶段']) {
+    assert.ok(wxml.includes(token), `我的页缺少 v2.0 结构或既有契约 ${token}`);
+  }
+  for (const banned of ['size="mini"', 'cover-view', 'safe-area-inset-top']) {
+    assert.equal(wxml.includes(banned), false, `我的页不得出现 ${banned}`);
+  }
+  assert.equal(emoji.test(wxml) || emoji.test(wxss), false, '我的页零 Emoji');
+  for (const token of ['grid-template-columns: repeat(2, minmax(0, 1fr))', '.retry-banner',
+    'height: 80rpx', 'width: 148rpx', 'height: 88rpx', 'var(--hairline-strong)', '.identity-card',
+    '.trip-status-dot']) {
+    assert.ok(wxss.includes(token), `我的页缺少 v2.0 样式 ${token}`);
+  }
+});

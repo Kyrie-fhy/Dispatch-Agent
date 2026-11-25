@@ -22,9 +22,20 @@ type HistoryTurnView = {
 
 function present(row: TripHistoryRow) {
   const date = new Date(row.issuedAt);
+  const allPending = row.pendingPrices > 0 && row.totalCents === 0;
+  const deliveredAll = row.customers > 0 && row.delivered >= row.customers;
   return { ...row, time: localDay(date) + ' ' +
     [date.getHours(), date.getMinutes()].map(value => String(value).padStart(2, '0')).join(':'),
-    total: amountLabel(row.totalCents, row.pendingPrices, '送货金额') };
+    total: amountLabel(row.totalCents, row.pendingPrices, '送货金额'),
+    allPending,
+    amountDisplay: allPending ? '待补价' : '¥' + money(row.totalCents),
+    pendingNote: row.pendingPrices > 0 && row.totalCents > 0 ? `另有 ${row.pendingPrices} 样待补价` : '',
+    statusLabel: row.current ? '进行中' : (deliveredAll ? '已全部送达' : '未送完'),
+    statusTone: row.current ? 'current' : (deliveredAll ? 'done' : 'pending') };
+}
+
+function syncTitle(title: string) {
+  wx.setNavigationBarTitle?.({ title });
 }
 
 function historyTurnView(turn: AgentTurn): HistoryTurnView {
@@ -70,6 +81,7 @@ Page({
       this.generation++;
       this.setData({ signedIn: !!token, trips: [], nextBefore: '', formal: null, error: '', busy: false,
         selectedTime: '', historyTab: 'delivery', selectedShopId: '', selectedShop: null, tripTurns: [], turnsLoadedId: '' });
+      syncTitle('历史');
     }
     if (!token) return;
     const id = this.data.formal?.id;
@@ -93,6 +105,7 @@ Page({
         this.token = '';
         this.setData({ signedIn: false, trips: [], formal: null, nextBefore: '', busy: false, error: '登录已失效，请重新登录。',
           selectedTime: '', historyTab: 'delivery', selectedShopId: '', selectedShop: null, tripTurns: [], turnsLoadedId: '' });
+        syncTitle('历史');
       } else this.setData({ error: errorMessage(error) });
     } finally { if (current()) this.setData({ busy: false }); }
   },
@@ -102,6 +115,7 @@ Page({
       const page = await workspaceRequest<TripHistoryPage>('GET', '/trips?limit=20' + (before ? '&before=' + before : ''), token);
       if (!current()) return;
       this.setData({ trips: [...(before ? this.data.trips : []), ...page.trips.map(present)], nextBefore: page.nextBefore ?? '' });
+      syncTitle('历史');
     });
   },
 
@@ -124,6 +138,7 @@ Page({
       const selectedShop = formal.deliveryRows.find(row => row.id === this.data.selectedShopId) ?? null;
       this.setData({ formal, selectedShopId: selectedShop?.id ?? '', selectedShop });
     });
+    if (this.data.formal?.id === id) syncTitle(this.data.selectedShop ? '门店送货单' : '趟次档案');
     if (this.data.historyTab === 'turns' && this.data.formal?.id === id) await this.loadTurns(id);
   },
 
@@ -149,13 +164,21 @@ Page({
   openHistoryShop(event: WechatMiniprogram.TouchEvent) {
     const sheetId = String(event.currentTarget.dataset.sheetId ?? '');
     const shop = this.data.formal?.deliveryRows.find(row => row.id === sheetId);
-    if (shop) this.setData({ selectedShopId: sheetId, selectedShop: shop });
+    if (shop) {
+      this.setData({ selectedShopId: sheetId, selectedShop: shop });
+      syncTitle('门店送货单');
+    }
   },
 
-  closeHistoryShop() { this.setData({ selectedShopId: '', selectedShop: null }); },
+  closeHistoryShop() {
+    this.setData({ selectedShopId: '', selectedShop: null });
+    if (this.data.formal) syncTitle('趟次档案');
+  },
 
   backToList() {
-    if (!this.data.busy) this.setData({ formal: null, selectedTime: '', historyTab: 'delivery', selectedShopId: '',
+    if (this.data.busy) return;
+    this.setData({ formal: null, selectedTime: '', historyTab: 'delivery', selectedShopId: '',
       selectedShop: null, tripTurns: [], turnsLoadedId: '', error: '' });
+    syncTitle('历史');
   },
 });

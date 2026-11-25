@@ -2154,6 +2154,36 @@ test('6.5-10 profile retries failed alias and catalog loads in place', async t =
   assert.equal(profile.data.error, '');
 });
 
+test('6.8-3 profile switches to the disabled gate when the alias load reports account_disabled', async t => {
+  const draft = order();
+  const { pageFor, handle } = setup(t, draft);
+  const profile = pageFor('profile');
+  handle(request => {
+    if (request.path === '/workspace') {
+      request.ok({ draft, parties: [], draftConfirmed: false, currentTrip: null });
+      return true;
+    }
+    if (request.path === '/customer-aliases') {
+      request.ok({ error: 'account_disabled', message: '当前账号已暂停使用，请联系管理员' }, 403);
+      return true;
+    }
+    if (request.path === '/catalog/summary') {
+      request.ok({ productCount: 12, variantCount: 20, activeVariantCount: 18,
+        discontinuedVariantCount: 2, missingUnitVariantCount: 1 });
+      return true;
+    }
+    return false;
+  });
+  await profile.onShow();
+  await profile.login();
+  assert.equal(agentSession.token, '', '遇到停用必须立刻清空本机会话');
+  assert.equal(profile.data.signedIn, false);
+  assert.equal(profile.data.authGate, 'disabled');
+  assert.equal(profile.data.disabledMessage, '当前账号已暂停使用，请联系管理员');
+  assert.equal(agentSession.disabledMessage, '当前账号已暂停使用，请联系管理员');
+  assert.equal(profile.data.error, '', '停用提示不应落成普通错误条');
+});
+
 test('6.5-10 keeps the new sheets native, equal-width and reachable', () => {
   const read = file => fs.readFileSync(require.resolve(`../code/dist/${file}`), 'utf8');
   const agentWxml = read('pages/agent/index.wxml');

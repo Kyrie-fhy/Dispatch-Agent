@@ -888,6 +888,7 @@ export const adminOpsScript = `
     }
     var switchAccount = target.closest('[data-account-switch]');
     if (switchAccount) {
+      App.closeModal();
       App.clearMaterialUrls();
       state.accountId = switchAccount.getAttribute('data-account-switch');
       state.dashboard = null;

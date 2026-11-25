@@ -134,9 +134,17 @@ export const adminShellScript = `
     if (!date) return '—';
     return fmtDay(iso) + ' ' + pad2(date.getHours()) + ':' + pad2(date.getMinutes());
   };
+  var centsToYuan = function (cents) {
+    var n = Number(cents);
+    if (cents === null || cents === undefined || !Number.isSafeInteger(n)) return '';
+    var sign = n < 0 ? '-' : '';
+    var s = String(Math.abs(n));
+    while (s.length < 3) s = '0' + s;
+    return sign + s.slice(0, -2) + '.' + s.slice(-2);
+  };
   var moneyText = function (cents) {
-    if (cents === null || cents === undefined || !isFinite(Number(cents))) return '待补价';
-    return '¥' + (Number(cents) / 100).toFixed(2);
+    var yuan = centsToYuan(cents);
+    return yuan ? '¥' + yuan : '待补价';
   };
   var moneyHtml = function (cents, pendingCount) {
     var pending = Number(pendingCount) || 0;
@@ -311,9 +319,11 @@ export const adminShellScript = `
     root.classList.add('hidden');
     root.innerHTML = '';
   };
+  var modalSeq = 0;
   var openModal = function (options) {
     var root = el('modalRoot');
     if (!root) return null;
+    var mySeq = ++modalSeq;
     var title = options.title || '请确认';
     var confirmText = options.confirmText || '确定';
     var tone = options.confirmTone === 'danger' ? 'btn-danger' : 'btn-primary';
@@ -348,7 +358,7 @@ export const adminShellScript = `
       }
       Promise.resolve(result).then(function (keepOpen) {
         if (keepOpen === false) { reset(); return; }
-        closeModal();
+        if (mySeq === modalSeq) closeModal();
       }, function (error) {
         reset();
         toast(error && error.message ? error.message : '操作失败', 'error');
@@ -532,6 +542,7 @@ export const adminShellScript = `
   });
   var accountSelect = el('accountSelect');
   if (accountSelect) accountSelect.addEventListener('change', function (event) {
+    closeModal();
     clearMaterialUrls();
     state.accountId = event.target.value;
     state.dashboard = null;
@@ -573,6 +584,7 @@ export const adminShellScript = `
   App.state = state;
   App.views = views;
   App.esc = esc;
+  App.centsToYuan = centsToYuan;
   App.moneyText = moneyText;
   App.moneyHtml = moneyHtml;
   App.fmtDay = fmtDay;

@@ -19,6 +19,9 @@ const { DraftStore } = require('../../code/server-dist/server/drafts');
 const { startLocalServer } = require('../../code/server-dist/server/main');
 const { MaterialStore } = require('../../code/server-dist/server/materials');
 const { migrate } = require('../../code/server-dist/server/migrate');
+const { adminDataScript } = require('../../code/server-dist/server/admin/page-data');
+const { adminOpsScript } = require('../../code/server-dist/server/admin/page-ops');
+const { adminShellHtml, adminShellScript } = require('../../code/server-dist/server/admin/page-shell');
 
 const adminToken = 'test-admin-v2-isolated-secret';
 const appId = 'wx0123456789abcdef';
@@ -145,6 +148,390 @@ async function protectFormalTables(owner) {
   }
 }
 
+/* ============ 后台页面离线事件模拟（最小 DOM + fetch） ============ */
+
+const adminHtmlEntities = { amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'" };
+const adminDecodeHtml = value => String(value).replace(/&(amp|lt|gt|quot|#39);/g, (_, code) => adminHtmlEntities[code]);
+
+function adminAttrSelector(node, name, expected) {
+  if (!node.hasAttribute(name)) return false;
+  return expected === undefined || node.getAttribute(name) === expected;
+}
+
+function adminMatchesSimple(node, rawSelector) {
+  if (!node || node.nodeType !== 1) return false;
+  for (const part of rawSelector.split(',').map(value => value.trim()).filter(Boolean)) {
+    let rest = part;
+    let matched = true;
+    const tag = rest.match(/^[a-zA-Z][\w-]*/);
+    if (tag) {
+      matched = node.tagName === tag[0].toUpperCase();
+      rest = rest.slice(tag[0].length);
+    }
+    for (const attr of rest.matchAll(/\[([^\]=]+)(?:=(?:"([^"]*)"|'([^']*)'|([^\]]+)))?\]/g)) {
+      const expected = attr[2] ?? attr[3] ?? attr[4];
+      matched = matched && adminAttrSelector(node, attr[1], expected);
+    }
+    for (const id of rest.matchAll(/#([\w-]+)/g)) {
+      matched = matched && node.getAttribute('id') === id[1];
+    }
+    for (const cls of rest.matchAll(/\.([\w-]+)/g)) {
+      matched = matched && node.classList.contains(cls[1]);
+    }
+    if (rest.includes(':checked')) matched = matched && (node.checked === true || node.hasAttribute('checked'));
+    if (matched) return true;
+  }
+  return false;
+}
+
+function adminSelectorParts(selector) {
+  const parts = [];
+  let current = '';
+  let depth = 0;
+  let quote = '';
+  for (const ch of selector) {
+    if (quote) {
+      current += ch;
+      if (ch === quote) quote = '';
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; current += ch; continue; }
+    if (ch === '[') depth += 1;
+    if (ch === ']') depth -= 1;
+    if (/\s/.test(ch) && depth === 0) {
+      if (current) { parts.push(current); current = ''; }
+      continue;
+    }
+    current += ch;
+  }
+  if (current) parts.push(current);
+  return parts;
+}
+
+class AdminClassList {
+  constructor(node) { this.node = node; }
+  values() { return new Set(String(this.node.getAttribute('class') || '').split(/\s+/).filter(Boolean)); }
+  write(values) { this.node.setAttribute('class', [...values].join(' ')); }
+  add(name) { const values = this.values(); values.add(name); this.write(values); }
+  remove(name) { const values = this.values(); values.delete(name); this.write(values); }
+  contains(name) { return this.values().has(name); }
+  toggle(name, force) {
+    const values = this.values();
+    const enabled = force === undefined ? !values.has(name) : Boolean(force);
+    if (enabled) values.add(name); else values.delete(name);
+    this.write(values);
+    return enabled;
+  }
+}
+
+class AdminNode {
+  constructor(document, tagName) {
+    this.ownerDocument = document;
+    this.nodeType = 1;
+    this.tagName = String(tagName).toUpperCase();
+    this.attributes = {};
+    this.childNodes = [];
+    this.children = [];
+    this.parentNode = null;
+    this.listeners = {};
+    this.style = {};
+    this.classList = new AdminClassList(this);
+    this._value = undefined;
+    this._checked = undefined;
+    this._textContent = null;
+    this._innerHTML = '';
+  }
+  get id() { return this.getAttribute('id') || ''; }
+  get className() { return this.getAttribute('class') || ''; }
+  set className(value) { this.setAttribute('class', value); }
+  get isConnected() {
+    let node = this;
+    while (node) { if (node === this.ownerDocument.body) return true; node = node.parentNode; }
+    return false;
+  }
+  get firstChild() { return this.childNodes[0] || null; }
+  get textContent() {
+    if (this._textContent !== null) return this._textContent;
+    return this.childNodes.map(node => typeof node === 'string' ? node : node.textContent).join('');
+  }
+  set textContent(value) {
+    this._textContent = String(value);
+    this.childNodes = [];
+    this.children = [];
+  }
+  get innerHTML() { return this._innerHTML; }
+  set innerHTML(value) {
+    this._innerHTML = String(value === null || value === undefined ? '' : value);
+    this._textContent = null;
+    this.childNodes = [];
+    this.children = [];
+    for (const node of parseAdminHtml(this._innerHTML, this.ownerDocument)) this.appendChild(node);
+  }
+  get value() {
+    if (this._value !== undefined) return this._value;
+    if (this.tagName === 'SELECT') {
+      const options = this.querySelectorAll('option');
+      const selected = options.find(option => option.hasAttribute('selected')) || options[0];
+      return selected ? (selected.getAttribute('value') ?? selected.textContent.trim()) : '';
+    }
+    if (this.hasAttribute('value')) return this.getAttribute('value');
+    if (this.tagName === 'TEXTAREA') return this.textContent;
+    return '';
+  }
+  set value(value) { this._value = String(value); }
+  get checked() {
+    if (this._checked !== undefined) return this._checked;
+    return this.hasAttribute('checked');
+  }
+  set checked(value) { this._checked = Boolean(value); }
+  get disabled() { return this.hasAttribute('disabled'); }
+  set disabled(value) { if (value) this.setAttribute('disabled', ''); else this.removeAttribute('disabled'); }
+  appendChild(node) {
+    if (typeof node === 'string') node = node;
+    if (typeof node !== 'string') {
+      if (node.parentNode) node.parentNode.removeChild(node);
+      node.parentNode = this;
+    }
+    this._textContent = null;
+    this.childNodes.push(node);
+    if (typeof node !== 'string') this.children.push(node);
+    return node;
+  }
+  removeChild(node) {
+    this.childNodes = this.childNodes.filter(child => child !== node);
+    if (typeof node !== 'string') this.children = this.children.filter(child => child !== node);
+    if (typeof node !== 'string' && node.parentNode === this) node.parentNode = null;
+    return node;
+  }
+  setAttribute(name, value) {
+    this.attributes[name] = String(value);
+  }
+  getAttribute(name) { return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null; }
+  hasAttribute(name) { return Object.prototype.hasOwnProperty.call(this.attributes, name); }
+  removeAttribute(name) { delete this.attributes[name]; }
+  addEventListener(type, listener) { (this.listeners[type] ||= []).push(listener); }
+  removeEventListener(type, listener) {
+    this.listeners[type] = (this.listeners[type] || []).filter(item => item !== listener);
+  }
+  closest(selector) {
+    let node = this;
+    while (node && node.nodeType === 1) {
+      if (adminMatchesSimple(node, selector)) return node;
+      node = node.parentNode;
+    }
+    return null;
+  }
+  matches(selector) { return adminMatchesSimple(this, selector); }
+  querySelectorAll(selector) {
+    const parts = adminSelectorParts(selector);
+    if (!parts.length) return [];
+    let search = [this];
+    let found = [];
+    for (const part of parts) {
+      found = [];
+      const seen = new Set();
+      for (const root of search) {
+        const candidates = [root, ...adminDescendants(root)];
+        for (const candidate of candidates) {
+          if (seen.has(candidate) || !adminMatchesSimple(candidate, part)) continue;
+          seen.add(candidate);
+          found.push(candidate);
+        }
+      }
+      search = found;
+    }
+    return found;
+  }
+  querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+  focus() {}
+  select() {}
+  click() { this.ownerDocument.__fire(this, 'click'); }
+  scrollIntoView() {}
+}
+
+function adminDescendants(node) {
+  const list = [];
+  for (const child of node.children) {
+    list.push(child);
+    list.push(...adminDescendants(child));
+  }
+  return list;
+}
+
+function parseAdminHtml(html, document) {
+  const voidTags = new Set(['BR', 'HR', 'IMG', 'INPUT', 'META', 'LINK']);
+  const root = new AdminNode(document, 'template');
+  const stack = [root];
+  const source = String(html);
+  const tokenRe = /<!--[\s\S]*?-->|<\/([a-zA-Z][\w:-]*)\s*>|<([a-zA-Z][\w:-]*)((?:\s+[^<>]*?)?)\s*(\/?)>/g;
+  let last = 0;
+  let match;
+  const addText = text => {
+    if (!text) return;
+    const value = adminDecodeHtml(text);
+    stack[stack.length - 1].appendChild(value);
+  };
+  while ((match = tokenRe.exec(source))) {
+    addText(source.slice(last, match.index));
+    last = tokenRe.lastIndex;
+    if (match[1]) {
+      const tag = match[1].toUpperCase();
+      for (let index = stack.length - 1; index > 0; index--) {
+        if (stack[index].tagName === tag) { stack.length = index; break; }
+      }
+      continue;
+    }
+    if (!match[2]) continue;
+    const node = new AdminNode(document, match[2]);
+    const attrs = match[3] || '';
+    for (const attr of attrs.matchAll(/([^\s=/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g)) {
+      node.setAttribute(attr[1], adminDecodeHtml(attr[2] ?? attr[3] ?? attr[4] ?? ''));
+    }
+    stack[stack.length - 1].appendChild(node);
+    if (!voidTags.has(node.tagName) && match[4] !== '/') stack.push(node);
+  }
+  addText(source.slice(last));
+  return root.childNodes;
+}
+
+function createAdminDocument() {
+  const document = {
+    listeners: {},
+    createElement(tag) { return new AdminNode(document, tag); },
+    getElementById(id) {
+      const found = document.body.querySelector('#' + id);
+      return found;
+    },
+    querySelector(selector) { return document.body.querySelector(selector); },
+    querySelectorAll(selector) { return document.body.querySelectorAll(selector); },
+    addEventListener(type, listener) { (document.listeners[type] ||= []).push(listener); },
+    removeEventListener(type, listener) {
+      document.listeners[type] = (document.listeners[type] || []).filter(item => item !== listener);
+    },
+    __fire(node, type, extra) {
+      const event = { type, target: node, currentTarget: node, preventDefault() {}, stopPropagation() {}, ...extra };
+      let current = node;
+      while (current) {
+        for (const listener of (current.listeners?.[type] || []).slice()) listener.call(current, event);
+        current = current.parentNode;
+      }
+      for (const listener of (document.listeners[type] || []).slice()) listener.call(document, event);
+    },
+  };
+  document.body = new AdminNode(document, 'body');
+  return document;
+}
+
+const adminJson = (status, data) => ({
+  status,
+  ok: status >= 200 && status < 300,
+  text: () => Promise.resolve(data === undefined ? '' : JSON.stringify(data)),
+  blob: () => Promise.resolve(new Blob([JSON.stringify(data ?? null)])),
+});
+
+const adminFlush = async (rounds = 20) => {
+  for (let index = 0; index < rounds; index++) await new Promise(resolve => setImmediate(resolve));
+};
+
+const adminAccounts = [
+  { id: 'A', remarkName: '甲配送', disabled: false, missingUnitCount: 0, openMistakeCount: 0 },
+  { id: 'B', remarkName: '乙配送', disabled: false, missingUnitCount: 0, openMistakeCount: 0 },
+];
+
+function adminCatalogFixture(overrides = {}) {
+  return {
+    catalogRevision: 7,
+    importedAt: '2026-10-01T10:00:00Z',
+    categories: ['冻品'],
+    summary: { productCount: 1, variantCount: 1, activeVariantCount: 1, discontinuedVariantCount: 0, missingUnitVariantCount: 0 },
+    items: [{
+      productId: 'p-fish', variantId: 'v-fish', product: '鱼豆腐', brand: '安井', category: '冻品',
+      packaging: '袋装', flavorOrGrade: '原味', specification: '500g', unit: '箱', priceCents: 1980,
+      status: 'active', aliases: ['鱼豆腐', '鱼腐'], brandAliases: ['安井', '安景'],
+      productCode: 'FISH', variantCode: 'V001',
+    }],
+    ...overrides,
+  };
+}
+
+function createAdminHarness(options = {}) {
+  const document = createAdminDocument();
+  document.body.innerHTML = adminShellHtml;
+  const calls = [];
+  const catalog = options.catalog || adminCatalogFixture();
+  const records = options.records || [];
+  const fallback = call => {
+    const path = call.url.replace('/admin/api', '');
+    if (path === '/accounts') return adminJson(200, { accounts: adminAccounts });
+    if (path === '/system/status') return adminJson(200, { database: { reachable: true }, wechat: {}, models: {} });
+    if (path === '/activation-codes') return adminJson(200, { records });
+    if (path === '/prompts') return adminJson(200, { prompts: [] });
+    if (/^\/accounts\/[^/]+\/dashboard$/.test(path)) {
+      return adminJson(200, { pulse: {}, todos: {}, ai7d: {} });
+    }
+    if (/^\/accounts\/[^/]+\/catalog$/.test(path)) return adminJson(200, catalog);
+    if (/^\/accounts\/[^/]+\/customers$/.test(path)) return adminJson(200, { customers: [] });
+    if (/^\/accounts\/[^/]+\/quality-turns/.test(path)) return adminJson(200, { turns: [] });
+    if (/^\/accounts\/[^/]+\/mistakes/.test(path)) return adminJson(200, { mistakes: [] });
+    return adminJson(200, { catalogRevision: catalog.catalogRevision + 1, item: catalog.items[0] });
+  };
+  const fetch = (url, init = {}) => {
+    const call = {
+      url: String(url),
+      method: init.method || 'GET',
+      headers: init.headers || {},
+      body: typeof init.body === 'string' ? JSON.parse(init.body) : undefined,
+    };
+    calls.push(call);
+    let response;
+    try { response = options.handler ? options.handler(call, calls) : undefined; }
+    catch (error) { response = Promise.reject(error); }
+    return Promise.resolve(response === undefined ? fallback(call) : response);
+  };
+  const storage = new Map();
+  const sandbox = {
+    document,
+    sessionStorage: {
+      getItem: key => storage.has(key) ? storage.get(key) : null,
+      setItem: (key, value) => storage.set(key, String(value)),
+      removeItem: key => storage.delete(key),
+    },
+    fetch,
+    navigator: {},
+    URL: { createObjectURL: () => 'blob:admin', revokeObjectURL() {} },
+    console,
+    setTimeout: (callback, delay) => (delay >= 1000 ? 0 : setTimeout(callback, 0)),
+    clearTimeout,
+  };
+  sandbox.window = sandbox;
+  const context = vm.createContext(sandbox);
+  for (const script of [adminShellScript, adminOpsScript, adminDataScript]) {
+    new vm.Script(script).runInContext(context);
+  }
+  const App = sandbox.__dispatchAdmin;
+  assert.ok(App, '后台脚本应挂载 window.__dispatchAdmin');
+  const fire = (node, type, extra) => {
+    assert.ok(node, '事件目标节点应存在');
+    document.__fire(node, type, extra);
+  };
+  const waitFor = async (predicate, label) => {
+    for (let index = 0; index < 100; index++) {
+      if (predicate()) return;
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    assert.fail('Timed out waiting for ' + label);
+  };
+  const openSection = async section => {
+    sandbox.sessionStorage.setItem('dispatchAdminToken', 'test-admin-token');
+    App.state.token = 'test-admin-token';
+    await App.loadAccounts();
+    App.navigate(section);
+    await adminFlush();
+  };
+  return { document, App, calls, fire, waitFor, openSection, catalog };
+}
+
+
 async function addTurn(owner, accountId, draft, { status = 'completed', text = '', events = [], timestamp = new Date(), undone = false } = {}) {
   const id = randomUUID();
   await owner.query(`INSERT INTO dispatch.agent_turns
@@ -167,6 +554,151 @@ test('activation configuration preserves explicit local and trial choices', () =
   assert.equal(configuredActivation({ DISPATCH_SERVER_MODE: 'trial', DISPATCH_REQUIRE_ACTIVATION: '0' }).requireActivation, false);
   assert.equal(configuredActivation({ DISPATCH_SERVER_MODE: 'trial', DISPATCH_REQUIRE_ACTIVATION: 'false' }).requireActivation, false);
   assert.equal(configuredActivation({ DISPATCH_ADMIN_TOKEN: 'fallback', DISPATCH_ACTIVATION_PEPPER: 'explicit' }).activationPepper, 'explicit');
+});
+
+test('admin v2 offline keeps existing product aliases when adding a variant and hides generated codes', async () => {
+  const catalog = adminCatalogFixture();
+  catalog.items.push({
+    productId: 'p-manual', variantId: 'v-manual', product: '手工鱼丸', brand: '自制', category: '冻品',
+    packaging: '', flavorOrGrade: '', specification: '500g', unit: '袋', priceCents: 1200,
+    status: 'active', aliases: [], brandAliases: [],
+    productCode: 'M-123e4567-e89b-12d3-a456-426614174000',
+    variantCode: 'V-123e4567-e89b-12d3-a456-426614174000',
+  });
+  const harness = createAdminHarness({ catalog });
+  await harness.openSection('catalog');
+  await harness.waitFor(() => harness.document.querySelector('#catalogRows'), 'catalog rows');
+  const rowsText = harness.document.querySelector('#catalogRows').textContent;
+  assert.ok(rowsText.includes('手工建档'), '自动生成的货号应显示为手工建档');
+  assert.equal(rowsText.includes('123e4567'), false, '列表不得暴露自动生成货号的完整 UUID');
+  assert.ok(rowsText.includes('FISH / V001'), 'CSV 人类货号应照常展示');
+
+  harness.fire(harness.document.querySelector('[data-catalog-add]'), 'click');
+  const picker = harness.document.querySelector('#catalogEditorProduct');
+  assert.equal(picker.value, '__new__');
+  picker.value = 'p-fish';
+  harness.fire(picker, 'change');
+  assert.equal(harness.document.querySelector('#catAliases').value, '鱼豆腐、鱼腐');
+  assert.equal(harness.document.querySelector('#catBrandAliases').value, '安井、安景');
+  harness.document.querySelector('#catPrice').value = '20.00';
+  harness.fire(harness.document.querySelector('#modalRoot [data-modal-confirm]'), 'click');
+  await harness.waitFor(() => harness.calls.some(call => call.method === 'POST' && call.url.endsWith('/catalog/items')),
+    'new variant request');
+  const posted = harness.calls.find(call => call.method === 'POST' && call.url.endsWith('/catalog/items'));
+  assert.equal(posted.url, '/admin/api/accounts/A/catalog/items');
+  assert.equal(posted.body.productId, 'p-fish');
+  assert.equal(posted.body.priceCents, 2000);
+  assert.equal('aliases' in posted.body, false, '未改别名时不得发送清空数组');
+  assert.equal('brandAliases' in posted.body, false, '未改品牌别名时不得发送清空数组');
+});
+
+test('admin v2 offline closes account-scoped modals when the viewed courier changes', async () => {
+  const harness = createAdminHarness({ catalog: adminCatalogFixture() });
+  await harness.openSection('catalog');
+  await harness.waitFor(() => harness.document.querySelector('#catalogRows'), 'catalog rows');
+  harness.fire(harness.document.querySelector('[data-catalog-add]'), 'click');
+  const staleConfirm = harness.document.querySelector('#modalRoot [data-modal-confirm]');
+  assert.ok(staleConfirm);
+  const select = harness.document.querySelector('#accountSelect');
+  select.value = 'B';
+  harness.fire(select, 'change');
+  await harness.waitFor(() => harness.App.state.accountId === 'B' && harness.document.querySelector('#catalogRows'),
+    'courier B catalog');
+  const modal = harness.document.querySelector('#modalRoot');
+  assert.equal(modal.classList.contains('hidden'), true, '切换配送员后弹窗必须关闭');
+  assert.equal(modal.innerHTML, '');
+  harness.fire(staleConfirm, 'click');
+  await adminFlush(30);
+  assert.equal(harness.calls.some(call => call.method === 'POST' && call.url.includes('/accounts/B/')), false,
+    '原账号弹窗的旧确认不得写到新账号');
+});
+
+test('admin v2 offline ignores a late test-query reply from the previous courier', async () => {
+  let releaseA;
+  const harness = createAdminHarness({
+    catalog: adminCatalogFixture(),
+    handler(call) {
+      if (call.method === 'POST' && call.url === '/admin/api/accounts/A/catalog/test-query') {
+        return new Promise(resolve => {
+          releaseA = () => resolve(adminJson(200, { status: 'active', priceCents: 111, priceSource: 'catalog',
+            item: null, candidates: [], reason: 'A-only' }));
+        });
+      }
+      if (call.method === 'POST' && call.url === '/admin/api/accounts/B/catalog/test-query') {
+        return adminJson(200, { status: 'active', priceCents: 222, priceSource: 'catalog',
+          item: null, candidates: [], reason: 'B-only' });
+      }
+      return undefined;
+    },
+  });
+  await harness.openSection('catalog');
+  await harness.waitFor(() => harness.document.querySelector('[data-catalog-query]'), 'catalog query button');
+  harness.document.querySelector('#catalog-query-text').value = '安井鱼豆腐500g 2箱';
+  harness.fire(harness.document.querySelector('[data-catalog-query]'), 'click');
+  await harness.waitFor(() => Boolean(releaseA), 'pending A query');
+  const select = harness.document.querySelector('#accountSelect');
+  select.value = 'B';
+  harness.fire(select, 'change');
+  await harness.waitFor(() => harness.App.state.accountId === 'B' && harness.document.querySelector('#catalogRows'),
+    'courier B catalog');
+  releaseA();
+  await adminFlush(30);
+  const box = harness.document.querySelector('#catalog-query-result');
+  assert.equal(box.textContent.includes('A-only'), false, 'A 的迟到回包不得渲染到 B 页面');
+  assert.equal(box.textContent.includes('1.11'), false, 'A 的价格不得出现在 B 页面');
+  harness.document.querySelector('#catalog-query-text').value = '乙店查询';
+  harness.fire(harness.document.querySelector('[data-catalog-query]'), 'click');
+  await harness.waitFor(() => box.textContent.includes('B-only'), 'courier B query result');
+});
+
+test('admin v2 offline edits a large safe-integer price without dropping one cent', async () => {
+  const catalog = adminCatalogFixture();
+  catalog.items.push({
+    productId: 'p-big', variantId: 'v-big', product: '大额货品', brand: '测试', category: '冻品',
+    packaging: '', flavorOrGrade: '', specification: '1件', unit: '件', priceCents: 9007199254740982,
+    status: 'active', aliases: [], brandAliases: [], productCode: 'BIG', variantCode: 'BIG-1',
+  });
+  const harness = createAdminHarness({ catalog });
+  await harness.openSection('catalog');
+  await harness.waitFor(() => harness.document.querySelector('[data-catalog-edit="v-big"]'), 'big price edit button');
+  assert.equal(harness.App.centsToYuan(9007199254740982), '90071992547409.82');
+  harness.fire(harness.document.querySelector('[data-catalog-edit="v-big"]'), 'click');
+  assert.equal(harness.document.querySelector('#catPrice').value, '90071992547409.82');
+  harness.fire(harness.document.querySelector('#modalRoot [data-modal-confirm]'), 'click');
+  await harness.waitFor(() => harness.calls.some(call => call.method === 'PATCH' && call.url.endsWith('/catalog/variants/v-big')),
+    'big price PATCH');
+  const patched = harness.calls.find(call => call.method === 'PATCH' && call.url.endsWith('/catalog/variants/v-big'));
+  assert.equal(patched.body.priceCents, 9007199254740982);
+});
+
+test('admin v2 offline keeps the reissued one-time code modal open', async () => {
+  let reissued = false;
+  const first = { id: 'c1', remarkName: '甲配送', status: 'unused', codeHint: 'DZ-****', createdAt: '2026-10-01T10:00:00Z' };
+  const second = { id: 'c2', remarkName: '甲配送', status: 'unused', codeHint: 'DZ-****', createdAt: '2026-10-01T10:05:00Z' };
+  const harness = createAdminHarness({
+    records: [first],
+    handler(call) {
+      if (call.method === 'GET' && call.url.endsWith('/activation-codes')) {
+        return adminJson(200, { records: reissued ? [second] : [first] });
+      }
+      if (call.method === 'POST' && call.url.endsWith('/activation-codes/c1/reissue')) {
+        reissued = true;
+        return adminJson(200, { revokedId: 'c1', code: 'DZ-AAAA-BBBB', record: second });
+      }
+      return undefined;
+    },
+  });
+  await harness.openSection('accounts');
+  await harness.waitFor(() => harness.document.querySelector('[data-code-reissue="c1"]'), 'reissue button');
+  harness.fire(harness.document.querySelector('[data-code-reissue="c1"]'), 'click');
+  assert.ok(harness.document.querySelector('#modalRoot [data-modal-confirm]'));
+  harness.fire(harness.document.querySelector('#modalRoot [data-modal-confirm]'), 'click');
+  await harness.waitFor(() => harness.document.querySelector('#modalRoot').textContent.includes('DZ-AAAA-BBBB'),
+    'new one-time code');
+  await adminFlush(30);
+  const modal = harness.document.querySelector('#modalRoot');
+  assert.equal(modal.classList.contains('hidden'), false, '旧确认流程不得关闭新码弹窗');
+  assert.ok(modal.textContent.includes('一次性开通码已生成'));
 });
 
 test('admin dispatch rejects methods, authentication and cross-origin writes before database access', async () => {

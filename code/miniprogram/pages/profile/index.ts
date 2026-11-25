@@ -114,13 +114,16 @@ Page({
     });
     const [aliasResult, catalogResult] = await Promise.all([
       workspaceRequest<{ aliases: AliasView[] }>('GET', '/customer-aliases', token).then(
-        ({ aliases }) => ({ aliases, error: '' }),
-        () => ({ aliases: null, error: '叫法列表没加载出来' })),
+        ({ aliases }) => ({ aliases, error: '', failure: null as unknown }),
+        (failure: unknown) => ({ aliases: null, error: '叫法列表没加载出来', failure })),
       workspaceRequest<CatalogSummary>('GET', '/catalog/summary', token).then(
-        summary => ({ summary, error: '' }),
-        () => ({ summary: null, error: '货品库信息没加载出来' })),
+        summary => ({ summary, error: '', failure: null as unknown }),
+        (failure: unknown) => ({ summary: null, error: '货品库信息没加载出来', failure })),
     ]);
     if (generation !== this.generation || token !== agentSession.token) return;
+    const disabledError = [aliasResult.failure, catalogResult.failure].find(error =>
+      error instanceof WorkspaceError && error.status === 403 && error.code === 'account_disabled');
+    if (disabledError) { this.showError(disabledError); return; }
     if (aliasResult.aliases) this.setData({ aliases: aliasResult.aliases.map(({ alias, canonicalName }) =>
       ({ alias, canonicalName })), aliasesLoaded: true, aliasError: '' });
     else this.setData({ aliasError: aliasResult.error });

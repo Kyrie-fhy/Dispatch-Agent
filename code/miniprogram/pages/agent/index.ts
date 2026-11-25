@@ -1,10 +1,10 @@
 import type { AgentEvent, AgentStatus, AgentTurn, DeliveryCardState, DeliveryProgress, DeliveryProposal, DirectIntent, PlanStep, Question, StepState } from '../../core/agent';
 import type { CustomerMention, DraftPriceSuggestion } from '../../core/memory';
-import { money, nullablePrice, validTextPrice } from '../../core/orders';
+import { lineAmount, money, nullablePrice, validTextPrice, yuanToCents } from '../../core/orders';
 import type { ItemInput } from '../../core/orders';
 import { materialImagePattern, Material, MaterialSource } from '../../core/materials';
 import { textOrderLimit, textOrderQuestions } from '../../core/text-order';
-import type { TripDraft } from '../../core/trips';
+import type { TripDraft, TripPreview } from '../../core/trips';
 import { agentSession } from '../../services/agent-session';
 import { newId } from '../../services/ids';
 import { chooseMaterial, forgetStaged, materialInfo, sameMaterial, stagedMaterials, stageMaterial,
@@ -26,7 +26,7 @@ type CatalogCandidate = { productId: string; variantId: string; product: string;
   unit: string | null; priceCents: number; status: 'active' | 'discontinued' };
 type CatalogChoice = { draftCustomerId: string; lineId: string; status: 'ambiguous'; priceHint: string | null;
   candidates: CatalogCandidate[] };
-type CatalogCandidateView = { variantId: string; label: string; warn: boolean };
+type CatalogCandidateView = { variantId: string; label: string; name: string; priceLabel: string; warn: boolean };
 type CatalogChoiceView = { draftCustomerId: string; lineId: string; customerName: string; lineLabel: string; hint: string;
   candidates: CatalogCandidateView[] };
 type PriceUpdate = { draftCustomerId: string; lineId: string; product: string; beforePrice: string | null;
@@ -46,6 +46,11 @@ type PriceDrawerRow = { lineId: string; draftCustomerId: string; customerName: s
   productName: string; quantity: string; unit: string; price: string; metaLabel: string; discontinued: boolean;
   refButtons: { value: string; label: string }[]; showSpec: boolean;
   inputUnit: string; inputSpecification: string; originalUnit: string; originalSpecification: string };
+type SheetPreviewCustomer = ReturnType<typeof tripView>['customers'][number] & {
+  pendingPrices: number; allPending: boolean; displayTotal: string };
+type SheetPreview = Omit<ReturnType<typeof tripView>, 'customers'> & {
+  id: string; pendingPrices: number; allPending: boolean; displayTotal: string;
+  customers: SheetPreviewCustomer[] };
 type CustomerSheet = { id: string; label: string; value: string };
 const draftConflicts = ['draft_changed', 'draft_confirmed', 'draft_not_found', 'preview_not_found', 'material_draft_changed'];
 const choiceConflicts = ['draft_changed', 'draft_confirmed', 'draft_not_found', 'agent_busy', 'customer_already_linked',
@@ -74,6 +79,8 @@ function catalogCandidateView(candidate: CatalogCandidate): CatalogCandidateView
   const price = money(candidate.priceCents);
   const priced = candidate.unit ? `· ${candidate.unit} ¥${price}` : `· 库内 ¥${price}（未标单位）`;
   return { variantId: candidate.variantId, warn: candidate.status === 'discontinued',
+    name: name || '未命名货品',
+    priceLabel: candidate.unit ? `¥${price}/${candidate.unit}` : `库内 ¥${price}`,
     label: `${name} ${priced}${candidate.status === 'discontinued' ? ' · 已下架' : ''}` };
 }
 
@@ -174,11 +181,8 @@ function view(turn: AgentTurn, revision: number, confirmed: boolean, last: boole
   const deliveryActive = Boolean(proposal && !stale && !deliveryState && turn.status === 'completed');
   const canAnswer = Boolean(last && (!confirmed || plan.some(step => step.id === 'delivery-check')) && !undone &&
     turn.status === 'completed' && end?.revision === revision);
-  const hasPendingQuestions = Boolean(canAnswer && questions.length);
-  const showDraftSummary = Boolean(last && !confirmed && turn.status === 'completed' && !preview && !proposal);
-  const showDraftActions = showDraftSummary;
   const canUndo = Boolean(!confirmed && !undone && !!changes.length && end?.revision === revision && turn.status !== 'running');
-  const showStandaloneUndo = Boolean(canUndo && !showDraftActions);
+  const showNameCard = Boolean(canAnswer && !confirmed && questionViews.some(question => question.missingCustomer));
   const allDelivered = Boolean(delivery && delivery.shops.length > 0 && delivery.shops.every(shop => shop.locked));
   const showDeliveryFooter = Boolean(last && confirmed && turn.status === 'completed' && !deliveryActive);
   const runningStepText = turn.status === 'running'
@@ -200,14 +204,12 @@ function view(turn: AgentTurn, revision: number, confirmed: boolean, last: boole
     else if (proposal) summaryText = '已整理门店送货核对卡';
     else if (turn.status === 'failed' || turn.status === 'interrupted') summaryText = '这一步没跑完，可以把原消息放回输入框重试';
   }
-  const draftHasLines = Boolean(draft?.customers.some(customer => customer.items.some(line =>
-    line.product || line.quantity || line.price || line.brand || line.specification)));
-  const showChangeList = Boolean(changes.length) && !(showDraftSummary && draftHasLines && !undone);
+  const showChangeList = Boolean(changes.length) && turn.status !== 'running';
   return { id: turn.id, text: turn.text, pictures: turn.materialIds.length, checklist, questions: questionViews, changes, undone, issued, links, showChoices,
     status: turn.status, runningStepText, summaryText, showChangeList,
     reply: changes.length && end?.text === '草稿已更新。' ? '' : end?.text ?? '',
     elapsed: end?.elapsedMs === undefined ? '' : `用时 ${Math.max(1, Math.round(end.elapsedMs / 1000))} 秒`,
-    canAnswer, hasPendingQuestions, showDraftSummary, showDraftActions, showStandaloneUndo, showDeliveryFooter, allDelivered,
+    canAnswer, showNameCard, showDeliveryFooter, allDelivered,
     canRetry: last && (turn.status === 'failed' || turn.status === 'interrupted'),
     canUndo,
     preview: preview ? { ...tripView(preview), id: preview.previewId,
@@ -220,14 +222,21 @@ function view(turn: AgentTurn, revision: number, confirmed: boolean, last: boole
 
 function deliverySummaryView(progress: DeliveryProgress) {
   const unfinished = progress.shops.filter(shop => !shop.locked).map(shop => shop.customer);
-  const allDelivered = progress.shops.length > 0 && unfinished.length === 0;
-  return { label: `本趟送货 · ${progress.shops.length - unfinished.length}/${progress.shops.length} 家已送达`,
-    unfinished, allDelivered,
+  const totalCount = progress.shops.length;
+  const deliveredCount = totalCount - unfinished.length;
+  const allDelivered = totalCount > 0 && unfinished.length === 0;
+  const knownTotalCents = progress.shops.reduce((sum, shop) => sum + shop.totalCents, 0);
+  const pendingPricesTotal = progress.shops.reduce((sum, shop) => sum + shop.pendingPrices, 0);
+  return { label: `本趟送货 · ${deliveredCount}/${totalCount} 家已送达`,
+    unfinished, allDelivered, deliveredCount, totalCount, knownTotalCents, pendingPricesTotal,
+    pillTitle: allDelivered ? '本趟已全部送达' : `送货中 · ${deliveredCount}/${totalCount} 家已送`,
+    pillSub: knownTotalCents === 0 && pendingPricesTotal > 0 ? `待补价（${pendingPricesTotal} 项）`
+      : `预计应收 ¥${money(knownTotalCents)}${pendingPricesTotal ? ` · ${pendingPricesTotal} 项待补价` : ''}`,
     shops: progress.shops.map(shop => ({ ...shop, description: `${shop.locked ? '已锁定应收' : '预计应收'} ¥${money(shop.totalCents)}` +
       (shop.pendingPrices ? ` · ${shop.pendingPrices} 项待补价` : '') })) };
 }
 
-function draftSummary(draft: TripDraft, pending: number) {
+function draftSummary(draft: TripDraft, pending: number, choiceCount = 0, catalogChoiceCount = 0) {
   type SummaryLine = { id: string; product: string; nameOnly: string; metaLabel: string; quantity: string; unit: string;
     price: string; pending: boolean; priceSource: string; priceSourceLabel: string; discontinued: boolean;
     priceHint: string; catalogHint: string; secondaryText: string };
@@ -239,9 +248,10 @@ function draftSummary(draft: TripDraft, pending: number) {
         const metaLabel = lineMetaLabel(line);
         const discontinued = line.catalogStatus === 'discontinued';
         const catalogHint = catalogHintText(line.priceHint, discontinued);
+        const price = nullablePrice(line.price);
         return { id: line.id, product: productLabel(line) || '未命名货品', nameOnly: lineNameOnly(line),
           metaLabel, quantity: line.quantity, unit: line.unit,
-          price: line.price ? '¥' + line.price : '待填价', pending: !line.price,
+          price: price ? '¥' + price : '待填价', pending: price === null,
           priceSource: line.priceSource ?? '', priceSourceLabel: priceSourceLabel(line.priceSource),
           discontinued, priceHint: line.priceHint ?? '', catalogHint,
           secondaryText: [metaLabel, catalogHint].filter(Boolean).join(' · ') };
@@ -251,22 +261,37 @@ function draftSummary(draft: TripDraft, pending: number) {
   const issues = pending || (lines ? textOrderQuestions(draft).reduce((sum, customer) => sum + customer.issues.length, 0) : 0);
   const pendingCount = customers.reduce((sum, customer) => sum + customer.lines.filter(line => line.pending).length, 0);
   const discontinuedCount = customers.reduce((sum, customer) => sum + customer.lines.filter(line => line.discontinued).length, 0);
-  const overLimit = lines > 8;
-  const previewCustomers: SummaryCustomer[] = [];
-  let shown = 0;
-  for (const customer of customers) {
-    if (shown >= 8) break;
-    const previewLines = customer.lines.slice(0, 8 - shown);
-    if (!previewLines.length) continue;
-    previewCustomers.push({ ...customer, lines: previewLines });
-    shown += previewLines.length;
+  let knownTotalCents = 0;
+  for (const customer of draft.customers) for (const line of customer.items) {
+    if (!(line.product || line.quantity || line.price || line.brand || line.specification)) continue;
+    const price = nullablePrice(line.price);
+    const quantity = line.quantity.trim();
+    if (price === null || !validTextPrice(price) || !/^[1-9]\d*$/.test(quantity)) continue;
+    knownTotalCents += lineAmount(Number(quantity), yuanToCents(price)) ?? 0;
   }
+  const hasKnownAmount = knownTotalCents > 0;
+  const knownTotalLabel = hasKnownAmount ? '¥' + money(knownTotalCents)
+    : (pendingCount > 0 ? '待填价' : '¥0.00');
   const alertText = [pendingCount ? `${pendingCount} 样待填价` : '',
     discontinuedCount ? `${discontinuedCount} 样已下架，请查库存` : ''].filter(Boolean).join(' · ');
   const unnamedCustomers = draft.customers.flatMap((customer, index) => customer.customer.trim()
     ? [] : [{ id: customer.id, label: `第 ${index + 1} 位客户` }]);
-  return { customers, hasLines: lines > 0, lineCount: lines, pendingCount, discontinuedCount, overLimit,
-    hiddenCount: Math.max(0, lines - 8), previewCustomers, alertText, unnamedCustomers,
+  const unnamedLineCounts: Record<string, number> = {};
+  for (const customer of draft.customers) {
+    unnamedLineCounts[customer.id] = customer.items.filter(line =>
+      line.product || line.quantity || line.price || line.brand || line.specification).length;
+  }
+  const unnamedCount = customers.filter(customer => customer.unnamed).length;
+  const todoParts = [unnamedCount ? `${unnamedCount} 家待填店名` : '',
+    choiceCount ? `${choiceCount} 家待确认客户` : '',
+    catalogChoiceCount ? `${catalogChoiceCount} 样待选款` : '',
+    pendingCount ? `${pendingCount} 样待填价` : '',
+    discontinuedCount ? `${discontinuedCount} 样已下架` : ''].filter(Boolean);
+  const hasTodo = todoParts.length > 0;
+  return { customers, hasLines: lines > 0, customerCount: customers.length, lineCount: lines,
+    unnamedCount, pendingCount, discontinuedCount, knownTotalCents, knownTotalLabel, hasKnownAmount,
+    todoParts, hasTodo, todoText: hasTodo ? todoParts.join(' · ') : '单价齐全，可直接出单',
+    alertText, unnamedCustomers, unnamedLineCounts,
     label: `当前整单 · ${customers.length} 家 ${lines} 样${issues ? `，${issues} 处待确认` : ''}` };
 }
 
@@ -280,7 +305,7 @@ Page({
     turns: [] as ReturnType<typeof view>[], attachments: [] as Attachment[], pendingMaterial: '', uploadLabel: '',
     draftsAvailable: false, scrollTo: '', voicePhase: '', voiceRetry: false, inputMode: 'text' as 'text' | 'voice',
     readyImages: [] as Attachment[], uploadRows: [] as (MaterialSource & { id?: string; local: boolean })[],
-    draftSummary: null as ReturnType<typeof draftSummary> | null, draftExpanded: false, issuedCard: false, revokeFailed: false,
+    draftSummary: null as ReturnType<typeof draftSummary> | null, issuedCard: false, revokeFailed: false,
     deliverySummary: null as ReturnType<typeof deliverySummaryView> | null, navTitle: '录单助手', focusInput: false, imageLimit,
     voiceCorrectionHint: '',
     choices: [] as ChoiceView[], memoryNames: [] as string[], rememberOff: {} as Record<string, boolean>,
@@ -288,6 +313,10 @@ Page({
     catalogChoices: [] as CatalogChoiceView[],
     memoryCustomers: [] as { id: string; name: string }[], quickCustomers: [] as { id: string; name: string }[],
     priceDrawerOpen: false, priceDrawerRows: [] as PriceDrawerRow[], priceDrawerError: '', priceDrawerFocusId: '',
+    orderSheetOpen: false, orderSheetTab: 'all' as 'all' | 'pending', orderSheetStep: 'list' as 'list' | 'preview',
+    orderSheetScrollTop: 0,
+    sheetPreview: null as SheetPreview | null,
+    priceDrawerDirty: false,
     customerSheet: null as CustomerSheet | null, inlineCustomerDrafts: {} as Record<string, string>,
   },
   draft: null as TripDraft | null,
@@ -347,11 +376,13 @@ Page({
     this.memory = null;
     this.setData({ signedIn: false, busy: false, polling: false, confirmed: false, draftsAvailable: false,
       error: '', text: '', turns: [], attachments: [], readyImages: [], uploadRows: [], pendingMaterial: '',
-      scrollTo: '', draftSummary: null, deliverySummary: null, navTitle: '录单助手', focusInput: false, draftExpanded: false,
+      scrollTo: '', draftSummary: null, deliverySummary: null, navTitle: '录单助手', focusInput: false,
       issuedCard: false, voiceRetry: false, inputMode: 'text', revokeFailed: !!this.retiredToken,
       voiceCorrectionHint: '', choices: [], memoryNames: [], rememberOff: {}, memoryFailed: false, notice: '', priceHints: {}, adoptableCount: 0,
       catalogChoices: [], memoryCustomers: [], quickCustomers: [], priceDrawerOpen: false, priceDrawerRows: [],
-      priceDrawerError: '', priceDrawerFocusId: '', customerSheet: null, inlineCustomerDrafts: {} });
+      priceDrawerError: '', priceDrawerFocusId: '', orderSheetOpen: false, orderSheetTab: 'all', orderSheetStep: 'list',
+      orderSheetScrollTop: 0,
+      sheetPreview: null, priceDrawerDirty: false, customerSheet: null, inlineCustomerDrafts: {} });
     applyNavTitle('录单助手');
   },
 
@@ -418,8 +449,11 @@ Page({
       this.voiceMeta = null;
     }
     this.setData({ confirmed: draftConfirmed, draftsAvailable: true, polling: !!active,
-      ...(changedMode || !sameTrip ? { text: '', attachments: [], readyImages: [], uploadRows: [], draftExpanded: false,
-        pendingMaterial: '', voiceRetry: false, inputMode: 'text', voiceCorrectionHint: '' } : {}),
+      ...(changedMode || !sameTrip ? { text: '', attachments: [], readyImages: [], uploadRows: [],
+        pendingMaterial: '', voiceRetry: false, inputMode: 'text', voiceCorrectionHint: '',
+        orderSheetOpen: false, orderSheetTab: 'all', orderSheetStep: 'list', sheetPreview: null,
+        orderSheetScrollTop: 0,
+        priceDrawerOpen: false, priceDrawerRows: [], priceDrawerDirty: false, priceDrawerError: '', priceDrawerFocusId: '' } : {}),
       ...(prefill ? { text: `${target.name}：`, focusInput: !active, inputMode: 'text' } : { focusInput: false }) });
     await this.loadMemory(draft, draftConfirmed, generation, token);
     if (generation !== this.generation || token !== agentSession.token) return;
@@ -493,7 +527,7 @@ Page({
     const recent = turns[turns.length - 1];
     const deliverySummary = this.delivery ? deliverySummaryView(this.delivery) : null;
     const draftInfo = !this.data.confirmed && this.draft
-      ? draftSummary(this.draft, recent?.canAnswer ? recent.questions.length : 0) : null;
+      ? draftSummary(this.draft, recent?.canAnswer ? recent.questions.length : 0, choices.length, catalogChoices.length) : null;
     const navTitle = !this.data.signedIn || !this.data.confirmed ? '录单助手'
       : (this.delivery && this.delivery.shops.length
         ? `送货助手（${this.delivery.shops.filter(shop => shop.locked).length}/${this.delivery.shops.length} 已送达）`
@@ -635,8 +669,6 @@ Page({
   previewShortcut(): Promise<void> | undefined {
     return this.submit('生成送货单', [], { intent: 'preview' });
   },
-
-  toggleDraft(): void { this.setData({ draftExpanded: !this.data.draftExpanded }); },
 
   copyTurnText(event: WechatMiniprogram.TouchEvent): void {
     const id = String(event.currentTarget.dataset.turn ?? '');
@@ -783,6 +815,10 @@ Page({
         const result = await this.saveCustomerChoice(draft, payload);
         if (!result) return;
         await this.reload();
+        if (this.data.orderSheetOpen) {
+          this.setData({ priceDrawerError: '',
+            ...(!this.data.priceDrawerDirty ? { priceDrawerRows: this.buildPriceRows() } : {}) });
+        }
         if (result.remembered === true) {
           if (typeof wx.showToast === 'function') wx.showToast({ title: '已记住叫法', icon: 'success' });
         }
@@ -881,11 +917,17 @@ Page({
     }
     await this.run(async () => {
       try {
+        const zeroCustomers = Boolean(this.memory && this.memory.customers.length === 0);
         const customers = draft.customers.map(customer => customer.id === draftCustomerId
-          ? { ...customer, customer: trimmed } : customer);
+          ? { ...customer, customer: trimmed, ...(zeroCustomers ? { partyId: null } : {}) } : customer);
         await this.putRequest(`/drafts/${draft.id}`, { revision: draft.revision, customers });
         onSaved();
         await this.reload();
+        if (this.data.orderSheetOpen) {
+          this.setData({ priceDrawerError: '',
+            ...(!this.data.priceDrawerDirty ? { priceDrawerRows: this.buildPriceRows() } : {}) });
+        }
+        if (this.data.choices.length > 0) this.scrollOrderSheetTop();
         if (typeof wx.showToast === 'function') wx.showToast({ title: '已保存店名', icon: 'success' });
       } catch (error) {
         await this.reloadAfterConflict(error, draftConflicts);
@@ -912,49 +954,85 @@ Page({
     return rows.map(row => ({ ...row, showCustomer: customerCount > 1 }));
   },
 
+  scrollOrderSheetTop(): void {
+    this.setData({ orderSheetScrollTop: this.data.orderSheetScrollTop === 0 ? 1 : 0 });
+  },
+
+  openOrderSheet(event?: WechatMiniprogram.TouchEvent): void {
+    if (!this.draft || this.data.confirmed || this.data.busy || this.data.polling) return;
+    const tab = event?.currentTarget?.dataset?.tab === 'pending' ? 'pending' : 'all';
+    const lineId = String(event?.currentTarget?.dataset?.line ?? '');
+    const keepDirty = Boolean(this.data.orderSheetOpen && this.data.priceDrawerDirty);
+    const rows = keepDirty ? this.data.priceDrawerRows : this.buildPriceRows();
+    this.setData({ error: '', orderSheetOpen: true, orderSheetTab: tab, orderSheetStep: 'list', sheetPreview: null,
+      priceDrawerOpen: tab === 'pending', priceDrawerRows: rows, priceDrawerDirty: keepDirty, priceDrawerError: '',
+      priceDrawerFocusId: tab === 'pending' && lineId && rows.some(row => row.lineId === lineId) ? `pf-${lineId}` : '' });
+  },
+
   openPriceDrawer(event?: WechatMiniprogram.TouchEvent): void {
     if (!this.draft || this.data.confirmed || this.data.busy || this.data.polling) return;
     const rows = this.buildPriceRows();
     if (!rows.length) {
-      this.setData({ priceDrawerOpen: false, priceDrawerRows: [], priceDrawerFocusId: '', priceDrawerError: '' });
+      this.setData({ priceDrawerOpen: false, orderSheetOpen: false, priceDrawerRows: [], priceDrawerFocusId: '',
+        priceDrawerDirty: false, priceDrawerError: '' });
       this.notify('当前没有待填价货品');
       return;
     }
     const lineId = String(event?.currentTarget.dataset.line ?? '');
-    this.setData({ priceDrawerOpen: true, priceDrawerRows: rows, priceDrawerError: '',
+    this.setData({ error: '', orderSheetOpen: true, orderSheetTab: 'pending', orderSheetStep: 'list', sheetPreview: null,
+      priceDrawerOpen: true, priceDrawerRows: rows, priceDrawerDirty: false, priceDrawerError: '',
       priceDrawerFocusId: lineId && rows.some(row => row.lineId === lineId) ? `pf-${lineId}` : '' });
   },
 
+  switchOrderSheetTab(event: WechatMiniprogram.TouchEvent): void {
+    const tab = event.currentTarget.dataset.tab === 'pending' ? 'pending' : 'all';
+    if (tab === this.data.orderSheetTab && this.data.orderSheetStep === 'list') return;
+    const priceDrawerRows = tab === 'pending'
+      ? (this.data.priceDrawerDirty ? this.data.priceDrawerRows : this.buildPriceRows())
+      : this.data.priceDrawerRows;
+    this.setData({ orderSheetTab: tab, orderSheetStep: 'list', sheetPreview: null, priceDrawerOpen: tab === 'pending',
+      priceDrawerRows, priceDrawerError: '', priceDrawerFocusId: '' });
+  },
+
+  closeOrderSheet(): void {
+    this.setData({ orderSheetOpen: false, orderSheetTab: 'all', orderSheetStep: 'list', sheetPreview: null,
+      priceDrawerOpen: false, priceDrawerRows: [], priceDrawerDirty: false, priceDrawerError: '', priceDrawerFocusId: '' });
+  },
+
   closePriceDrawer(): void {
-    this.setData({ priceDrawerOpen: false, priceDrawerRows: [], priceDrawerError: '', priceDrawerFocusId: '' });
+    this.closeOrderSheet();
   },
 
   editPriceDrawerPrice(event: WechatMiniprogram.Input) {
     const lineId = String(event.currentTarget.dataset.line ?? '');
-    this.setData({ priceDrawerFocusId: '', priceDrawerRows: this.data.priceDrawerRows.map(row =>
-      row.lineId === lineId ? { ...row, price: event.detail.value } : row) });
+    const priceDrawerRows = this.data.priceDrawerRows.map(row =>
+      row.lineId === lineId ? { ...row, price: event.detail.value } : row);
+    this.setData({ priceDrawerFocusId: '', priceDrawerRows, priceDrawerDirty: Boolean(this.priceDrawerCustomers(priceDrawerRows)) });
   },
 
   applyRefPrice(event: WechatMiniprogram.TouchEvent) {
     const lineId = String(event.currentTarget.dataset.line ?? '');
     const value = String(event.currentTarget.dataset.value ?? '');
     if (!value) return;
-    this.setData({ priceDrawerFocusId: '', priceDrawerRows: this.data.priceDrawerRows.map(row =>
-      row.lineId === lineId ? { ...row, price: value } : row) });
+    const priceDrawerRows = this.data.priceDrawerRows.map(row =>
+      row.lineId === lineId ? { ...row, price: value } : row);
+    this.setData({ priceDrawerFocusId: '', priceDrawerRows, priceDrawerDirty: Boolean(this.priceDrawerCustomers(priceDrawerRows)) });
   },
 
   toggleDrawerSpec(event: WechatMiniprogram.TouchEvent) {
     const lineId = String(event.currentTarget.dataset.line ?? '');
-    this.setData({ priceDrawerFocusId: '', priceDrawerRows: this.data.priceDrawerRows.map(row =>
-      row.lineId === lineId ? { ...row, showSpec: !row.showSpec } : row) });
+    const priceDrawerRows = this.data.priceDrawerRows.map(row =>
+      row.lineId === lineId ? { ...row, showSpec: !row.showSpec } : row);
+    this.setData({ priceDrawerFocusId: '', priceDrawerRows, priceDrawerDirty: Boolean(this.priceDrawerCustomers(priceDrawerRows)) });
   },
 
   editPriceDrawerField(event: WechatMiniprogram.Input) {
     const lineId = String(event.currentTarget.dataset.line ?? '');
     const field = String(event.currentTarget.dataset.field ?? '');
     if (field !== 'unit' && field !== 'specification') return;
-    this.setData({ priceDrawerFocusId: '', priceDrawerRows: this.data.priceDrawerRows.map(row => row.lineId !== lineId
-      ? row : { ...row, [field === 'unit' ? 'inputUnit' : 'inputSpecification']: event.detail.value }) });
+    const priceDrawerRows = this.data.priceDrawerRows.map(row => row.lineId !== lineId
+      ? row : { ...row, [field === 'unit' ? 'inputUnit' : 'inputSpecification']: event.detail.value });
+    this.setData({ priceDrawerFocusId: '', priceDrawerRows, priceDrawerDirty: Boolean(this.priceDrawerCustomers(priceDrawerRows)) });
   },
 
   validatePriceDrawer(rows: PriceDrawerRow[]): string {
@@ -968,13 +1046,13 @@ Page({
     return '';
   },
 
-  priceDrawerCustomers(): TripDraft['customers'] | null {
+  priceDrawerCustomers(rows?: PriceDrawerRow[]): TripDraft['customers'] | null {
     const draft = this.draft;
     if (!draft) return null;
-    const rows = new Map(this.data.priceDrawerRows.map(row => [row.lineId, row]));
+    const byLine = new Map((rows ?? this.data.priceDrawerRows).map(row => [row.lineId, row]));
     let changed = false;
     const customers = draft.customers.map(customer => ({ ...customer, items: customer.items.map(item => {
-      const row = rows.get(item.id);
+      const row = byLine.get(item.id);
       if (!row) return item;
       const price = row.price.trim() || null;
       const unit = row.inputUnit.trim();
@@ -997,19 +1075,21 @@ Page({
     }
     const customers = this.priceDrawerCustomers();
     if (!customers) {
-      this.closePriceDrawer();
+      this.setData({ priceDrawerDirty: false, priceDrawerError: '' });
+      this.notify('还没有改动');
       return;
     }
     this.setData({ priceDrawerError: '' });
     return this.run(async () => {
       try {
         await this.putRequest(`/drafts/${draft.id}`, { revision: draft.revision, customers });
-        this.closePriceDrawer();
         await this.reload();
+        const nextRows = this.buildPriceRows();
+        this.setData({ priceDrawerRows: nextRows, priceDrawerDirty: false, priceDrawerError: '', priceDrawerFocusId: '' });
         if (typeof wx.showToast === 'function') wx.showToast({ title: '已保存修改', icon: 'success' });
       } catch (error) {
         if (error instanceof WorkspaceError && error.code === 'draft_confirmed') {
-          this.closePriceDrawer();
+          this.closeOrderSheet();
           await this.reloadAfterConflict(error, draftConflicts);
           return;
         }
@@ -1021,6 +1101,102 @@ Page({
         this.setData({ priceDrawerError: errorMessage(error) });
       }
     });
+  },
+
+  previewInSheet(): Promise<void> | undefined {
+    const draft = this.draft;
+    if (!draft || this.data.confirmed || this.data.busy || this.data.polling) return;
+    if (this.priceDrawerCustomers()) {
+      const invalid = this.validatePriceDrawer(this.data.priceDrawerRows);
+      this.setData({ priceDrawerError: invalid ? `${invalid}；请先点「保存价格」后再预览` : '请先点「保存价格」后再预览' });
+      return;
+    }
+    const unnamed = this.data.draftSummary?.unnamedCustomers ?? [];
+    if (unnamed.length > 0) {
+      const first = unnamed[0];
+      const customer = draft.customers.find(entry => entry.id === first.id);
+      this.setData({ priceDrawerError: '', error: '',
+        customerSheet: { id: first.id, label: '未命名客户',
+          value: this.data.inlineCustomerDrafts[first.id] ?? customer?.customer ?? '' } });
+      this.notify('先填上店名就能出单');
+      return;
+    }
+    if (this.data.choices.length > 0) {
+      this.scrollOrderSheetTop();
+      this.setData({ priceDrawerError:
+        `请先在上方确认「${this.data.choices[0].spoken}」是已有熟客还是新建客户` });
+      return;
+    }
+    return this.run(async () => {
+      try {
+        const { preview } = await this.request<{ preview: TripPreview }>('/trips/preview',
+          { draftId: draft.id, revision: draft.revision });
+        const view = tripView(preview);
+        const customers = view.customers.map(customer => {
+          const customerPending = customer.items.filter(line => line.amountCents === null).length;
+          const allPending = customer.totalCents === 0 && customerPending > 0;
+          return { ...customer, pendingPrices: customerPending, allPending,
+            displayTotal: allPending ? '待补价' : '¥' + money(customer.totalCents) };
+        });
+        const pendingPrices = customers.reduce((sum, customer) => sum + customer.pendingPrices, 0);
+        const allPending = preview.totalCents === 0 && pendingPrices > 0;
+        this.setData({ orderSheetStep: 'preview', priceDrawerError: '',
+          sheetPreview: { ...view, customers, id: preview.previewId, pendingPrices, allPending,
+            displayTotal: allPending ? '待补价' : '¥' + money(preview.totalCents) } });
+      } catch (error) {
+        if (error instanceof WorkspaceError && error.status === 401) throw error;
+        if (error instanceof WorkspaceError && draftConflicts.includes(error.code)) {
+          await this.reloadAfterConflict(error, draftConflicts);
+          if (this.data.confirmed) {
+            this.closeOrderSheet();
+            return;
+          }
+          this.setData({ orderSheetStep: 'list', sheetPreview: null, priceDrawerError: errorMessage(error) });
+          return;
+        }
+        this.setData({ orderSheetStep: 'list', sheetPreview: null, priceDrawerError: errorMessage(error) });
+      }
+    });
+  },
+
+  backToSheetList(): void {
+    this.setData({ orderSheetStep: 'list', sheetPreview: null, priceDrawerError: '' });
+  },
+
+  async adoptAllAndPreviewInSheet(): Promise<void> {
+    const done = await this.adopt(this.adoptableLines());
+    if (done) await this.previewInSheet();
+  },
+
+  confirmSheetPreview(): Promise<void> | undefined {
+    const preview = this.data.sheetPreview;
+    if (!preview || this.data.busy || this.data.polling) return;
+    this.card('confirm');
+    return this.run(async () => {
+      try {
+        await this.request('/trips/confirm', { previewId: preview.id });
+        this.closeOrderSheet();
+        await this.reload();
+        this.notify('已出单，取货单与送货单已生成');
+      } catch (error) {
+        if (error instanceof WorkspaceError && error.status === 401) throw error;
+        if (error instanceof WorkspaceError && draftConflicts.includes(error.code)) {
+          await this.reloadAfterConflict(error, draftConflicts);
+          if (this.data.confirmed) {
+            this.closeOrderSheet();
+            return;
+          }
+          this.setData({ orderSheetStep: 'list', sheetPreview: null, priceDrawerError: errorMessage(error) });
+          return;
+        }
+        this.setData({ priceDrawerError: errorMessage(error) });
+      }
+    });
+  },
+
+  openWorkspaceFromSheet(): void {
+    this.closeOrderSheet();
+    this.openWorkspace();
   },
 
   chooseCatalogVariant(event: WechatMiniprogram.TouchEvent): Promise<void> | undefined {
@@ -1045,6 +1221,10 @@ Page({
         const result = await this.request<CatalogChoiceResult>('/agent/catalog-choice',
           { draftId: draft.id, revision: draft.revision, draftCustomerId: choice.draftCustomerId, lineId, ...selection });
         await this.reload();
+        if (this.data.orderSheetOpen) {
+          this.setData({ priceDrawerError: '',
+            ...(!this.data.priceDrawerDirty ? { priceDrawerRows: this.buildPriceRows() } : {}) });
+        }
         const updates = (result.priceUpdates ?? []).map(update => update.text).filter(Boolean);
         if (updates.length) this.setData({ notice: `已选定规格：${updates.join('；')}` });
         else if (typeof wx.showToast === 'function') wx.showToast({
@@ -1092,6 +1272,9 @@ Page({
       try {
         await this.request('/agent/price-adopt', { draftId: draft.id, revision: draft.revision, lines });
         await this.reload();
+        if (this.data.orderSheetOpen && this.data.orderSheetTab === 'pending' && !this.data.priceDrawerDirty) {
+          this.setData({ priceDrawerRows: this.buildPriceRows() });
+        }
         if (typeof wx.showToast === 'function') wx.showToast({ title: '已填入单价', icon: 'success' });
         done = true;
       } catch (error) {

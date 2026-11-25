@@ -402,8 +402,6 @@ test('A1 manual form uses the same session and detects an unsaved edit after cha
   await page.onShow();
   await page.login();
   assert.match(page.data.draftSummary.label, /当前整单 · 1 家 1 样/);
-  page.toggleDraft();
-  assert.equal(page.data.draftExpanded, true);
   page.openWorkspace();
   assert.equal(navigation[0], '/pages/workspace/index?from=agent');
   page.onHide();
@@ -635,6 +633,7 @@ test('Agent drops the top strip and keeps the next action only on the latest lin
   assert.equal(wxml.includes('draft-strip'), false);
   assert.equal(wxml.includes('退出登录'), false);
   assert.equal(wxml.includes('size="mini"'), false);
+  assert.ok(wxml.includes('trip-pill'), '顶部常驻本趟单据胶囊');
 
   const draft = order();
   const { page, requests, event, handle, setTurns, setConfirmed, setDelivery, titles, card } = setup(t, draft);
@@ -643,11 +642,12 @@ test('Agent drops the top strip and keeps the next action only on the latest lin
   assert.equal(page.data.turns.length, 0);
   assert.equal(page.data.draftSummary.hasLines, true);
   assert.match(page.data.draftSummary.label, /当前整单 · 1 家 1 样/);
+  assert.equal(page.data.draftSummary.customerCount, 1);
+  assert.equal(page.data.draftSummary.lineCount, 1);
+  assert.equal(page.data.draftSummary.knownTotalLabel, '¥164.00');
+  assert.equal(page.data.draftSummary.hasTodo, false);
+  assert.equal(page.data.draftSummary.todoText, '单价齐全，可直接出单');
   assert.equal(page.data.navTitle, '录单助手');
-  page.toggleDraft();
-  assert.equal(page.data.draftExpanded, true);
-  page.toggleDraft();
-  assert.equal(page.data.draftExpanded, false);
 
   const first = { id: 'turn-1', text: '水饺两箱', materialIds: [], status: 'completed', revision: draft.revision,
     events: [event('change', { lines: ['老王 水饺 数量：1箱 → 2箱'] }),
@@ -657,10 +657,8 @@ test('Agent drops the top strip and keeps the next action only on the latest lin
       event('end', { status: 'completed', text: '草稿已更新。', revision: draft.revision })] };
   setTurns([first, second]);
   await page.onShow();
-  assert.equal(page.data.turns[0].showDraftActions, false);
-  assert.equal(page.data.turns[0].showStandaloneUndo, true);
-  assert.equal(page.data.turns[1].showDraftActions, true);
-  assert.equal(page.data.turns[1].showStandaloneUndo, false);
+  assert.equal(page.data.turns[0].showChangeList, true, '每轮只展示本轮增量微卡');
+  assert.equal(page.data.turns[1].showChangeList, true);
 
   const preview = { ...card, revision: draft.revision };
   const previewTurn = { id: 'preview-turn', text: '生成送货单', materialIds: [], status: 'completed', revision: draft.revision,
@@ -707,13 +705,25 @@ test('Agent drops the top strip and keeps the next action only on the latest lin
 test('Delivery MVP lists shops before opening a sheet and picking stays a flat read-only view', async t => {
   const deliveryWxml = fs.readFileSync(require.resolve('../code/dist/pages/trip-delivery/index.wxml'), 'utf8');
   assert.equal(deliveryWxml.includes('order-line'), false);
-  assert.equal(deliveryWxml.includes('原订'), false);
   assert.equal(deliveryWxml.includes('size="mini"'), false);
+  assert.equal(deliveryWxml.includes('cover-view'), false);
+  assert.equal(deliveryWxml.includes('price-tag'), false, '正式送货单不出现草稿价格来源标签');
+  const deliveryDetail = deliveryWxml.slice(0, deliveryWxml.indexOf('progress-card'));
+  const deliveryList = deliveryWxml.slice(deliveryWxml.indexOf('progress-card'));
+  assert.equal(deliveryDetail.includes('原订'), true, '门店详情展示原订数量');
+  assert.equal(deliveryList.includes('原订'), false, '门店列表不展示原订数量');
+  for (const token of ['确认送达并锁账', '点我改数/价', 'stepReceivedQuantity', 'toggleFieldEdit']) {
+    assert.ok(deliveryDetail.includes(token), `门店详情缺少 ${token}`);
+  }
   const pickingWxml = fs.readFileSync(require.resolve('../code/dist/pages/trip-picking/index.wxml'), 'utf8');
   const pickingFragment = fs.readFileSync(require.resolve('../code/dist/pages/workspace/picking.wxml'), 'utf8');
   for (const wxml of [pickingWxml, pickingFragment]) {
     assert.equal(wxml.includes('<checkbox'), false);
     assert.equal(wxml.includes('openSheet'), false);
+  }
+  assert.equal(pickingWxml.includes('size="mini"'), false);
+  for (const token of ['冷库取货单', 'picking-qty-box', 'picking-qty-other']) {
+    assert.ok(pickingWxml.includes(token), `取货单缺少 ${token}`);
   }
 
   const draft = order();
@@ -1393,7 +1403,7 @@ test('6.5-2 catalog cards choose a variant or keep external with idempotent post
   ]);
   assert.deepEqual(choice.candidates.map(candidate => candidate.warn), [false, true]);
   const cardWxml = fs.readFileSync(require.resolve('../code/dist/pages/agent/index.wxml'), 'utf8');
-  assert.ok(cardWxml.includes('按库外新货保留'));
+  assert.ok(cardWxml.includes('都不是，按新货记'));
   assert.ok(cardWxml.includes('catalog-choices'));
 
   await page.chooseCatalogVariant(tap({ line: line.id, variant: 'v-300' }));
@@ -1535,7 +1545,7 @@ test('6.5-2 catalog controls keep the native design baseline on both pages', () 
     assert.equal(wxml.includes('size="mini"'), false, `${name} 不得使用 mini 按钮`);
     assert.equal(emoji.test(wxml), false, `${name} 不得出现 Emoji`);
   }
-  for (const token of ['按库外新货保留', '已下架', 'price-tag-history', 'price-tag-catalog']) {
+  for (const token of ['都不是，按新货记', '已下架', 'price-tag-history', 'price-tag-catalog']) {
     assert.ok(agentWxml.includes(token), `缺少 ${token}`);
   }
   assert.ok(profileWxml.includes('货品库'));
@@ -1694,12 +1704,14 @@ test('6.5-8 ships a full-width receipt card without nested scrolling or mini con
   const wxss = fs.readFileSync(require.resolve('../code/dist/pages/agent/index.wxss'), 'utf8');
   assert.equal(/<scroll-view[^>]*draft-inline-body/.test(wxml), false, '明细不再套卡片内滚动框');
   assert.equal(wxss.includes('max-height: 360rpx'), false, '明细不再限高截断');
+  assert.equal(wxml.includes('draft-inline'), false, '聊天流不再塞整单巨无霸卡');
   assert.equal(wxml.includes('avatar helper'), false, '取消左侧助手大头像');
+  assert.equal(wxml.includes('card-header'), false, '取消旧卡头与「助」徽章');
   assert.equal(wxml.includes('size="mini"'), false, '不得使用 mini 按钮');
   assert.equal(/\benv\(safe-area-inset-top\)/.test(wxss), false, '页面根节点不得叠加顶部安全区');
-  for (const token of ['card-header', 'alert-strip', 'copy-bubble-btn', 'card-actions-pair',
-    '预览送货单', '手动改单', '撤回刚发的']) {
-    assert.ok(wxml.includes(token), `缺少全宽小票风结构 ${token}`);
+  for (const token of ['trip-pill', 'order-sheet', 'composer-dock', 'focus-card', 'copy-bubble-btn',
+    '撤回', '都不是，按新货记', '发截图、语音或打字记单…']) {
+    assert.ok(wxml.includes(token), `缺少方案 A 结构 ${token}`);
   }
   const emoji = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{26FF}\u{FE0F}]/u;
   assert.equal(emoji.test(wxml), false, '助手卡片必须是零 Emoji');
@@ -1722,8 +1734,7 @@ test('6.5-8 hides the duplicate change wall and spells out pending prices and di
 
   const card = page.data.turns[0];
   assert.equal(card.summaryText, '已记上 2 样货');
-  assert.equal(card.showDraftSummary, true);
-  assert.equal(card.showChangeList, false, '整单明细已自然展开时不再重复显示本轮改动');
+  assert.equal(card.showChangeList, true, '整单已分离进订单本，聊天流只展示本轮增量');
   const summary = page.data.draftSummary;
   assert.equal(summary.label, '当前整单 · 1 家 2 样');
   assert.equal(summary.lineCount, 2);
@@ -1757,29 +1768,24 @@ test('6.5-8 expands up to eight receipt lines naturally and folds only the overf
   await short.page.onShow();
   await short.page.login();
   const shortSummary = short.page.data.draftSummary;
-  assert.equal(shortSummary.overLimit, false);
-  assert.equal(shortSummary.hiddenCount, 0);
-  assert.equal(shortSummary.previewCustomers.length, 1);
-  assert.equal(shortSummary.previewCustomers[0].lines.length, 8);
+  assert.equal(shortSummary.lineCount, 8);
+  assert.equal(shortSummary.customers.length, 1);
+  assert.equal(shortSummary.customers[0].lines.length, 8);
 
   const long = setup(t, linesOf(10));
   await long.page.onShow();
   await long.page.login();
   const summary = long.page.data.draftSummary;
   assert.equal(summary.lineCount, 10);
-  assert.equal(summary.overLimit, true);
-  assert.equal(summary.hiddenCount, 2);
-  assert.equal(summary.previewCustomers.reduce((sum, customer) => sum + customer.lines.length, 0), 8);
-  assert.equal(summary.customers[0].lines.length, 10);
-  assert.equal(long.page.data.draftExpanded, false);
-  long.page.toggleDraft();
-  assert.equal(long.page.data.draftExpanded, true);
-  long.page.toggleDraft();
-  assert.equal(long.page.data.draftExpanded, false);
+  assert.equal(summary.customerCount, 1);
+  assert.equal(summary.customers[0].lines.length, 10, '订单本展示完整明细，不再聊天内折叠');
+  assert.equal(summary.customers[0].lines[9].nameOnly, '货品10');
 
   const wxml = fs.readFileSync(require.resolve('../code/dist/pages/agent/index.wxml'), 'utf8');
-  assert.ok(wxml.includes('draftSummary.previewCustomers'));
-  assert.ok(wxml.includes('展开其余 '));
+  assert.ok(wxml.includes('draftSummary.customers'));
+  assert.equal(wxml.includes('previewCustomers'), false);
+  assert.equal(wxml.includes('展开其余 '), false);
+  assert.ok(wxml.includes('order-sheet'));
 });
 
 test('6.5-8 copies a user bubble back into the composer and asks before replacing typed text', async t => {
@@ -1981,6 +1987,7 @@ test('6.5-10 fills only pending prices in the drawer and keeps typed input on fa
   const { page, requests, handle, setDraft } = setup(t, draft);
   const toasts = [];
   const puts = [];
+  const previews = [];
   let failOnce = true;
   let current = draft;
   global.wx.showToast = spec => toasts.push(spec);
@@ -1995,6 +2002,15 @@ test('6.5-10 fills only pending prices in the drawer and keeps typed input on fa
       current = { ...current, revision: current.revision + 1, customers: request.data.customers };
       setDraft(current);
       request.ok({ draft: current });
+      return true;
+    }
+    if (request.path === '/trips/preview') {
+      previews.push(request.data);
+      assert.equal(request.data.draftId, current.id);
+      assert.equal(request.data.revision, current.revision);
+      assert.ok(request.data.requestId);
+      request.ok({ preview: { ...previewTrip(current, true), previewId: 'pre-sheet', draftId: current.id,
+        revision: current.revision, choices: [null] } });
       return true;
     }
     return false;
@@ -2063,8 +2079,11 @@ test('6.5-10 fills only pending prices in the drawer and keeps typed input on fa
   await page.savePriceDrawer();
   assert.equal(puts.length, 2);
   assert.equal(puts[1].requestId, puts[0].requestId, '同一份输入复用幂等请求号');
-  assert.equal(page.data.priceDrawerOpen, false);
+  assert.equal(page.data.orderSheetOpen, true, '保存后平滑留在本趟订单本');
+  assert.equal(page.data.orderSheetStep, 'list');
+  assert.equal(page.data.priceDrawerOpen, true, '仍停留在只看待填价页签');
   assert.deepEqual(page.data.priceDrawerRows, []);
+  assert.equal(page.data.priceDrawerDirty, false);
   assert.equal(page.data.draftSummary.pendingCount, 0);
   assert.deepEqual(toasts.at(-1), { title: '已保存修改', icon: 'success' });
   const refLine = puts[1].customers[0].items.find(line => line.id === 'line-ref');
@@ -2073,8 +2092,19 @@ test('6.5-10 fills only pending prices in the drawer and keeps typed input on fa
   assert.deepEqual([plainLine.price, plainLine.unit], ['12', '箱']);
   assert.equal(puts[1].customers[0].items[0].price, '82', '已定价的行保持原价');
 
+  await page.previewInSheet();
+  assert.equal(previews.length, 1);
+  assert.equal(page.data.orderSheetOpen, true);
+  assert.equal(page.data.orderSheetStep, 'preview');
+  assert.equal(page.data.sheetPreview.total, '228.00');
+  assert.equal(page.data.sheetPreview.pendingPrices, 0);
+  page.backToSheetList();
+  assert.equal(page.data.orderSheetStep, 'list');
+  assert.equal(page.data.sheetPreview, null);
+
   page.openPriceDrawer();
   assert.equal(page.data.priceDrawerOpen, false);
+  assert.equal(page.data.orderSheetOpen, false);
   assert.equal(toasts.at(-1).title, '当前没有待填价货品');
 });
 
@@ -2130,11 +2160,11 @@ test('6.5-10 keeps the new sheets native, equal-width and reachable', () => {
     assert.equal(emoji.test(source), false, `${name} 不得出现 Emoji`);
     assert.equal(source.includes('safe-area-inset-top'), false, `${name} 不得叠加顶部安全区`);
   }
-  for (const token of ['openPriceDrawer', 'savePriceDrawer', 'applyRefPrice', 'saveInlineCustomerName',
+  for (const token of ['openOrderSheet', 'savePriceDrawer', 'applyRefPrice', 'saveInlineCustomerName',
     'pickQuickCustomer', 'openCustomerSheet', 'saveCustomerSheet', '改单位/规格',
-    '也可直接发语音一次报多行单价', '待填价货品', 'scroll-into-view="{{priceDrawerFocusId}}"',
-    'id="pf-{{row.lineId}}"', '保存全部', '保存店名', 'drawer-price-input num',
-    '/pages/agent/icons/check.svg', 'class="inline-customer-save"']) {
+    '也可关掉窗口，直接语音一次报多行单价', '只看待填价', 'scroll-into-view="{{priceDrawerFocusId}}"',
+    'id="pf-{{row.lineId}}"', '保存价格', '本趟订单本', '预览并出单', '确认出单', '保存店名',
+    'drawer-price-input num', '/pages/agent/icons/check.svg', 'class="inline-customer-save"']) {
     assert.ok(agentWxml.includes(token), `缺少速填抽屉结构 ${token}`);
   }
   assert.equal(agentWxml.includes('card-btn-primary inline-customer-save'), false,
@@ -2215,4 +2245,607 @@ test('in-place agent actions keep current scroll position instead of jumping to 
   page.editText({ detail: { value: '再加一箱水饺' } });
   await page.send();
   assert.equal(page.data.scrollTo, '', '发送后收到回执不再强行二次跳底');
+});
+
+test('6.6-2 runs the Plan A loop from the trip pill through the order book to confirmation', async t => {
+  const bare = order();
+  bare.customers[0].items[0].price = null;
+  const barePage = setup(t, bare);
+  await barePage.page.onShow();
+  await barePage.page.login();
+  assert.equal(barePage.page.data.draftSummary.hasKnownAmount, false);
+  assert.equal(barePage.page.data.draftSummary.knownTotalCents, 0);
+  assert.equal(barePage.page.data.draftSummary.knownTotalLabel, '待填价', '全单缺价时诚实显示待填价，不误显 ¥0.00');
+  assert.equal(barePage.page.data.draftSummary.pendingCount, 1);
+  assert.equal(barePage.page.data.draftSummary.todoText, '1 样待填价');
+
+  const draft = order();
+  const base = draft.customers[0].items[0];
+  draft.customers[0].items[0] = { ...base, id: 'line-known', product: '水饺', quantity: '2', unit: '箱', price: '82' };
+  draft.customers[0].items.push({ ...base, id: 'line-missing', product: '烧卖', quantity: '3', unit: '箱', price: null });
+  const { page, requests, handle, setDraft, setConfirmed, setDelivery } = setup(t, draft);
+  const toasts = [];
+  let current = draft;
+  global.wx.showToast = spec => toasts.push(spec);
+  handle(request => {
+    if (request.path === `/drafts/${draft.id}`) {
+      assert.equal(request.method, 'PUT');
+      assert.ok(request.data.requestId);
+      current = { ...current, revision: current.revision + 1, customers: request.data.customers };
+      setDraft(current);
+      request.ok({ draft: current });
+      return true;
+    }
+    if (request.path === '/trips/preview') {
+      assert.equal(request.data.draftId, current.id);
+      assert.equal(request.data.revision, current.revision);
+      assert.ok(request.data.requestId, '抽屉预览复用幂等 requestId');
+      request.ok({ preview: { ...previewTrip(current, true), previewId: 'pre-plan-a', draftId: current.id,
+        revision: current.revision, choices: [null] } });
+      return true;
+    }
+    if (request.path === '/trips/confirm') {
+      assert.equal(request.data.previewId, 'pre-plan-a');
+      assert.ok(request.data.requestId, '抽屉确认复用幂等 requestId');
+      setConfirmed(true, 'pre-plan-a');
+      setDelivery({ tripId: draft.id, version: 1, statusRevision: 0, shops: [
+        { sheetId: draft.customers[0].id, customer: '老王', locked: false, totalCents: 20000, pendingPrices: 0 },
+      ] });
+      request.ok({ picking: [] });
+      return true;
+    }
+    return false;
+  });
+  await page.onShow();
+  await page.login();
+  assert.equal(page.data.draftSummary.customerCount, 1);
+  assert.equal(page.data.draftSummary.lineCount, 2);
+  assert.equal(page.data.draftSummary.knownTotalCents, 16400, '整数分累加，不混入缺价行');
+  assert.equal(page.data.draftSummary.knownTotalLabel, '¥164.00');
+  assert.equal(page.data.draftSummary.pendingCount, 1);
+  assert.equal(page.data.draftSummary.hasTodo, true);
+
+  page.setData({ scrollTo: '' });
+  page.openOrderSheet(tap({ tab: 'all' }));
+  assert.equal(page.data.orderSheetOpen, true);
+  assert.equal(page.data.orderSheetTab, 'all');
+  assert.equal(page.data.orderSheetStep, 'list');
+  assert.equal(page.data.scrollTo, '', '打开订单本不跳底');
+
+  page.switchOrderSheetTab(tap({ tab: 'pending' }));
+  assert.equal(page.data.orderSheetTab, 'pending');
+  assert.equal(page.data.priceDrawerOpen, true);
+  assert.deepEqual(page.data.priceDrawerRows.map(row => row.lineId), ['line-missing']);
+  assert.equal(page.data.scrollTo, '');
+
+  page.editPriceDrawerPrice({ ...tap({ line: 'line-missing' }), detail: { value: '12' } });
+  assert.equal(page.data.priceDrawerDirty, true);
+  await page.savePriceDrawer();
+  assert.equal(page.data.orderSheetOpen, true, '保存后平滑留在订单本');
+  assert.equal(page.data.orderSheetTab, 'pending');
+  assert.deepEqual(page.data.priceDrawerRows, []);
+  assert.equal(page.data.priceDrawerDirty, false);
+  assert.equal(page.data.scrollTo, '');
+
+  await page.previewInSheet();
+  assert.equal(page.data.orderSheetStep, 'preview');
+  assert.equal(page.data.orderSheetOpen, true);
+  assert.equal(page.data.sheetPreview.total, '200.00');
+  assert.equal(page.data.sheetPreview.pendingPrices, 0);
+  assert.equal(page.data.sheetPreview.allPending, false);
+  assert.equal(page.data.sheetPreview.displayTotal, '¥200.00');
+  assert.equal(page.data.sheetPreview.customers[0].pendingPrices, 0);
+  assert.equal(page.data.sheetPreview.customers[0].allPending, false);
+  assert.equal(page.data.sheetPreview.customers[0].displayTotal, '¥200.00');
+  const previewRequest = requests.find(request => request.path === '/trips/preview');
+  assert.deepEqual([previewRequest.data.draftId, previewRequest.data.revision], [draft.id, 2]);
+
+  await page.confirmSheetPreview();
+  assert.equal(page.data.orderSheetOpen, false);
+  assert.equal(page.data.confirmed, true);
+  assert.equal(page.data.deliverySummary.pillTitle, '送货中 · 0/1 家已送');
+  assert.ok(page.data.deliverySummary.pillSub.startsWith('预计应收 ¥200.00'));
+  assert.deepEqual(toasts.at(-1), { title: '已出单，取货单与送货单已生成', icon: 'none' });
+  assert.ok(requests.some(request => request.path === '/agent/card-actions' && request.data.action === 'confirm'));
+});
+
+test('6.6-2 blocks drawer preview until prices are saved and keeps failures inside the sheet', async t => {
+  const draft = order();
+  const base = draft.customers[0].items[0];
+  draft.customers[0].items[0] = { ...base, id: 'line-only', product: '水饺', quantity: '2', unit: '箱', price: null };
+  const { page, requests, handle, setDraft } = setup(t, draft);
+  let current = draft;
+  let mode = 'validation';
+  handle(request => {
+    if (request.path === `/drafts/${draft.id}`) {
+      current = { ...current, revision: current.revision + 1, customers: request.data.customers };
+      setDraft(current);
+      request.ok({ draft: current });
+      return true;
+    }
+    if (request.path === '/trips/preview') {
+      assert.ok(request.data.requestId);
+      if (mode === 'validation') request.ok({ error: 'invalid_draft', message: '请填写客户名称' }, 400);
+      else request.ok({ error: 'draft_changed', message: '草稿已更新，请重新预览' }, 409);
+      return true;
+    }
+    return false;
+  });
+  await page.onShow();
+  await page.login();
+  await page.onShow();
+  assert.equal(page.data.scrollTo, '');
+
+  page.openOrderSheet(tap({ tab: 'pending' }));
+  assert.equal(page.data.orderSheetOpen, true);
+  assert.equal(page.data.orderSheetTab, 'pending');
+  assert.equal(page.data.scrollTo, '');
+
+  page.editPriceDrawerPrice({ ...tap({ line: 'line-only' }), detail: { value: '8' } });
+  assert.equal(page.data.priceDrawerDirty, true);
+  await page.previewInSheet();
+  assert.equal(requests.some(request => request.path === '/trips/preview'), false, '未保存时不发预览请求');
+  assert.match(page.data.priceDrawerError, /保存价格/);
+  assert.equal(page.data.orderSheetOpen, true);
+  assert.equal(page.data.orderSheetStep, 'list');
+  assert.equal(page.data.priceDrawerRows[0].price, '8', '拦截时保留已填单价');
+  assert.equal(page.data.scrollTo, '');
+
+  await page.savePriceDrawer();
+  assert.equal(page.data.priceDrawerDirty, false);
+  assert.equal(page.data.orderSheetOpen, true);
+
+  await page.previewInSheet();
+  assert.equal(page.data.orderSheetOpen, true, '预览校验失败不关抽屉');
+  assert.equal(page.data.orderSheetStep, 'list');
+  assert.equal(page.data.sheetPreview, null);
+  assert.match(page.data.priceDrawerError, /请填写客户名称/);
+  assert.equal(page.data.scrollTo, '');
+
+  mode = 'changed';
+  await page.previewInSheet();
+  assert.equal(page.data.orderSheetOpen, true, '草稿冲突不关抽屉');
+  assert.equal(page.data.orderSheetStep, 'list');
+  assert.match(page.data.priceDrawerError, /草稿已更新/);
+  assert.equal(page.data.scrollTo, '');
+});
+
+test('6.6-2 shows honest all-pending totals inside the order book preview', async t => {
+  const pending = order();
+  pending.customers[0].items[0].price = null;
+  const first = setup(t, pending);
+  first.handle(request => {
+    if (request.path !== '/trips/preview') return false;
+    request.ok({ preview: { ...previewTrip(pending, true), previewId: 'pre-all-pending', draftId: pending.id,
+      revision: pending.revision, choices: [null] } });
+    return true;
+  });
+  await first.page.onShow();
+  await first.page.login();
+  first.page.openOrderSheet(tap({ tab: 'all' }));
+  await first.page.previewInSheet();
+  assert.equal(first.page.data.orderSheetStep, 'preview');
+  assert.equal(first.page.data.sheetPreview.total, '0.00', '预览接口原始金额仍是 0');
+  assert.equal(first.page.data.sheetPreview.pendingPrices, 1);
+  assert.equal(first.page.data.sheetPreview.allPending, true);
+  assert.equal(first.page.data.sheetPreview.displayTotal, '待补价', '全单缺价不得显示 ¥0.00');
+  assert.equal(first.page.data.sheetPreview.customers[0].pendingPrices, 1);
+  assert.equal(first.page.data.sheetPreview.customers[0].allPending, true);
+  assert.equal(first.page.data.sheetPreview.customers[0].displayTotal, '待补价');
+
+  const mixed = order();
+  const base = mixed.customers[0].items[0];
+  mixed.customers[0].items[0] = { ...base, id: 'line-open', price: null };
+  mixed.customers.push({ id: 'customer-paid', customer: '老李', partyId: null,
+    items: [{ ...base, id: 'line-paid', product: '汤圆', quantity: '1', unit: '箱', price: '30' }] });
+  const second = setup(t, mixed);
+  second.handle(request => {
+    if (request.path !== '/trips/preview') return false;
+    request.ok({ preview: { ...previewTrip(mixed, true), previewId: 'pre-mixed', draftId: mixed.id,
+      revision: mixed.revision, choices: [null] } });
+    return true;
+  });
+  await second.page.onShow();
+  await second.page.login();
+  second.page.openOrderSheet(tap({ tab: 'all' }));
+  await second.page.previewInSheet();
+  assert.equal(second.page.data.sheetPreview.allPending, false);
+  assert.equal(second.page.data.sheetPreview.displayTotal, '¥30.00');
+  assert.equal(second.page.data.sheetPreview.pendingPrices, 1);
+  assert.equal(second.page.data.sheetPreview.customers[0].allPending, true);
+  assert.equal(second.page.data.sheetPreview.customers[0].displayTotal, '待补价', '单店全缺价不得显示 ¥0.00');
+  assert.equal(second.page.data.sheetPreview.customers[1].allPending, false);
+  assert.equal(second.page.data.sheetPreview.customers[1].displayTotal, '¥30.00');
+  assert.equal(second.page.data.sheetPreview.customers[1].pendingPrices, 0);
+
+  const wxml = fs.readFileSync(require.resolve('../code/dist/pages/agent/index.wxml'), 'utf8');
+  assert.equal(wxml.includes('¥{{sheetPreview.total}}'), false, '总金额不得写死 ¥ 加原始金额');
+  assert.equal(wxml.includes('¥{{customer.total}}'), false, '门店小计不得写死 ¥ 加原始金额');
+  assert.ok(wxml.includes('sheetPreview.displayTotal'));
+  assert.ok(wxml.includes('customer.displayTotal'));
+  assert.ok(wxml.includes('trip-pill-todo num {{draftSummary.hasTodo'));
+});
+
+test('6.6-1 ships v2.0 global visual tokens and native bar palette', async () => {
+  const wxss = fs.readFileSync(require.resolve('../code/dist/app.wxss'), 'utf8');
+  for (const token of [
+    '--canvas: #F5F6F8', '--ink: #0F172A', '--primary: #0F6E52', '--warning: #B45309',
+    '--warning-line: #FDE68A', '--danger: #C81E1E', '--radius-pill: 48rpx', '--shadow-float:',
+    '.num { font-variant-numeric: tabular-nums; font-feature-settings: "tnum"; }',
+    'box-shadow: var(--shadow-card);', '.btn-secondary:active { background: #E2E8F0; }',
+  ]) {
+    assert.ok(wxss.includes(token), `app.wxss 缺少 v2.0 令牌或工具类 ${token}`);
+  }
+  assert.equal(wxss.includes('#12664D'), false, 'app.wxss 仍残留旧主色 #12664D');
+  assert.equal(wxss.includes('safe-area-inset-top'), false, '页面根节点严禁叠加顶部安全区');
+
+  const app = require('../code/dist/app.json');
+  assert.equal(app.tabBar.custom, undefined, '保持原生 tabBar，严禁 custom: true');
+  assert.equal(app.tabBar.list.length, 5, 'tabBar 仍为原生 5 标签');
+  assert.equal(app.window.navigationBarBackgroundColor, '#FFFFFF');
+  assert.equal(app.window.backgroundColor, '#F5F6F8');
+  assert.equal(app.tabBar.color, '#64748B');
+  assert.equal(app.tabBar.selectedColor, '#0F6E52');
+  assert.equal(app.tabBar.backgroundColor, '#FFFFFF');
+});
+
+test('6.6-3 builds the cold-storage picking summary with box and bag separation', () => {
+  const { formalTripView } = require('../code/dist/pages/workspace/trip-view');
+  const draft = order();
+  const base = draft.customers[0].items[0];
+  draft.customers.push({ id: 'c-2', customer: '老李', partyId: null, items: [
+    { ...base, id: 'i-shared' },
+    { id: 'i-bag', product: '汤圆', brand: '甲牌', specification: '500g', unit: '袋', quantity: '3', price: '10' },
+  ] });
+  const summary = previewTrip(draft, true);
+  const formal = { trip: { id: draft.id, origin: 's2',
+    versions: [{ ...summary, version: 1, savedAt: '2026-11-24T00:00:00Z' }],
+    statuses: statusesFor(summary.customers, 'pending'), statusRevision: 0 },
+  picking: pickingList(summary.customers), deliveryEdits: {}, sheets: [] };
+  const view = formalTripView(formal);
+  assert.equal(view.pickingKindCount, 2);
+  assert.equal(view.pickingTotalQty, 7);
+  assert.deepEqual(view.picking, formal.picking, '既有 picking 原结构保持不变');
+  assert.deepEqual(formal.picking.map(row => row.quantity), [4, 3], '同一货品跨店汇总不变');
+
+  const box = view.pickingRows.find(row => row.unit === '箱');
+  assert.deepEqual(box, { ...formal.picking.find(row => row.unit === '箱'),
+    title: '水饺', specMeta: '2 家要货', isBox: true });
+  const bag = view.pickingRows.find(row => row.unit === '袋');
+  assert.deepEqual(bag, { ...formal.picking.find(row => row.unit === '袋'),
+    title: '甲牌 汤圆', specMeta: '500g · 1 家要货', isBox: false });
+
+  const wxml = fs.readFileSync(require.resolve('../code/dist/pages/trip-picking/index.wxml'), 'utf8');
+  const wxss = fs.readFileSync(require.resolve('../code/dist/pages/trip-picking/index.wxss'), 'utf8');
+  for (const token of ['冷库取货单', '{{formal.pickingKindCount}} 种 · {{formal.pickingTotalQty}} 件',
+    'picking-qty-box', 'picking-qty-other']) {
+    assert.ok(wxml.includes(token), `取货单缺少 ${token}`);
+  }
+  for (const banned of ['<checkbox', 'openSheet', 'size="mini"', 'cover-view', 'safe-area-inset-top', '¥']) {
+    assert.equal(wxml.includes(banned), false, `取货单不得出现 ${banned}`);
+  }
+  assert.ok(wxss.includes('--primary-weak') && wxss.includes('--canvas-sub'), '箱袋底色复用全局令牌');
+  assert.equal(wxss.includes('@import'), false, '取货页不再引入旧 S5 样式');
+  assert.equal(wxss.includes('safe-area-inset-top'), false, '页面根节点不得叠加顶部安全区');
+  const emoji = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{26FF}\u{FE0F}]/u;
+  assert.equal(emoji.test(wxml) || emoji.test(wxss), false, '取货页零 Emoji');
+});
+
+test('6.6-3 shows honest pending totals, progress and blocks locking an unpriced line', async t => {
+  const draft = order();
+  const wang = { id: draft.customers[0].id, lineId: draft.customers[0].items[0].id };
+  draft.customers[0].items[0].price = null;
+  draft.customers.push({ id: 'c-li', customer: '老李', partyId: null,
+    items: [{ id: 'i-li', product: '汤圆', brand: '', specification: '', unit: '箱', quantity: '1', price: null }] });
+  const summary = previewTrip(draft, true);
+  const [wangOrder, liOrder] = summary.customers;
+  const baseStatuses = statusesFor(summary.customers, 'pending');
+  Object.assign(baseStatuses, Object.fromEntries(liOrder.items.map(item => [item.id, 'delivered'])));
+
+  const { pageFor, requests, handle } = setup(t, draft);
+  let edits = {};
+  let revision = 0;
+  let wangDone = false;
+  const statuses = () => wangDone
+    ? { ...baseStatuses, ...Object.fromEntries(wangOrder.items.map(item => [item.id, 'delivered'])) }
+    : baseStatuses;
+  const trip = () => ({
+    trip: { id: draft.id, origin: 's2',
+      versions: [{ ...summary, version: 1, savedAt: '2026-11-24T00:00:00Z' }],
+      statuses: statuses(), statusRevision: revision },
+    picking: pickingList(summary.customers), deliveryEdits: edits,
+    sheets: [
+      { sheetId: wang.id, reviewed: wangDone, deliveryCompleted: wangDone },
+      { sheetId: 'c-li', reviewed: true, deliveryCompleted: true },
+    ],
+  });
+  const details = () => {
+    const lines = deliveryLines(wangOrder, edits).map(line => ({ ...line, status: wangDone ? 'delivered' : 'pending' }));
+    const execution = deliverySummary(lines);
+    return { sheet: { tripId: draft.id, sheetId: wang.id, customer: wangOrder.customer, version: 1, statusRevision: revision,
+      reviewed: wangDone, deliveryCompleted: wangDone, orderCents: wangOrder.totalCents, execution,
+      amounts: { due: wangDone ? execution.totalCents : 0, remaining: 0, paid: 0, excess: 0 }, lines } };
+  };
+  handle(request => {
+    if (request.path === '/workspace') {
+      request.ok({ draft, parties: [], draftConfirmed: true, currentTrip: { id: draft.id } });
+      return true;
+    }
+    if (request.path === `/trips/${draft.id}`) { request.ok(trip()); return true; }
+    if (request.path === `/trips/${draft.id}/sheets/${wang.id}`) { request.ok(details()); return true; }
+    if (request.path === `/trips/${draft.id}/sheets/${wang.id}/delivery/line`) {
+      edits = { ...edits, [request.data.lineId]: { receivedQuantity: Number(request.data.receivedQuantity),
+        unitPriceCents: request.data.price === null ? null : Math.round(Number(request.data.price) * 100) } };
+      revision += 1;
+      request.ok(details());
+      return true;
+    }
+    if (request.path === `/trips/${draft.id}/sheets/${wang.id}/delivery/complete`) {
+      wangDone = true;
+      revision += 1;
+      request.ok(details());
+      return true;
+    }
+    return false;
+  });
+
+  agentSession.token = token;
+  const delivery = pageFor('trip-delivery');
+  await delivery.onShow();
+  assert.equal(delivery.data.formal.deliveryAllPending, true);
+  assert.equal(delivery.data.formal.deliveryTotalTitle, '待补价');
+  assert.equal(delivery.data.formal.deliveryTotalAmount, '待补价');
+  assert.equal(delivery.data.formal.deliveryTotalCents, 0);
+  assert.equal(delivery.data.formal.deliveryPendingCount, 2);
+  assert.equal(delivery.data.formal.deliveryProgressPercent, 50);
+  assert.equal(delivery.data.formal.deliveredCount, 1);
+  const rows = delivery.data.formal.deliveryRows;
+  assert.equal(rows[0].dueLabel, '待补价');
+  assert.notEqual(rows[0].dueLabel, '¥0.00');
+  assert.equal(rows[0].actionHint, '点进核对');
+  assert.equal(rows[1].dueLabel, '待补价');
+  assert.notEqual(rows[1].dueLabel, '¥0.00');
+  assert.equal(rows[1].actionHint, '已锁账');
+  const deliveryWxml = fs.readFileSync(require.resolve('../code/dist/pages/trip-delivery/index.wxml'), 'utf8');
+  for (const token of ['progress-card', 'progress-fill', 'deliveryProgressPercent', 'deliveryAllPending']) {
+    assert.ok(deliveryWxml.includes(token), `送货列表缺少 ${token}`);
+  }
+
+  await delivery.openSheet(tap({ tripId: draft.id, sheetId: wang.id }));
+  assert.equal(delivery.data.sheet.pendingCount, 1);
+  assert.equal(delivery.data.sheet.allPending, true);
+  assert.equal(delivery.data.sheet.dueTitle, '预计本次应收');
+  assert.equal(delivery.data.sheet.dueDisplay, '待补价');
+  assert.notEqual(delivery.data.sheet.dueDisplay, '¥0.00');
+
+  const toasts = [];
+  global.wx.showToast = spec => toasts.push(spec);
+  await delivery.completeDelivery();
+  assert.match(delivery.data.error, /水饺/);
+  assert.equal(delivery.data.fieldEdit.id, wang.lineId);
+  assert.equal(delivery.data.fieldEdit.receivedQuantity, '2');
+  assert.deepEqual(toasts.at(-1), { title: '请先补填缺价货品单价', icon: 'none' });
+  assert.equal(requests.filter(request => request.path.endsWith('/delivery/complete')).length, 0, '缺价拦截不得发锁账请求');
+
+  delivery.toggleFieldEdit(tap({ id: wang.lineId }));
+  assert.equal(delivery.data.fieldEdit, null, '再点同一行收起编辑');
+  delivery.toggleFieldEdit(tap({ id: wang.lineId }));
+  assert.equal(delivery.data.fieldEdit.id, wang.lineId);
+
+  delivery.stepReceivedQuantity(tap({ delta: 1 }));
+  assert.equal(delivery.data.fieldEdit.receivedQuantity, '3');
+  for (let index = 0; index < 4; index += 1) delivery.stepReceivedQuantity(tap({ delta: -1 }));
+  assert.equal(delivery.data.fieldEdit.receivedQuantity, '0');
+  delivery.stepReceivedQuantity(tap({ delta: -1 }));
+  assert.equal(delivery.data.fieldEdit.receivedQuantity, '0', '步进下限锁定 0，不出现负数');
+
+  delivery.editDeliveryField({ ...tap({ field: 'receivedQuantity' }), detail: { value: '0' } });
+  await delivery.saveFieldEdit();
+  assert.equal(edits[wang.lineId].receivedQuantity, 0);
+  assert.equal(edits[wang.lineId].unitPriceCents, null);
+  assert.equal(delivery.data.sheet.lines[0].receivedQuantity, 0);
+  assert.equal(delivery.data.sheet.lines[0].amountLabel, '¥0.00', '实收 0 计零分');
+  assert.equal(delivery.data.fieldEdit, null);
+
+  delivery.toggleFieldEdit(tap({ id: wang.lineId }));
+  delivery.editDeliveryField({ ...tap({ field: 'receivedQuantity' }), detail: { value: '1' } });
+  delivery.editDeliveryField({ ...tap({ field: 'price' }), detail: { value: '82' } });
+  await delivery.saveFieldEdit();
+  assert.deepEqual(edits[wang.lineId], { receivedQuantity: 1, unitPriceCents: 8200 });
+  assert.equal(delivery.data.sheet.lines[0].amountLabel, '¥82.00');
+  assert.equal(delivery.data.sheet.pendingCount, 0);
+  assert.equal(delivery.data.sheet.dueDisplay, '¥82.00');
+  assert.equal(delivery.data.formal.deliveryTotalCents, 8200);
+  assert.equal(delivery.data.formal.deliveryTotalTitle, '已算金额');
+  assert.equal(delivery.data.formal.deliveryTotalAmount, '¥82.00');
+  assert.equal(delivery.data.formal.deliveryProgressPercent, 50);
+  assert.equal(delivery.data.formal.deliveryAllPending, false);
+
+  await delivery.completeDelivery();
+  assert.equal(requests.filter(request => request.path.endsWith('/delivery/complete')).length, 1);
+  assert.equal(delivery.data.sheet.reviewed, true);
+  assert.equal(delivery.data.sheet.dueTitle, '本次实收锁定金额');
+  assert.equal(delivery.data.sheet.dueDisplay, '¥82.00');
+  assert.equal(delivery.data.formal.deliveryProgressPercent, 100);
+  assert.equal(delivery.data.formal.deliveredCount, 2);
+  assert.equal(delivery.data.formal.deliveryTotalCents, 8200);
+});
+
+test('6.6-4 completes customer naming inside the pending drawer without closing the order book', async t => {
+  const draft = order();
+  const { page, requests, handle, setDraft } = setup(t, draft);
+  const customer = draft.customers[0];
+  Object.assign(customer, { customer: '' });
+  delete customer.partyId;
+  const customerId = customer.id;
+  customer.items[0] = { ...customer.items[0], id: 'line-pending', product: '水饺', quantity: '2', unit: '箱', price: null };
+  const puts = [];
+  const previews = [];
+  const toasts = [];
+  let current = draft;
+  global.wx.showToast = spec => toasts.push(spec);
+  handle(request => {
+    if (request.path === '/agent/memory') {
+      request.ok({ draftId: current.id, revision: current.revision, confirmed: false,
+        customers: [], mentions: [], prices: [], catalogChoices: [] });
+      return true;
+    }
+    if (request.method === 'PUT' && request.path === `/drafts/${draft.id}`) {
+      puts.push(request.data);
+      current = { ...current, revision: current.revision + 1, customers: request.data.customers };
+      setDraft(current);
+      request.ok({ draft: current });
+      return true;
+    }
+    if (request.path === '/trips/preview') {
+      previews.push(request.data);
+      request.ok({ preview: { ...previewTrip(current, true), previewId: 'pre-zero-name', draftId: current.id,
+        revision: current.revision, choices: [null] } });
+      return true;
+    }
+    return false;
+  });
+  await page.onShow();
+  await page.login();
+  assert.equal(page.data.draftSummary.unnamedCustomers.length, 1);
+  assert.equal(page.data.draftSummary.pendingCount, 1);
+
+  page.openOrderSheet(tap({ tab: 'pending' }));
+  assert.equal(page.data.orderSheetOpen, true);
+  assert.equal(page.data.orderSheetTab, 'pending');
+  assert.deepEqual(page.data.priceDrawerRows.map(row => row.lineId), ['line-pending']);
+
+  page.editPriceDrawerPrice({ ...tap({ line: 'line-pending' }), detail: { value: '8' } });
+  await page.savePriceDrawer();
+  assert.equal(page.data.orderSheetOpen, true);
+  assert.deepEqual(page.data.priceDrawerRows, []);
+
+  await page.previewInSheet();
+  assert.equal(previews.length, 0, '未填店名时不得直接发预览请求');
+  assert.equal(page.data.orderSheetOpen, true, '自动弹出补店名弹层前抽屉保持打开');
+  assert.equal(page.data.customerSheet.id, customerId);
+  assert.equal(page.data.customerSheet.label, '未命名客户');
+  assert.equal(page.data.customerSheet.value, '');
+  assert.ok(toasts.some(toast => toast.title === '先填上店名就能出单'));
+
+  page.editSheetCustomerName({ detail: { value: '老白餐饮' } });
+  await page.saveCustomerSheet();
+  assert.equal(puts.length, 2);
+  assert.equal(puts.at(-1).customers[0].customer, '老白餐饮');
+  assert.equal(puts.at(-1).customers[0].partyId, null, '零熟客账号保存店名即按新建客户处理');
+  assert.equal(page.data.customerSheet, null);
+  assert.equal(page.data.orderSheetOpen, true, '保存店名后订单本仍保持打开');
+  assert.equal(page.data.choices.length, 0);
+  assert.equal(page.data.priceDrawerError, '');
+
+  await page.previewInSheet();
+  assert.equal(previews.length, 1, '补好店名后一次通过预览');
+  assert.equal(page.data.orderSheetOpen, true);
+  assert.equal(page.data.orderSheetStep, 'preview');
+  assert.equal(page.data.priceDrawerError, '');
+  assert.ok(requests.some(request => request.path === '/trips/preview'));
+});
+
+test('6.6-4 keeps choice and catalog cards, drawer scroll and pill todos in sync inside the order book', async t => {
+  const draft = order();
+  const customer = draft.customers[0];
+  Object.assign(customer, { customer: '老白餐饮' });
+  delete customer.partyId;
+  const customerId = customer.id;
+  const line = customer.items[0];
+  Object.assign(line, { id: 'line-catalog', product: '鸭血', brand: '', specification: '', unit: '盒',
+    quantity: '2', price: null, priceSource: null, catalogStatus: 'ambiguous', priceHint: null });
+  const { page, requests, handle, setDraft } = setup(t, draft);
+  const previews = [];
+  const choices = [];
+  const catalogs = [];
+  let current = draft;
+  global.wx.showToast = () => {};
+  const pendingMention = () => ({ draftCustomerId: customerId, resolution: { status: 'candidate_only', customerId: null,
+    candidates: [{ customerId: 'p-strong', canonicalName: '强记面馆' }] } });
+  const catalogChoice = () => ({ draftCustomerId: customerId, lineId: line.id, status: 'ambiguous', priceHint: null,
+    candidates: [{ productId: 'p-duck', variantId: 'v-300', product: '鸭血', brand: '甲牌', specification: '300g',
+      unit: '盒', priceCents: 700, status: 'active' }] });
+  handle(request => {
+    if (request.path === '/agent/memory') {
+      const state = current.customers[0];
+      request.ok({ draftId: current.id, revision: current.revision, confirmed: false,
+        customers: [{ id: 'p-strong', name: '强记面馆' }],
+        mentions: state.partyId === undefined ? [pendingMention()] : [], prices: [],
+        catalogChoices: state.items[0].catalogStatus === 'ambiguous' ? [catalogChoice()] : [] });
+      return true;
+    }
+    if (request.path === '/agent/customer-choice') {
+      choices.push(request.data);
+      current = { ...current, revision: current.revision + 1, customers: current.customers.map(entry =>
+        entry.id === customerId ? { ...entry, partyId: null } : entry) };
+      setDraft(current);
+      request.ok({ revision: current.revision, remembered: null });
+      return true;
+    }
+    if (request.path === '/agent/catalog-choice') {
+      catalogs.push(request.data);
+      current = { ...current, revision: current.revision + 1, customers: current.customers.map(entry =>
+        entry.id === customerId ? { ...entry, items: entry.items.map(item => item.id === line.id
+          ? { ...item, price: '7.00', priceSource: 'catalog', catalogStatus: null } : item) } : entry) };
+      setDraft(current);
+      request.ok({ revision: current.revision, item: current.customers[0].items[0],
+        priceUpdates: [{ draftCustomerId: customerId, lineId: line.id, product: '鸭血', beforePrice: null,
+          beforeSource: null, price: '7.00', priceSource: 'catalog', text: '鸭血：待补价 → 库内价 ¥7.00' }] });
+      return true;
+    }
+    if (request.path === '/trips/preview') {
+      previews.push(request.data);
+      request.ok({ preview: { ...previewTrip(current, true), previewId: 'pre-choice', draftId: current.id,
+        revision: current.revision, choices: [null] } });
+      return true;
+    }
+    return false;
+  });
+  await page.onShow();
+  await page.login();
+  assert.equal(page.data.choices.length, 1);
+  assert.equal(page.data.catalogChoices.length, 1);
+  assert.match(page.data.draftSummary.todoText, /待确认客户/);
+  assert.match(page.data.draftSummary.todoText, /待选款/);
+
+  page.openOrderSheet(tap({ tab: 'pending' }));
+  assert.equal(page.data.orderSheetOpen, true);
+  const beforeTop = page.data.orderSheetScrollTop;
+  await page.previewInSheet();
+  assert.equal(previews.length, 0, '待确认客户时不得发预览请求');
+  assert.match(page.data.priceDrawerError, /请先在上方确认「老白餐饮」是已有熟客还是新建客户/);
+  assert.notEqual(page.data.orderSheetScrollTop, beforeTop, '提示同时把订单本滚回顶部露出选店卡');
+  assert.equal(page.data.orderSheetOpen, true);
+
+  await page.newCustomer(tap({ customer: customerId }));
+  assert.deepEqual(choices.map(choice => choice.choice), ['new']);
+  assert.equal(page.data.orderSheetOpen, true);
+  assert.equal(page.data.priceDrawerError, '');
+  assert.deepEqual(page.data.priceDrawerRows.map(row => row.lineId), ['line-catalog'], '选店后待填价列表原地刷新');
+  assert.equal(page.data.choices.length, 0);
+
+  await page.chooseCatalogVariant(tap({ line: line.id, variant: 'v-300' }));
+  assert.equal(catalogs.length, 1);
+  assert.equal(catalogs[0].variantId, 'v-300');
+  assert.equal(page.data.orderSheetOpen, true);
+  assert.equal(page.data.priceDrawerError, '');
+  assert.deepEqual(page.data.priceDrawerRows, [], '选款带回价格后待填价列表同步清空');
+  assert.equal(page.data.catalogChoices.length, 0);
+
+  await page.previewInSheet();
+  assert.equal(previews.length, 1);
+  assert.equal(page.data.orderSheetOpen, true);
+  assert.equal(page.data.orderSheetStep, 'preview');
+  assert.ok(requests.some(request => request.path === '/trips/preview'));
+
+  const wxml = fs.readFileSync(require.resolve('../code/dist/pages/agent/index.wxml'), 'utf8');
+  const emoji = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{26FF}\u{FE0F}]/u;
+  assert.ok(wxml.includes('sheet-pending-actions'));
+  assert.ok(wxml.includes('scroll-top="{{orderSheetScrollTop}}"'));
+  assert.ok(wxml.includes('id="pf-{{row.lineId}}"'), '待填价定位锚点保持');
+  assert.equal(wxml.includes('size="mini"'), false);
+  assert.equal(wxml.includes('cover-view'), false);
+  assert.equal(wxml.includes('safe-area-inset-top'), false);
+  assert.equal(emoji.test(wxml), false);
 });

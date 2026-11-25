@@ -1,33 +1,34 @@
 page {
-  /* ---- 画布与表面 ---- */
-  --canvas: #F4F6F5;
-  --canvas-sub: #EDF2EF;
+  /* ---- 画布与表面（现代极简通透冷灰层次） ---- */
+  --canvas: #F5F6F8;
+  --canvas-sub: #F1F5F9;
   --surface: #FFFFFF;
-  --surface-sunken: #F7F9F8;
+  --surface-sunken: #F8FAFC;
 
-  /* ---- 文字层级 ---- */
-  --ink: #182B24;
-  --ink-2: #394D45;
-  --ink-3: #596C64;
-  --ink-disabled: #9BA9A3;
+  /* ---- 文字层级（全线高对比，强光冷库不发虚） ---- */
+  --ink: #0F172A;
+  --ink-2: #475569;
+  --ink-3: #64748B;
+  --ink-disabled: #94A3B8;
 
-  /* ---- 边框与分割线 ---- */
-  --hairline: #DFE7E3;
-  --hairline-strong: #C9D6D0;
+  /* ---- 极细描边与分割线 ---- */
+  --hairline: rgba(15, 23, 42, 0.08);
+  --hairline-strong: rgba(15, 23, 42, 0.14);
 
-  /* ---- 品牌主交互色（冷杉墨绿） ---- */
-  --primary: #12664D;
-  --primary-pressed: #0D4F3B;
-  --primary-weak: #E4F2EC;
+  /* ---- 品牌主交互色（深翠墨绿） ---- */
+  --primary: #0F6E52;
+  --primary-pressed: #0B563F;
+  --primary-weak: #EBF6F2;
   --on-primary: #FFFFFF;
 
   /* ---- 语义状态色 ---- */
-  --success: #12664D;
-  --success-weak: #E6F4EE;
-  --warning: #A84B00;
-  --warning-weak: #FFF5E5;
-  --danger: #B8261E;
-  --danger-weak: #FDECEB;
+  --success: #0F6E52;
+  --success-weak: #EBF6F2;
+  --warning: #B45309;
+  --warning-weak: #FFFBEB;
+  --warning-line: #FDE68A;
+  --danger: #C81E1E;
+  --danger-weak: #FEF2F2;
 
   /* ---- 间距标尺 ---- */
   --space-1: 8rpx;
@@ -38,9 +39,10 @@ page {
   --page-x: 28rpx;
 
   /* ---- 圆角标尺 ---- */
-  --radius-sm: 12rpx;
-  --radius-md: 18rpx;
-  --radius-lg: 24rpx;
+  --radius-sm: 16rpx;
+  --radius-md: 24rpx;
+  --radius-lg: 32rpx;
+  --radius-pill: 48rpx;
 
   /* ---- 触控尺寸底线 ---- */
   --tap-card-btn: 80rpx;
@@ -48,8 +50,9 @@ page {
   --action-h: 96rpx;
   --row-min: 104rpx;
 
-  /* ---- 极简阴影 ---- */
-  --shadow-card: 0 2rpx 10rpx rgba(24, 43, 36, 0.04);
+  /* ---- 极简微影 ---- */
+  --shadow-card: 0 2rpx 6rpx rgba(15, 23, 42, 0.03), 0 8rpx 24rpx rgba(15, 23, 42, 0.02);
+  --shadow-float: 0 8rpx 32rpx rgba(15, 23, 42, 0.06);
 
   background: var(--canvas);
   color: var(--ink);
@@ -78,7 +81,7 @@ page {
 .btn-primary { height: var(--action-h); background: var(--primary); color: var(--on-primary); font-weight: 600; }
 .btn-primary:active { background: var(--primary-pressed); }
 .btn-secondary { height: var(--tap-min); background: var(--canvas-sub); color: var(--ink); font-weight: 500; }
-.btn-secondary:active { background: var(--hairline); }
+.btn-secondary:active { background: #E2E8F0; }
 .btn-ghost {
   height: var(--tap-card-btn);
   background: transparent;
@@ -112,6 +115,7 @@ page {
   border-radius: var(--radius-lg);
   padding: 28rpx;
   margin: 24rpx 0;
+  box-shadow: var(--shadow-card);
 }
 label { display: block; margin: 20rpx 0 10rpx; font-size: 26rpx; }
 input {

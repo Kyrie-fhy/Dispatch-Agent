@@ -1,10 +1,43 @@
-<view class="container">
-  <view class="title">取货清单</view>
+<view class="picking-page">
   <view wx:if="{{error}}" class="error">{{error}}</view>
   <view wx:if="{{!signedIn}}" class="card">
-    <view class="hint">微信登录后查看本趟冷库汇总拿货单。</view>
+    <view class="empty-title">微信登录后查看取货单</view>
+    <view class="hint">登录后自动按本趟出单快照汇总整车应取货品。</view>
     <button class="btn-primary" bindtap="goAssistant">去助手登录</button>
   </view>
   <view wx:elif="{{busy && !draft}}" class="hint">正在读取取货清单…</view>
-  <block wx:else><include src="../workspace/picking.wxml" /></block>
+  <view wx:elif="{{!formal}}" class="card">
+    <view class="empty-title">本趟还没确认出单</view>
+    <view class="hint">确认出单后，这里会自动汇总整车应取货品。</view>
+    <button class="btn-primary" bindtap="goAssistant">去助手录单</button>
+  </view>
+  <block wx:else>
+    <view class="picking-top">
+      <view class="picking-top-main">
+        <view class="picking-title">冷库取货单</view>
+        <view class="picking-sub">按确认出单数量汇总，箱袋分开</view>
+      </view>
+      <view class="picking-count-pill num">{{formal.pickingKindCount}} 种 · {{formal.pickingTotalQty}} 件</view>
+    </view>
+    <view wx:if="{{formal.version > 1}}" class="card">
+      <view class="section-title">第 {{formal.version}} 版取货变化</view>
+      <view wx:if="{{!formal.changes.length}}" class="hint">本次取货数量无变化</view>
+      <view wx:for="{{formal.changes}}" wx:key="id" class="line">
+        <view>{{item.brand ? item.brand + ' ' : ''}}{{item.product}}{{item.specification ? ' · ' + item.specification : ''}}</view>
+        <view class="num">{{item.before}} → {{item.after}} {{item.unit}}</view>
+      </view>
+    </view>
+    <view class="picking-card">
+      <view wx:for="{{formal.pickingRows}}" wx:key="id" class="picking-row">
+        <view class="picking-info">
+          <view class="picking-name">{{item.title}}</view>
+          <view wx:if="{{item.specMeta}}" class="picking-spec">{{item.specMeta}}</view>
+        </view>
+        <view class="picking-qty-badge {{item.isBox ? 'picking-qty-box' : 'picking-qty-other'}}">
+          <text class="picking-qty-num num">{{item.quantity}}</text>
+          <text class="picking-qty-unit">{{item.unit}}</text>
+        </view>
+      </view>
+    </view>
+  </block>
 </view>

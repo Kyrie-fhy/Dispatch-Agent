@@ -205,7 +205,13 @@ button { margin-top: 20rpx; font-size: 30rpx; border-radius: var(--radius-md); }
 .option-active { background: var(--primary-weak); color: var(--primary); }
 
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
+  page {
+    --dur-press: 0.01ms;
+    --dur-fast: 0.01ms;
+    --dur-base: 0.01ms;
+    --dur-sheet: 0.01ms;
+  }
+  view, text, button, input, textarea, scroll-view, image {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;

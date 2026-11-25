@@ -3190,6 +3190,8 @@ test('UX & Motion: order sheet guards unsaved prices, voice pad explains tap flo
     'prefers-reduced-motion: reduce', '.skeleton-card']) {
     assert.ok(appWxss.includes(token), `app.wxss 缺少统一动效或骨架令牌 ${token}`);
   }
+  const appWxssNoComments = appWxss.replace(/\/\*[\s\S]*?\*\//g, '');
+  assert.equal(/\*/.test(appWxssNoComments), false, 'WXSS 不支持通配符 * 选择器，会导致微信开发者工具编译报错');
   const agentWxml = read('pages/agent/index.wxml');
   for (const token of ['scroll-with-animation="{{true}}"', 'confirm-type="done"', 'voice-pad-text',
     'orderSheetMounted', 'customerSheetRender', 'requestCloseOrderSheet', '点一下开始说', '点一下结束']) {

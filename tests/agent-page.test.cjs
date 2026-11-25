@@ -3236,11 +3236,19 @@ test('UX & Motion: order sheet guards unsaved prices, voice pad explains tap flo
   assert.equal(page.data.priceDrawerRows[0].price, '88', '已填单价未丢失');
   modal.success({ confirm: true });
   assert.equal(page.data.orderSheetOpen, false, '确认放弃后抽屉关闭');
-  // Interruptible reopen during exit transition
+  // Interruptible reopen during exit transition & preview exit does not snap back to list
   page.openOrderSheet(tap({ tab: 'all' }));
   assert.equal(page.data.orderSheetOpen, true);
   assert.equal(page.data.orderSheetMounted, true);
+  page.setData({ orderSheetStep: 'preview', sheetPreview: { id: 'p-exit', customers: [], totalCents: 0, pendingPrices: 0, allPending: false, displayTotal: '¥0.00' } });
   page.closeOrderSheet();
+  assert.equal(page.data.orderSheetOpen, false);
+  assert.equal(page.data.orderSheetStep, 'preview', '退场动画期间保持预览态，不闪回列表');
+  assert.equal(page.confirmSheetPreview(), undefined, '退场期间阻止误点确认出单');
+  page.onHide();
+  assert.equal(page.data.orderSheetMounted, false);
+  assert.equal(page.data.orderSheetStep, 'list');
+  assert.equal(page.data.sheetPreview, null);
 
   // 2. Unlinking customer ("不是他") scrolls choice card into view
   await page.notHim(tap({ turn: linkTurn.id, customer: draft.customers[0].id }));

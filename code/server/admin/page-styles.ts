@@ -248,7 +248,7 @@ export const adminStyles = `
     box-shadow: 0 4px 12px rgba(15, 110, 82, .22);
   }
   .side-brand b { display: block; font-size: 15px; letter-spacing: .01em; }
-  .side-brand span { display: block; color: var(--muted); font-size: 11px; }
+  .side-brand > div > span { display: block; color: var(--muted); font-size: 11px; }
   .side-nav { flex: 1; min-height: 0; overflow: auto; padding: 2px 2px 10px; }
   .nav-group { margin-top: 16px; }
   .nav-group-label {
@@ -353,7 +353,8 @@ export const adminStyles = `
     border-color: var(--green-border); background: var(--green-soft); color: var(--green-dark);
     animation: admin-pop var(--dur-fast) var(--ease-spring);
   }
-  .btn-small { padding: 5px 10px; border-radius: 7px; font-size: 11px; }
+  .btn-small { padding: 5px 10px; border-color: var(--line); border-radius: 7px; font-size: 11px; }
+  .btn-small.btn-ghost { border-color: transparent; }
   .btn-block { width: 100%; }
   .row-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
   .back-link {
@@ -797,6 +798,7 @@ export const adminStyles = `
   }
   .catalog-table-wrap { max-height: 68vh; overflow: auto; }
   .catalog-table th { position: sticky; top: 0; z-index: 1; }
+  .catalog-row { content-visibility: auto; contain-intrinsic-size: auto 56px; }
   .catalog-row.missing-unit td { background: var(--amber-bg); }
   .catalog-row.missing-unit:hover td { background: var(--amber-soft); }
   .catalog-overview .metric-grid { margin-top: 4px; }

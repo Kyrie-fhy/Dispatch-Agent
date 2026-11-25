@@ -373,14 +373,15 @@ export const adminDataScript = `
     loadCatalogCustomers(account.id);
   };
   var refreshCatalogInPlace = function (accountId, highlightVariantId) {
+    if (!isCurrent('catalog', accountId)) return Promise.resolve();
     var reqSeq = ++catalogLoadSeq;
-    var tableWrap = el('catalogTableWrap');
-    var scrollTop = tableWrap ? tableWrap.scrollTop : 0;
     return request(accountPath(accountId, '/catalog')).then(function (data) {
       if (reqSeq !== catalogLoadSeq || !isCurrent('catalog', accountId)) return;
       catalogView.data = data;
       var overview = el('catalogOverview');
       if (overview) {
+        var wrap = el('catalogTableWrap');
+        var scrollTop = wrap ? wrap.scrollTop : 0;
         overview.innerHTML = renderCatalogOverviewInner(data);
         var catSelect = el('catalog-category');
         if (catSelect) {
@@ -390,7 +391,6 @@ export const adminDataScript = `
           }).join('');
         }
         renderCatalogRows(highlightVariantId);
-        var wrap = el('catalogTableWrap');
         if (wrap) wrap.scrollTop = scrollTop;
       } else {
         renderCatalogView();
@@ -1372,6 +1372,7 @@ export const adminDataScript = `
   };
 
   var refreshMistakesInPlace = function (accountId) {
+    if (!isCurrent('mistakes', accountId)) return Promise.resolve();
     var reqSeq = ++mistakesLoadSeq;
     var expectedStatus = mistakesView.status;
     return request(accountPath(accountId, '/mistakes?status=' + encodeURIComponent(expectedStatus)))
@@ -1398,15 +1399,22 @@ export const adminDataScript = `
     }).then(function () {
       toast(message, 'success');
       App.loadAccounts().catch(function () {});
-      if (state.accountId !== targetAccountId) return;
+      if (!isCurrent('mistakes', targetAccountId)) return;
+      var runRefresh = function () {
+        if (!isCurrent('mistakes', targetAccountId)) return;
+        return refreshMistakesInPlace(targetAccountId).catch(function () {
+          if (card && card.isConnected) card.classList.remove('is-removing');
+          if (trigger && trigger.isConnected) trigger.disabled = false;
+          toast('状态已保存，但列表刷新失败，请点顶部「刷新」查看。', 'error');
+        });
+      };
       if (card && willLeaveList && typeof window.requestAnimationFrame === 'function') {
         card.classList.add('is-removing');
-        return new Promise(function (resolve) { setTimeout(resolve, 165); }).then(function () {
-          return refreshMistakesInPlace(targetAccountId);
-        });
+        return new Promise(function (resolve) { setTimeout(resolve, 165); }).then(runRefresh);
       }
-      return refreshMistakesInPlace(targetAccountId);
+      return runRefresh();
     }, function (error) {
+      if (card && card.isConnected) card.classList.remove('is-removing');
       if (trigger && trigger.isConnected) trigger.disabled = false;
       throw error;
     });
@@ -1641,8 +1649,10 @@ export const adminDataScript = `
       var next = node.getAttribute('data-mistake-next');
       var statusAccountId = state.accountId;
       try {
-        patchMistake(node.getAttribute('data-mistake-status'), { status: next },
-          next === 'resolved' ? '已标为修复。' : '已重开为待修复。', statusAccountId, node);
+        Promise.resolve(patchMistake(node.getAttribute('data-mistake-status'), { status: next },
+          next === 'resolved' ? '已标为修复。' : '已重开为待修复。', statusAccountId, node)).catch(function (error) {
+          toast(error && error.message ? error.message : '操作失败', 'error');
+        });
       } catch (error) {
         toast(error && error.message ? error.message : '操作失败', 'error');
       }

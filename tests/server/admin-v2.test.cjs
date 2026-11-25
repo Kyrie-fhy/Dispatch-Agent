@@ -1510,4 +1510,10 @@ test('UX & Motion guards: modal blocks Enter while closing or IME composing, and
   const listText = mistakeHarness.document.querySelector('#mistakesList').textContent;
   assert.ok(listText.includes('已修复条目'), '已修复列表应保持');
   assert.equal(listText.includes('旧待修复'), false, '过期的待修复局部刷新不得覆盖已修复列表');
+
+  // 4. Refresh button accessibility label & brand-mark specificity guard
+  const refreshBtn = baseHarness.document.querySelector('#refreshBtn');
+  assert.equal(refreshBtn.getAttribute('aria-label'), '刷新最新数据');
+  assert.ok(adminStyles.includes('.side-brand > div > span'), '品牌标 D 不被侧栏副标题样式误覆盖');
+  assert.ok(adminStyles.includes('content-visibility: auto'), '长货品列表启用视口外跳过绘制');
 });

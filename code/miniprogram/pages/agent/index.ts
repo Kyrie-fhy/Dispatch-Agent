@@ -368,7 +368,9 @@ Page({
     this.visible = false;
     this.stopPolling();
     this.clearSheetTimers();
-    if (!this.data.orderSheetOpen && this.data.orderSheetMounted) this.setData({ orderSheetMounted: false });
+    if (!this.data.orderSheetOpen && this.data.orderSheetMounted) {
+      this.setData({ orderSheetMounted: false, orderSheetTab: 'all', orderSheetStep: 'list', sheetPreview: null, priceDrawerRows: [] });
+    }
     if (!this.data.customerSheet && this.data.customerSheetRender) this.setData({ customerSheetRender: null });
     this.voiceCapture?.cancel();
     this.pauseUpload = true;
@@ -1150,12 +1152,17 @@ Page({
 
   closeOrderSheet(): void {
     if (this.orderSheetTimer !== null) clearTimeout(this.orderSheetTimer);
-    this.setData({ orderSheetOpen: false, orderSheetTab: 'all', orderSheetStep: 'list', sheetPreview: null,
-      priceDrawerOpen: false, priceDrawerRows: [], priceDrawerDirty: false, priceDrawerError: '', priceDrawerFocusId: '' });
-    if (!this.data.orderSheetMounted) return;
+    if (!this.data.orderSheetMounted) {
+      this.setData({ orderSheetOpen: false, orderSheetTab: 'all', orderSheetStep: 'list', sheetPreview: null,
+        priceDrawerOpen: false, priceDrawerRows: [], priceDrawerDirty: false, priceDrawerError: '', priceDrawerFocusId: '' });
+      return;
+    }
+    this.setData({ orderSheetOpen: false, priceDrawerOpen: false, priceDrawerDirty: false, priceDrawerError: '', priceDrawerFocusId: '' });
     this.orderSheetTimer = setTimeout(() => {
       this.orderSheetTimer = null;
-      if (!this.data.orderSheetOpen) this.setData({ orderSheetMounted: false });
+      if (!this.data.orderSheetOpen) {
+        this.setData({ orderSheetMounted: false, orderSheetTab: 'all', orderSheetStep: 'list', sheetPreview: null, priceDrawerRows: [] });
+      }
     }, 240);
   },
 
@@ -1330,7 +1337,7 @@ Page({
 
   confirmSheetPreview(): Promise<void> | undefined {
     const preview = this.data.sheetPreview;
-    if (!preview || this.data.busy || this.data.polling) return;
+    if (!this.data.orderSheetOpen || !preview || this.data.busy || this.data.polling) return;
     this.card('confirm');
     return this.run(async () => {
       try {

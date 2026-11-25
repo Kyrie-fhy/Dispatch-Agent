@@ -67,7 +67,7 @@ export const adminShellHtml = `
         <button type="button" id="themeBtn" class="btn btn-ghost" title="切换浅色 / 深色外观" aria-label="切换外观">
           <span id="themeIcon" class="icon-inline" aria-hidden="true"></span><span class="btn-label-sm" id="themeLabel">外观</span>
         </button>
-        <button type="button" id="refreshBtn" class="btn btn-ghost">
+        <button type="button" id="refreshBtn" class="btn btn-ghost" title="刷新最新数据" aria-label="刷新最新数据">
           <svg class="icon-inline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg><span class="btn-label-sm">刷新</span>
         </button>
         <button type="button" id="logoutBtn" class="btn btn-ghost">退出后台</button>

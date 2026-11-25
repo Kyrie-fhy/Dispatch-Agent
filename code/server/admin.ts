@@ -1,1 +1,1 @@
-export { configuredAdminToken, handleAdmin } from './admin/routes';
+export { configuredAdminOrigins, configuredAdminToken, handleAdmin, parseAdminOrigin } from './admin/routes';

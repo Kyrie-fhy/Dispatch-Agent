@@ -3,6 +3,7 @@ const { createHash, randomBytes, randomUUID } = require('node:crypto');
 const { readdir, readFile } = require('node:fs/promises');
 const { setTimeout: pause } = require('node:timers/promises');
 const { test } = require('node:test');
+const { request: httpRequest } = require('node:http');
 const { Readable } = require('node:stream');
 const vm = require('node:vm');
 const { pathToFileURL } = require('node:url');
@@ -11,7 +12,7 @@ const { catalogCsvColumns, parseCatalogCsv } = require('../../code/server-dist/m
 const { emptyTrip } = require('../../code/server-dist/miniprogram/core/trips');
 const { businessSession, lockAccountActivity, writeAccount } = require('../../code/server-dist/server/account-workspace');
 const { configuredActivation } = require('../../code/server-dist/server/activation');
-const { handleAdmin } = require('../../code/server-dist/server/admin');
+const { configuredAdminOrigins, handleAdmin } = require('../../code/server-dist/server/admin');
 const { AgentStore } = require('../../code/server-dist/server/agent/store');
 const { CatalogStore } = require('../../code/server-dist/server/catalog');
 const { setAccount, transaction } = require('../../code/server-dist/server/database');
@@ -842,6 +843,74 @@ test('admin dispatch rejects methods, authentication and cross-origin writes bef
   await assert.rejects(call('/admin', 'GET', {}, ''), { status: 404, code: 'not_found' });
 });
 
+test('admin Tailscale origin allowlist validates strictly and enforces loopback socket plus origin boundaries', async () => {
+  assert.deepEqual(configuredAdminOrigins({}), []);
+  assert.deepEqual(configuredAdminOrigins({ DISPATCH_ADMIN_ORIGINS: '   ' }), []);
+  assert.deepEqual(configuredAdminOrigins({
+    DISPATCH_ADMIN_ORIGINS: 'https://Dispatch-Srv.Tail12345.ts.net/, https://dispatch-srv.tail12345.ts.net:443, http://100.64.0.10:8787, https://100.127.255.254:8443, http://[fd7a:115c:a1e0::1]:8787',
+  }), [
+    'https://dispatch-srv.tail12345.ts.net',
+    'http://100.64.0.10:8787',
+    'https://100.127.255.254:8443',
+    'http://[fd7a:115c:a1e0::1]:8787',
+  ]);
+  for (const bad of [
+    'https://example.com',
+    'https://ts.net',
+    'https://single.ts.net',
+    'https://*.tail12345.ts.net',
+    'http://100.63.255.255:8787',
+    'http://100.128.0.1:8787',
+    'http://192.168.1.2:8787',
+    'http://8.8.8.8:8787',
+    'http://[fd00::1]:8787',
+    'https://dispatch-srv.tail12345.ts.net/admin',
+    'https://dispatch-srv.tail12345.ts.net?a=1',
+    'https://user:pass@dispatch-srv.tail12345.ts.net',
+    'ftp://dispatch-srv.tail12345.ts.net',
+    'https://dispatch-srv.tail12345.ts.net,',
+  ]) {
+    assert.throws(() => configuredAdminOrigins({ DISPATCH_ADMIN_ORIGINS: bad }), /DISPATCH_ADMIN_ORIGINS/, bad);
+  }
+
+  const pool = { query: () => assert.fail('guarded routes must not reach PostgreSQL') };
+  const runtime = { adminOrigins: ['https://dispatch-srv.tail12345.ts.net'] };
+  const call = async (url, method, headers = {}, remoteAddress = '127.0.0.1') => {
+    const request = Object.assign(Readable.from([Buffer.from('{}')]), {
+      method, url, headers: { host: 'dispatch-srv.tail12345.ts.net', ...headers }, socket: { remoteAddress },
+    });
+    const result = {};
+    const response = {
+      writeHead: (status, responseHeaders) => Object.assign(result, { status, headers: responseHeaders }),
+      end: content => Object.assign(result, { content }),
+    };
+    assert.equal(await handleAdmin(pool, adminToken, request, response, runtime), true);
+    return result;
+  };
+  const authorization = 'Bearer ' + adminToken;
+  const account = '/admin/api/accounts/' + randomUUID();
+  assert.equal((await call('/admin', 'GET')).status, 200);
+  assert.equal((await call('/admin', 'GET', { host: 'dispatch-srv.tail12345.ts.net:443' })).status, 200);
+  await assert.rejects(call('/admin', 'GET', { host: 'other.tail12345.ts.net' }), { status: 404, code: 'not_found' });
+  await assert.rejects(call('/admin', 'GET', {}, '100.64.0.9'), { status: 404, code: 'not_found' });
+  await assert.rejects(call(account, 'PATCH', {
+    authorization, origin: 'http://dispatch-srv.tail12345.ts.net', 'sec-fetch-site': 'same-origin', 'content-type': 'text/plain',
+  }), { status: 403, code: 'admin_origin_rejected' });
+  await assert.rejects(call(account, 'PATCH', {
+    authorization, origin: 'https://dispatch-srv.tail12345.ts.net', 'sec-fetch-site': 'cross-site', 'content-type': 'text/plain',
+  }), { status: 403, code: 'admin_origin_rejected' });
+  await assert.rejects(call(account, 'PATCH', {
+    authorization, 'sec-fetch-site': 'same-origin', 'content-type': 'text/plain',
+  }), { status: 403, code: 'admin_origin_rejected' });
+  // Matching Tailscale Origin passes requireSameOrigin and reaches body content-type validation (415) before DB access.
+  await assert.rejects(call(account, 'PATCH', {
+    authorization, origin: 'https://dispatch-srv.tail12345.ts.net', 'sec-fetch-site': 'same-origin', 'content-type': 'text/plain',
+  }), { status: 415, code: 'invalid_content_type' });
+  await assert.rejects(call(account, 'PATCH', {
+    host: '127.0.0.1:8787', authorization, origin: 'https://dispatch-srv.tail12345.ts.net', 'sec-fetch-site': 'same-origin', 'content-type': 'text/plain',
+  }), { status: 415, code: 'invalid_content_type' });
+});
+
 test('admin v2 through the normal routes on an isolated PostgreSQL database', { timeout: 120_000 }, async t => {
   const db = await isolatedDatabase(t);
   const api = await start(db, { appId, exchange: async code => code }, { requireActivation: true, activationPepper: 'isolated-pepper' });
@@ -1203,6 +1272,69 @@ test('admin v2 through the normal routes on an isolated PostgreSQL database', { 
       expect(await login(), 201);
     } finally {
       await dev.stop();
+    }
+  });
+
+  await t.test('Tailscale private admin origin works over loopback proxy while keeping /v1 loopback-host only', async () => {
+    const tailscaleOrigin = 'https://dispatch-srv.tail12345.ts.net';
+    const tailscaleHost = 'dispatch-srv.tail12345.ts.net';
+    const tsServer = await start(db, undefined, { adminOrigins: [tailscaleOrigin] });
+    const port = Number(new URL(tsServer.origin).port);
+    const rawCall = (path, { method = 'GET', headers = {}, body } = {}) => new Promise((resolve, reject) => {
+      const payload = body === undefined ? undefined : JSON.stringify(body);
+      const req = httpRequest({
+        hostname: '127.0.0.1', port, path, method,
+        headers: { ...(payload === undefined ? {} : { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }), ...headers },
+      }, res => {
+        const chunks = [];
+        res.on('data', chunk => chunks.push(chunk));
+        res.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8');
+          resolve({
+            status: res.statusCode,
+            data: res.headers['content-type']?.includes('application/json') && text ? JSON.parse(text) : text,
+          });
+        });
+      });
+      req.on('error', reject);
+      if (payload !== undefined) req.write(payload);
+      req.end();
+    });
+    try {
+      const auth = { Authorization: 'Bearer ' + adminToken };
+      assert.equal((await rawCall('/admin', { headers: { Host: tailscaleHost } })).status, 200);
+      assert.equal((await rawCall('/admin', { headers: { Host: 'other.tail12345.ts.net' } })).status, 404);
+      const v1Blocked = await rawCall('/v1/workspace', { headers: { Host: tailscaleHost } });
+      assert.equal(v1Blocked.status, 400);
+      assert.equal(v1Blocked.data.error, 'invalid_host');
+
+      const accounts = expect(await rawCall('/admin/api/accounts', { headers: { Host: tailscaleHost, ...auth } })).accounts;
+      const targetId = accounts[0].id;
+      const renamedDirect = await rawCall('/admin/api/accounts/' + targetId, {
+        method: 'PATCH',
+        headers: { Host: tailscaleHost, Origin: tailscaleOrigin, 'Sec-Fetch-Site': 'same-origin', ...auth },
+        body: { remarkName: '尾网直连改名' },
+      });
+      assert.equal(renamedDirect.status, 200);
+      assert.equal(renamedDirect.data.remarkName, '尾网直连改名');
+
+      const renamedRewritten = await rawCall('/admin/api/accounts/' + targetId, {
+        method: 'PATCH',
+        headers: { Host: `127.0.0.1:${port}`, Origin: tailscaleOrigin, 'Sec-Fetch-Site': 'same-origin', ...auth },
+        body: { remarkName: '尾网反代改名' },
+      });
+      assert.equal(renamedRewritten.status, 200);
+      assert.equal(renamedRewritten.data.remarkName, '尾网反代改名');
+
+      const wrongScheme = await rawCall('/admin/api/accounts/' + targetId, {
+        method: 'PATCH',
+        headers: { Host: tailscaleHost, Origin: 'http://' + tailscaleHost, 'Sec-Fetch-Site': 'same-origin', ...auth },
+        body: { remarkName: '非法协议' },
+      });
+      assert.equal(wrongScheme.status, 403);
+      assert.equal(wrongScheme.data.error, 'admin_origin_rejected');
+    } finally {
+      await tsServer.stop();
     }
   });
 });

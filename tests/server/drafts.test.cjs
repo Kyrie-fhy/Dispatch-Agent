@@ -1043,7 +1043,8 @@ test('WeChat code exchange restores an app-scoped workspace and keeps developmen
 
   const initial = await codeRequest(api, 'a-first', { openid: 'not-a-trusted-identity', appId: otherApp });
   assert.equal(initial.status, 201, JSON.stringify(initial.data));
-  assert.deepEqual(Object.keys(initial.data).sort(), ['expiresAt', 'token']);
+  assert.deepEqual(Object.keys(initial.data).sort(), ['expiresAt', 'remarkName', 'token']);
+  assert.equal(initial.data.remarkName, '');
   const { token: a } = initial.data;
   assert.equal((await codeRequest(api, 'a-first')).status, 401);
   const aTrip = await formalExample(api, a);

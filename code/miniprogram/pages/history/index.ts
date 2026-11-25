@@ -2,7 +2,7 @@ import type { AgentTurn, DeliveryCardState, DeliveryProposal } from '../../core/
 import { money } from '../../core/orders';
 import { localDay } from '../../core/settlement';
 import type { TripHistoryPage, TripHistoryRow } from '../../core/trips';
-import { agentSession } from '../../services/agent-session';
+import { agentSession, clearAgentSession } from '../../services/agent-session';
 import { FormalTrip, WorkspaceError, workspaceRequest } from '../../services/workspace';
 import { amountLabel, errorMessage, tripView } from '../order-view';
 import { formalTripView, FormalView } from '../workspace/trip-view';
@@ -100,11 +100,18 @@ Page({
     catch (error) {
       if (!current()) return;
       if (error instanceof WorkspaceError && error.status === 401) {
-        agentSession.token = '';
-        agentSession.unsaved = null;
+        clearAgentSession();
         this.token = '';
         this.setData({ signedIn: false, trips: [], formal: null, nextBefore: '', busy: false, error: '登录已失效，请重新登录。',
           selectedTime: '', historyTab: 'delivery', selectedShopId: '', selectedShop: null, tripTurns: [], turnsLoadedId: '' });
+        syncTitle('历史');
+      } else if (error instanceof WorkspaceError && error.status === 403 && error.code === 'account_disabled') {
+        const disabledMessage = error.message || '当前账号已暂停使用，请联系管理员';
+        clearAgentSession(disabledMessage);
+        this.token = '';
+        this.setData({ signedIn: false, trips: [], formal: null, nextBefore: '', busy: false, error: disabledMessage,
+          selectedTime: '', historyTab: 'delivery', selectedShopId: '', selectedShop: null, tripTurns: [],
+          turnsLoadedId: '', turnsLoading: false });
         syncTitle('历史');
       } else this.setData({ error: errorMessage(error) });
     } finally { if (current()) this.setData({ busy: false }); }

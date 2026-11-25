@@ -647,10 +647,13 @@ test('admin catalog snapshot keeps read-only token protection and account isolat
     assert.equal(Number.isNaN(Date.parse(catalogA.data.importedAt)), false);
     assert.deepEqual(catalogA.data.items.map(item => item.productCode), ['P001', 'P002']);
     const dumpling = catalogA.data.items.find(item => item.variantCode === 'V001');
-    assert.deepEqual(dumpling, { productCode: 'P001', variantCode: 'V001', category: '冻品', product: '水饺',
-      brand: '安井', specification: '500g', unit: '箱', priceCents: 8200, status: 'active', aliases: ['饺子'] });
-    assert.equal('productId' in dumpling, false);
-    assert.equal('brandAliases' in dumpling, false);
+    assert.equal(typeof dumpling.productId, 'string');
+    assert.equal(typeof dumpling.variantId, 'string');
+    assert.deepEqual(dumpling, { productId: dumpling.productId, variantId: dumpling.variantId,
+      productCode: 'P001', variantCode: 'V001', category: '冻品', product: '水饺',
+      brand: '安井', packaging: '袋装', flavorOrGrade: null, specification: '500g', unit: '箱',
+      priceCents: 8200, status: 'active', aliases: ['饺子'], brandAliases: [],
+      originalName: '', verificationStatus: '', remarks: '' });
     const duckBlood = catalogA.data.items.find(item => item.variantCode === 'V002');
     assert.equal(duckBlood.unit, null);
     assert.equal(duckBlood.priceCents, 700);
@@ -669,7 +672,7 @@ test('admin catalog snapshot keeps read-only token protection and account isolat
 
     const page = await api.request('/admin');
     assert.equal(page.status, 200);
-    for (const token of ['货品库', 'data-left="catalog"', 'catalog-search', 'npm run catalog:import',
+    for (const token of ['货品库', 'data-nav="catalog"', 'catalog-search', '上传 CSV 更新',
       '熟客价', '库内价', '?catalog=1']) {
       assert.ok(page.data.includes(token), `后台缺少货品库结构 ${token}`);
     }

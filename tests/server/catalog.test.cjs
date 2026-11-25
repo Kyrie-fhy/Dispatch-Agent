@@ -157,9 +157,17 @@ test('catalog migration, import, pricing and choices through isolated PostgreSQL
       const bRows = await runAs(accountB, client => client.query(`SELECT * FROM ${relation}`));
       assert.ok(aRows.rows.length && aRows.rows.every(row => row.account_id === accountA));
       assert.ok(bRows.rows.length && bRows.rows.every(row => row.account_id === accountB));
-      for (const sql of [`DELETE FROM ${relation}`, `UPDATE ${relation} SET account_id = account_id`,
-        `INSERT INTO ${relation} SELECT * FROM ${relation} WHERE false`]) {
-        await assert.rejects(runAs(accountA, client => client.query(sql)), { code: '42501' });
+      for (const account of [null, accountA]) {
+        // RLS hides rows of other accounts from UPDATE/DELETE, and rejects writes with a foreign account ID.
+        assert.equal((await runAs(account, client => client.query(`DELETE FROM ${relation} WHERE account_id = $1`, [accountB]))).rowCount, 0);
+        assert.equal((await runAs(account, client => client.query(
+          `UPDATE ${relation} SET account_id = account_id WHERE account_id = $1`, [accountB]))).rowCount, 0);
+        const row = aRows.rows[0];
+        const columns = Object.keys(row);
+        const foreignId = account ? accountB : accountA;
+        await assert.rejects(runAs(account, client => client.query(
+          `INSERT INTO ${relation} (${columns.join(', ')}) VALUES (${columns.map((_, index) => '$' + (index + 1)).join(', ')})`,
+          columns.map(column => column === 'account_id' ? foreignId : row[column]))), { code: '42501' });
       }
     }
 

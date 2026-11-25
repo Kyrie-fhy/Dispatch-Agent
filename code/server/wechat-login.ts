@@ -13,6 +13,15 @@ export function readWechatCode(body: unknown): string {
   return body.code;
 }
 
+export function readWechatSession(body: unknown) {
+  const code = readWechatCode(body);
+  const { activationCode } = body as Record<string, unknown>;
+  if (activationCode !== undefined && typeof activationCode !== 'string') {
+    throw new HttpError(400, 'invalid_wechat_request', '开通码须为文本');
+  }
+  return { code, activationCode };
+}
+
 export function configuredWechatLogin(
   env: NodeJS.ProcessEnv,
   request = fetch,

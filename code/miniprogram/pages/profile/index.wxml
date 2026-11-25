@@ -1,20 +1,39 @@
 <view class="profile">
-  <view wx:if="{{error}}" class="error">{{error}}</view>
+  <view wx:if="{{error && authGate !== 'activation'}}" class="error">{{error}}</view>
 
-  <view wx:if="{{!signedIn}}" class="card account-card">
-    <view class="account-title">我的账号</view>
-    <view class="hint">微信登录后同步本账号的录单草稿、正式送货单与熟客档案。</view>
-    <button wx:if="{{!revokeFailed}}" class="btn-primary" bindtap="login" disabled="{{busy}}">微信登录</button>
-    <button wx:else class="btn-danger-ghost account-btn" bindtap="logout" disabled="{{busy}}">重试退出</button>
-  </view>
+  <block wx:if="{{!signedIn}}">
+    <view wx:if="{{authGate === 'activation'}}" class="card gate-card">
+      <view class="gate-title">首次使用请输入开通码</view>
+      <view class="gate-desc">请输入管理员发来的开通码（如 DZ-XXXX-XXXX），绑定一次后以后直接微信登录</view>
+      <input class="gate-input num" value="{{activationCode}}" maxlength="40" placeholder="输入开通码"
+        placeholder-class="gate-placeholder" focus="{{true}}" disabled="{{busy}}"
+        bindinput="onActivationInput" bindconfirm="submitActivation" />
+      <view wx:if="{{error}}" class="gate-error">{{error}}</view>
+      <button class="btn-primary gate-btn" loading="{{busy}}" disabled="{{busy}}" bindtap="submitActivation">确认开通</button>
+      <button class="btn-ghost gate-btn" disabled="{{busy}}" bindtap="cancelActivation">返回微信登录</button>
+    </view>
+    <view wx:elif="{{authGate === 'disabled'}}" class="card gate-card gate-card-disabled">
+      <view class="gate-badge">账号受限</view>
+      <view class="gate-title">当前账号已暂停使用</view>
+      <view class="gate-desc">{{disabledMessage || '当前账号已暂停使用，请联系管理员'}}</view>
+      <view class="gate-note">管理员在后台恢复启用后，可点击下方按钮重新登录</view>
+      <button class="btn-primary gate-btn" loading="{{busy}}" disabled="{{busy}}" bindtap="login">重新登录</button>
+    </view>
+    <view wx:else class="card account-card">
+      <view class="account-title">我的账号</view>
+      <view class="hint">微信登录后同步本账号的录单草稿、正式送货单与熟客档案。</view>
+      <button wx:if="{{!revokeFailed}}" class="btn-primary" bindtap="login" disabled="{{busy}}">微信登录</button>
+      <button wx:else class="btn-danger-ghost account-btn" bindtap="logout" disabled="{{busy}}">重试退出</button>
+    </view>
+  </block>
 
   <block wx:else>
     <view class="identity-card">
       <view class="identity-main">
         <view class="identity-dot"></view>
         <view class="identity-text">
-          <view class="identity-title">微信账号已登录</view>
-          <view class="identity-sub">本账号草稿、正式单与熟客独立同步</view>
+          <view class="identity-title">{{remarkName || '微信账号已登录'}}</view>
+          <view class="identity-sub">{{remarkName ? '微信账号已登录 · 数据独立同步' : '本账号草稿、正式单与熟客独立同步'}}</view>
         </view>
       </view>
       <view class="identity-tag">已同步</view>

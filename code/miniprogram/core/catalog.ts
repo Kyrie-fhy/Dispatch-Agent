@@ -22,6 +22,9 @@ export interface CatalogRow {
   status: 'active' | 'discontinued';
   aliases: string[];
   brandAliases?: string[];
+  originalName?: string;
+  verificationStatus?: string;
+  remarks?: string;
 }
 
 export interface CatalogVariant extends CatalogRow {
@@ -47,7 +50,7 @@ function csvCells(csv: string): string[][] {
   let quoted = false;
   let closed = false;
   const finish = () => {
-    fields.push(value.trim());
+    fields.push(value);
     value = '';
     closed = false;
   };
@@ -111,24 +114,64 @@ export function extractCatalogAliases(original: string, remarks: string): string
   return uniqueAliases([original, ...catalogAliasClues(remarks).map(clue => clue.value)]);
 }
 
-export function parseCatalogCsv(input: string): CatalogRow[] {
-  if (input.includes('\0') || input.includes('\uFFFD')) throw new Error('CSV 须使用有效的 UTF-8 文本');
+const exportDetailsMarker = '[Dispatch Catalog v1] ';
+const formulaPrefix = (value: string) => /^[=+\-@\t\r\n]/u.test(value.normalize('NFKC').replace(/^ +/u, ''))
+  || /^[=+\-@]/u.test(value.normalize('NFKC').trimStart());
+
+function safeCsvText(value: string) {
+  return formulaPrefix(value) || value.startsWith("'") ? "'" + value : value;
+}
+
+function readCsvText(value: string, invalid: (reason: string) => never) {
+  if (formulaPrefix(value)) invalid('文本单元格疑似含电子表格公式');
+  if (value.startsWith("'") && (value.startsWith("''") || formulaPrefix(value.slice(1)))) return value.slice(1);
+  return value.trim();
+}
+
+function saleFlavor(saleSpec: string) {
+  const sale = normalizeCatalogSpec(saleSpec);
+  return !sale || /^(?:单规格|未点开(?:\(.*\))?|\d*\s*[箱袋盒包板卷件桶瓶个支提盘条只组份](?:\s*[/／]\s*[箱袋盒包板卷件桶瓶个支提盘条只组份])?)$/.test(sale)
+    ? null : sale;
+}
+
+export function exportCatalogCsv(rows: readonly CatalogRow[]) {
+  const quote = (value: string) => '"' + value.replace(/"/g, '""') + '"';
+  const records = rows.map(row => {
+    // The standard remarks column carries metadata for lossless alias and manual-spec round trips.
+    const saleSpec = row.flavorOrGrade ?? '';
+    const details = JSON.stringify({ aliases: row.aliases, brandAliases: row.brandAliases ?? [],
+      packaging: normalizeCatalogSpec(row.packaging), saleSpec: normalizeCatalogSpec(saleSpec),
+      specification: row.specification, flavorOrGrade: row.flavorOrGrade });
+    return [row.productCode, row.variantCode, row.category, row.originalName ?? '', row.brand, row.product,
+      row.packaging, saleSpec, row.unit ?? '', money(row.priceCents),
+      row.status === 'active' ? '在售' : '已下架', row.verificationStatus ?? '',
+      (row.remarks ? row.remarks + '\n' : '') + exportDetailsMarker + details].map(value => quote(safeCsvText(value)));
+  });
+  return '\uFEFF' + [catalogCsvColumns, ...records].map(row => row.join(',')).join('\r\n') + '\r\n';
+}
+
+export function parseCatalogCsv(input: string, maxRows = Infinity): CatalogRow[] {
+  if (/[\0\uFFFD\uD800-\uDFFF]/u.test(input)) throw new Error('CSV 须使用有效的 UTF-8 文本');
   const [header, ...records] = csvCells(input.replace(/^\uFEFF/, ''));
-  if (!header || header.length !== catalogCsvColumns.length || !catalogCsvColumns.every((name, i) => name === header[i])) {
+  if (!header || header.length !== catalogCsvColumns.length || !catalogCsvColumns.every((name, i) => name === header[i].trim())) {
     throw new Error('货品 CSV 表头须为标准 13 列');
   }
-  if (!records.length) throw new Error('货品 CSV 至少需要一条货品规格');
+  if (records.length > maxRows) throw new Error(`货品 CSV 最多支持 ${maxRows} 条规格`);
   const seen = new Set<string>();
   const products = new Map<string, string>();
   return records.map((cells, index) => {
     const invalid = (reason: string): never => { throw new Error(`货品 CSV 第 ${index + 2} 行：${reason}`); };
     if (cells.length !== catalogCsvColumns.length) invalid('必须包含 13 列');
-    const [productCode, variantCode, category, original, brand, product, rawSpec, saleSpec, rawUnit, price, status, , remarks] = cells;
+    const [productCode, variantCode, category, originalName, brand, product, rawSpec, saleSpec, rawUnit, price, status,
+      verificationStatus, rawRemarks] = cells.map((cell, column) => column === 9 ? cell.trim() : readCsvText(cell, invalid));
     if (!productCode || !variantCode || !product) invalid('总商品号、规格序号和标准品名必填');
     if ([product, brand, rawSpec, saleSpec, rawUnit].some(field => field.length > 200)) invalid('规格字段过长');
     const key = JSON.stringify([productCode, variantCode]);
     if (seen.has(key)) invalid('总商品号与规格序号重复');
     seen.add(key);
+    const marker = rawRemarks.lastIndexOf('\n' + exportDetailsMarker) + 1;
+    const hasDetails = rawRemarks.startsWith(exportDetailsMarker, marker);
+    const remarks = hasDetails ? rawRemarks.slice(0, Math.max(0, marker - 1)) : rawRemarks;
     const productIdentity = JSON.stringify([product, brand, category]);
     if (products.has(productCode) && products.get(productCode) !== productIdentity) invalid('同一总商品号的标准品名、品牌和分类须一致');
     products.set(productCode, productIdentity);
@@ -136,21 +179,37 @@ export function parseCatalogCsv(input: string): CatalogRow[] {
     if (!Number.isSafeInteger(priceCents) || priceCents <= 0) invalid('挂牌价须为大于零且最多两位小数的金额');
     if (status !== '在售' && status !== '已下架') invalid('销售状态须为在售或已下架');
     const packaging = normalizeCatalogSpec(rawSpec);
-    const sale = normalizeCatalogSpec(saleSpec);
-    const flavorOrGrade = !sale || /^(?:单规格|未点开(?:\(.*\))?|\d*\s*[箱袋盒包板卷件桶瓶个支提盘条只组份](?:\s*[/／]\s*[箱袋盒包板卷件桶瓶个支提盘条只组份])?)$/.test(sale)
-      ? null : sale;
-    const specification = [packaging, flavorOrGrade].filter(Boolean).join('·');
-    if (specification.length > 200) invalid('标准规格过长');
-    const aliases = [original];
-    const brandAliases: string[] = [];
-    for (const { label, value } of catalogAliasClues(remarks)) {
-      const isBrandClue = /^(?:品牌|厂牌)|^包装(?:上)?(?:的)?全称$/.test(label);
-      const namesProduct = specKey(value).includes(specKey(product));
-      (isBrandClue && !namesProduct ? brandAliases : aliases).push(value);
+    let flavorOrGrade = saleFlavor(saleSpec);
+    let specification = [packaging, flavorOrGrade].filter(Boolean).join('·');
+    let aliases = [originalName];
+    let brandAliases: string[] = [];
+    if (hasDetails) {
+      try {
+        const details = JSON.parse(rawRemarks.slice(marker + exportDetailsMarker.length));
+        const validAliases = (value: unknown): value is string[] => Array.isArray(value)
+          && value.every(alias => typeof alias === 'string' && !/[\0\uFFFD\uD800-\uDFFF]/u.test(alias));
+        if (!validAliases(details.aliases) || !validAliases(details.brandAliases)
+          || typeof details.specification !== 'string' || /[\0\uFFFD\uD800-\uDFFF]/u.test(details.specification)
+          || (details.flavorOrGrade !== null && (typeof details.flavorOrGrade !== 'string'
+            || /[\0\uFFFD\uD800-\uDFFF]/u.test(details.flavorOrGrade) || details.flavorOrGrade.length > 200))) {
+          invalid('回导备注中的规格或别名格式无效');
+        }
+        ({ aliases, brandAliases } = details);
+        if (packaging === details.packaging && normalizeCatalogSpec(saleSpec) === details.saleSpec) {
+          ({ specification, flavorOrGrade } = details);
+        }
+      } catch { invalid('回导备注格式无效'); }
+    } else {
+      for (const { label, value } of catalogAliasClues(remarks)) {
+        const isBrandClue = /^(?:品牌|厂牌)|^包装(?:上)?(?:的)?全称$/.test(label);
+        const namesProduct = specKey(value).includes(specKey(product));
+        (isBrandClue && !namesProduct ? brandAliases : aliases).push(value);
+      }
     }
+    if (specification.length > 200) invalid('标准规格过长');
     return {
       productCode, variantCode, category, product, brand, packaging, flavorOrGrade, specification,
-      unit: rawUnit ? catalogKey(rawUnit) : null, priceCents,
+      unit: rawUnit ? catalogKey(rawUnit) : null, priceCents, originalName, verificationStatus, remarks,
       status: status === '在售' ? 'active' : 'discontinued', aliases: uniqueAliases(aliases), brandAliases: uniqueAliases(brandAliases),
     };
   });

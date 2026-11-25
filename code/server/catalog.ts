@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import {
   catalogKey, matchCatalogChoice, matchCatalogItem, modifierStems, normalizeCatalogSpec, parseCatalogCsv, parseSpecTokens,
-  quotedLinePrices, resolveCatalogAutoPrice, type CatalogMatch, type CatalogVariant,
+  quotedLinePrices, resolveCatalogAutoPrice, type CatalogMatch, type CatalogRow, type CatalogVariant,
 } from '../miniprogram/core/catalog';
 import { money, nullablePrice, yuanToCents, type ItemInput } from '../miniprogram/core/orders';
 import { toPinyinTokens } from '../miniprogram/core/pinyin';
@@ -38,11 +38,12 @@ export function catalogPriceUpdate(customer: CustomerDraft, before: ItemInput, i
   };
 }
 
-const brandAliasPrefix = 'brand:';
+export const brandAliasPrefix = 'brand:';
 
-export async function loadCatalog(client: PoolClient, accountId: string): Promise<CatalogVariant[]> {
+export async function loadCatalog(client: PoolClient, accountId: string, includeMetadata = false): Promise<CatalogVariant[]> {
   const { rows } = await client.query<CatalogVariant & { priceCents: string | number }>(`
     SELECT p.id AS "productId", p.product_code AS "productCode", p.category, p.product, p.brand,
+           ${includeMetadata ? 'p.original_name AS "originalName", p.verification_status AS "verificationStatus", p.remarks,' : ''}
            v.id AS "variantId", v.variant_code AS "variantCode", v.packaging, v.flavor_or_grade AS "flavorOrGrade",
            v.canonical_spec AS specification, v.unit, v.price_cents AS "priceCents", v.status,
            ARRAY(SELECT a.alias FROM dispatch.catalog_aliases a WHERE a.account_id = p.account_id
@@ -255,6 +256,88 @@ export async function applyCatalogToDraft(client: PoolClient, accountId: string,
   return { lines, changes };
 }
 
+export async function lockCatalog(client: PoolClient, accountId: string) {
+  await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`dispatch.catalog:${accountId}`]);
+}
+
+export async function bumpCatalogRevision(client: PoolClient, accountId: string) {
+  const { rows: [account] } = await client.query<{ revision: number }>(`
+    UPDATE dispatch.accounts SET catalog_revision = catalog_revision + 1 WHERE id = $1 RETURNING catalog_revision AS revision
+  `, [accountId]);
+  return account.revision;
+}
+
+export async function catalogImportAnchor(client: PoolClient, accountId: string, sha256: Buffer, source: string) {
+  const { rows: [batch] } = await client.query<{ id: string }>(`
+    INSERT INTO dispatch.catalog_imports (account_id, id, sha256, source)
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (account_id, sha256) DO UPDATE SET imported_at = clock_timestamp()
+      WHERE excluded.source = 'admin_csv'
+    RETURNING id
+  `, [accountId, randomUUID(), sha256, source]);
+  if (batch) return batch.id;
+  const { rows: [previous] } = await client.query<{ id: string }>(
+    'SELECT id FROM dispatch.catalog_imports WHERE account_id = $1 AND sha256 = $2', [accountId, sha256]);
+  return previous.id;
+}
+
+export async function saveCatalogRows(client: PoolClient, accountId: string, importId: string, rows: readonly CatalogRow[],
+  replace = false) {
+  const productIds = new Map<string, string>();
+  const aliases = new Map<string, { productId: string; normalizedAlias: string; alias: string }>();
+  for (const row of rows) {
+    const { productCode, category, product, brand, originalName = '', verificationStatus = '', remarks = '' } = row;
+    if (productIds.has(productCode)) continue;
+    const { rows: [saved] } = await client.query<{ id: string }>(`
+      INSERT INTO dispatch.catalog_products
+        (account_id, id, product_code, category, product, brand, import_id, original_name, verification_status, remarks)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      ON CONFLICT (account_id, product_code) DO UPDATE SET category = excluded.category,
+        product = excluded.product, brand = excluded.brand, import_id = excluded.import_id, archived = false,
+        original_name = excluded.original_name, verification_status = excluded.verification_status, remarks = excluded.remarks
+      RETURNING id
+    `, [accountId, randomUUID(), productCode, category, product, brand, importId, originalName, verificationStatus, remarks]);
+    productIds.set(productCode, saved.id);
+  }
+  const variantIds = [];
+  for (const row of rows) {
+    const productId = productIds.get(row.productCode)!;
+    const { rows: [saved] } = await client.query<{ id: string }>(`
+      INSERT INTO dispatch.catalog_variants (account_id, id, product_id, variant_code, packaging,
+        flavor_or_grade, canonical_spec, unit, price_cents, status, import_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      ON CONFLICT (account_id, product_id, variant_code) DO UPDATE SET packaging = excluded.packaging,
+        flavor_or_grade = excluded.flavor_or_grade, canonical_spec = excluded.canonical_spec, unit = excluded.unit,
+        price_cents = excluded.price_cents, status = excluded.status, import_id = excluded.import_id, archived = false
+      RETURNING id
+    `, [accountId, randomUUID(), productId, row.variantCode, row.packaging, row.flavorOrGrade,
+      row.specification, row.unit, row.priceCents, row.status, importId]);
+    variantIds.push(saved.id);
+    for (const [prefix, values] of [['product:', row.aliases], [brandAliasPrefix, row.brandAliases ?? []]] as const) {
+      for (const alias of values) {
+        const normalizedAlias = prefix + catalogKey(alias);
+        aliases.set(JSON.stringify([productId, normalizedAlias]), { productId, normalizedAlias, alias });
+      }
+    }
+  }
+  if (replace) await client.query('DELETE FROM dispatch.catalog_aliases WHERE account_id = $1', [accountId]);
+  if (aliases.size) {
+    await client.query(`
+      INSERT INTO dispatch.catalog_aliases (account_id, product_id, normalized_alias, alias)
+      SELECT $1, a."productId", a."normalizedAlias", a.alias
+      FROM jsonb_to_recordset($2::jsonb) AS a("productId" uuid, "normalizedAlias" text, alias text)
+      ON CONFLICT (account_id, product_id, normalized_alias) DO UPDATE SET alias = excluded.alias
+    `, [accountId, JSON.stringify([...aliases.values()])]);
+  }
+  if (replace) {
+    await client.query('UPDATE dispatch.catalog_variants SET archived = true WHERE account_id = $1 AND import_id <> $2 AND NOT archived',
+      [accountId, importId]);
+    await client.query('UPDATE dispatch.catalog_products SET archived = true WHERE account_id = $1 AND import_id <> $2 AND NOT archived',
+      [accountId, importId]);
+  }
+  return variantIds;
+}
+
 export class CatalogStore {
   constructor(private readonly pool: Pool) {}
 
@@ -264,7 +347,8 @@ export class CatalogStore {
 
   async importCsv(account: string, csv: string | Buffer) {
     const sha256 = createHash('sha256').update(csv).digest();
-    const rows = parseCatalogCsv(csv.toString());
+    const rows = parseCatalogCsv(typeof csv === 'string' ? csv : new TextDecoder('utf-8', { fatal: true }).decode(csv));
+    if (!rows.length) throw new Error('货品 CSV 至少需要一条货品规格');
     return transaction(this.pool, async client => {
       const { rows: [target] } = await client.query<{ id: string }>(uuidPattern.test(account)
         ? 'SELECT id FROM dispatch.accounts WHERE id = $1'
@@ -273,7 +357,7 @@ export class CatalogStore {
       if (!target) throw new Error('未找到目标账号，请先创建账号');
       const accountId = target.id;
       await setAccount(client, accountId);
-      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`dispatch.catalog:${accountId}`]);
+      await lockCatalog(client, accountId);
       const batch = { accountId, sha256: sha256.toString('hex'),
         productCount: new Set(rows.map(row => row.productCode)).size, variantCount: rows.length,
         activeVariantCount: rows.filter(row => row.status === 'active').length,
@@ -287,47 +371,8 @@ export class CatalogStore {
       const importId = randomUUID();
       await client.query('INSERT INTO dispatch.catalog_imports (account_id, id, sha256) VALUES ($1, $2, $3)',
         [accountId, importId, sha256]);
-      const productIds = new Map<string, string>();
-      const aliases = new Map<string, { productId: string; normalizedAlias: string; alias: string }>();
-      for (const { productCode, category, product, brand } of rows) {
-        if (productIds.has(productCode)) continue;
-        const { rows: [saved] } = await client.query<{ id: string }>(`
-          INSERT INTO dispatch.catalog_products (account_id, id, product_code, category, product, brand, import_id)
-          VALUES ($1, $2, $3, $4, $5, $6, $7)
-          ON CONFLICT (account_id, product_code) DO UPDATE SET category = excluded.category,
-            product = excluded.product, brand = excluded.brand, import_id = excluded.import_id, archived = false
-          RETURNING id
-        `, [accountId, randomUUID(), productCode, category, product, brand, importId]);
-        productIds.set(productCode, saved.id);
-      }
-      for (const row of rows) {
-        const productId = productIds.get(row.productCode)!;
-        await client.query(`
-          INSERT INTO dispatch.catalog_variants (account_id, id, product_id, variant_code, packaging,
-            flavor_or_grade, canonical_spec, unit, price_cents, status, import_id)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-          ON CONFLICT (account_id, product_id, variant_code) DO UPDATE SET packaging = excluded.packaging,
-            flavor_or_grade = excluded.flavor_or_grade, canonical_spec = excluded.canonical_spec, unit = excluded.unit,
-            price_cents = excluded.price_cents, status = excluded.status, import_id = excluded.import_id, archived = false
-        `, [accountId, randomUUID(), productId, row.variantCode, row.packaging, row.flavorOrGrade,
-          row.specification, row.unit, row.priceCents, row.status, importId]);
-        for (const [prefix, values] of [['product:', row.aliases], [brandAliasPrefix, row.brandAliases ?? []]] as const) {
-          for (const alias of values) {
-            const normalizedAlias = prefix + catalogKey(alias);
-            aliases.set(JSON.stringify([productId, normalizedAlias]), { productId, normalizedAlias, alias });
-          }
-        }
-      }
-      await client.query('DELETE FROM dispatch.catalog_aliases WHERE account_id = $1', [accountId]);
-      await client.query(`
-        INSERT INTO dispatch.catalog_aliases (account_id, product_id, normalized_alias, alias)
-        SELECT $1, a."productId", a."normalizedAlias", a.alias
-        FROM jsonb_to_recordset($2::jsonb) AS a("productId" uuid, "normalizedAlias" text, alias text)
-      `, [accountId, JSON.stringify([...aliases.values()])]);
-      await client.query('UPDATE dispatch.catalog_variants SET archived = true WHERE account_id = $1 AND import_id <> $2 AND NOT archived',
-        [accountId, importId]);
-      await client.query('UPDATE dispatch.catalog_products SET archived = true WHERE account_id = $1 AND import_id <> $2 AND NOT archived',
-        [accountId, importId]);
+      await saveCatalogRows(client, accountId, importId, rows, true);
+      await bumpCatalogRevision(client, accountId);
       return { ...batch, importId, replayed: false };
     });
   }

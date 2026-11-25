@@ -1,9 +1,12 @@
 import { AgentRuntime } from './agent/runtime';
 import { AgentModel, configuredAgentModel } from './agent/model';
 import { configuredAdminToken, handleAdmin } from './admin';
+import type { AdminRuntime } from './admin/routes';
+import { configuredCostRates } from './admin/quality';
+import { ActivationCodes, configuredActivation } from './activation';
 import { configuredIntentModel, IntentModel } from './agent/intent';
 import { configuredDeliveryModel, DeliveryModel } from './agent/delivery-model';
-import { missingDraft, readAccount, readWorkspace } from './account-workspace';
+import { businessSession, missingDraft, readAccount, readWorkspace } from './account-workspace';
 import { readTurnInput } from './agent/store';
 import { createServer, IncomingMessage, Server, ServerResponse } from 'node:http';
 import { Pool } from 'pg';
@@ -20,7 +23,7 @@ import { TripStore } from './trips';
 import { readConfirmInput, readDeliveryEdit, readDeliveryInput, readNextInput, readOpeningInput, readPreviewInput, readReceiptInput,
   readCommand, readReviewInput, uuidPattern, validRevision, validSheetKey } from './request-input';
 import { HttpError } from './http-error';
-import { configuredWechatLogin, readWechatCode, WechatLogin } from './wechat-login';
+import { configuredWechatLogin, readWechatSession, WechatLogin } from './wechat-login';
 import { isObject } from '../miniprogram/core/orders';
 import { materialChunkBytes } from '../miniprogram/core/materials';
 import { configuredImageModel, configuredTextModel, ImageModel, TextModel } from './text-model';
@@ -74,12 +77,12 @@ function resourceId(path: string, collection: 'drafts' | 'trips'): string | null
 
 async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery: DeliveryStore, ledger: LedgerStore, amendments: AmendmentStore,
   materials: MaterialStore, textOrders: TextOrders, agent: AgentRuntime, memory: MemoryStore, catalog: CatalogStore, request: IncomingMessage, response: ServerResponse,
-  wechat?: WechatLogin, speechModel?: SpeechModel, adminToken?: string, voiceCorrector?: VoiceCorrector): Promise<void> {
+  wechat?: WechatLogin, speechModel?: SpeechModel, adminToken?: string, voiceCorrector?: VoiceCorrector, adminRuntime?: AdminRuntime): Promise<void> {
   const host = request.headers.host ?? '';
   if (!/^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host)) {
     throw new HttpError(400, 'invalid_host', '请通过本机地址访问草稿服务');
   }
-  if (await handleAdmin(pool, adminToken, request, response)) return;
+  if (await handleAdmin(pool, adminToken, request, response, adminRuntime)) return;
   const method = request.method;
   const path = request.url?.split('?')[0] ?? '';
 
@@ -103,9 +106,9 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
   }
   if (method === 'POST' && path === '/v1/session/wechat') {
     if (!wechat) throw new HttpError(404, 'not_found', '未找到此接口');
-    const code = readWechatCode(await readJson(request, response));
+    const { code, activationCode } = readWechatSession(await readJson(request, response));
     const openId = await wechat.exchange(code);
-    sendJson(response, 201, await store.wechatSession(wechat.appId, openId));
+    sendJson(response, 201, await store.wechatSession(wechat.appId, openId, activationCode));
     return;
   }
 
@@ -364,11 +367,29 @@ async function handle(pool: Pool, store: DraftStore, trips: TripStore, delivery:
   throw new HttpError(404, 'not_found', '未找到此接口');
 }
 
+type LocalServerOptions = {
+  requireActivation?: boolean;
+  activationPepper?: string;
+  modelNames?: Partial<Record<keyof AdminRuntime['models'], string>>;
+  costRates?: AdminRuntime['rates'];
+};
+
 export async function startLocalServer(pool: Pool, port: number, wechat?: WechatLogin, textModel?: TextModel,
   imageModel?: ImageModel, speechModel?: SpeechModel, agentModel?: AgentModel, intentModel?: IntentModel, deliveryModel?: DeliveryModel,
-  adminToken?: string, voiceCorrector?: VoiceCorrector): Promise<Server> {
+  adminToken?: string, voiceCorrector?: VoiceCorrector, options: LocalServerOptions = {}): Promise<Server> {
+  adminToken = configuredAdminToken({ DISPATCH_ADMIN_TOKEN: adminToken });
   await requireApplicationRole(pool);
-  const store = new DraftStore(pool);
+  const codes = new ActivationCodes(options.activationPepper || adminToken);
+  const requireActivation = options.requireActivation ?? false;
+  const modelStatus = (name: keyof AdminRuntime['models'], configured: boolean) => ({
+    configured, name: configured ? options.modelNames?.[name] ?? (name === 'voice' ? 'deepseek-asr' : 'deepseek-flash') : null,
+  });
+  const adminRuntime: AdminRuntime = { codes, requireActivation, wechatConfigured: Boolean(wechat),
+    models: { text: modelStatus('text', Boolean(textModel)), image: modelStatus('image', Boolean(imageModel)),
+      voice: modelStatus('voice', Boolean(speechModel)), agent: modelStatus('agent', Boolean(agentModel)) },
+    rates: options.costRates ?? configuredCostRates({}),
+  };
+  const store = new DraftStore(pool, requireActivation, codes);
   const trips = new TripStore(pool);
   const delivery = new DeliveryStore(pool);
   const ledger = new LedgerStore(pool);
@@ -379,9 +400,9 @@ export async function startLocalServer(pool: Pool, port: number, wechat?: Wechat
   const textOrders = new TextOrders(pool, textModel, imageModel);
   const agent = new AgentRuntime(pool, trips, textOrders, agentModel, intentModel, deliveryModel);
   await agent.store.interrupt();
-  const server = createServer({ requestTimeout: 15_000 }, (request, response) => {
+  const server = createServer({ requestTimeout: 15_000 }, (request, response) => businessSession.run({}, () => {
     void handle(pool, store, trips, delivery, ledger, amendments, materials, textOrders, agent, memory, catalog, request, response,
-      wechat, speechModel, adminToken, voiceCorrector).catch(error => {
+      wechat, speechModel, adminToken, voiceCorrector, adminRuntime).catch(error => {
       if (response.destroyed) return;
       if (error instanceof HttpError) {
         sendJson(response, error.status, { error: error.code, message: error.message });
@@ -390,7 +411,7 @@ export async function startLocalServer(pool: Pool, port: number, wechat?: Wechat
         sendJson(response, 500, { error: 'server_error', message: '服务暂时无法处理，请重试' });
       }
     });
-  });
+  }));
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
     server.listen(port, '127.0.0.1', () => {
@@ -413,7 +434,12 @@ async function main(): Promise<void> {
   try {
     const server = await startLocalServer(pool, port, wechat, configuredTextModel(process.env),
       configuredImageModel(process.env), configuredSpeechModel(process.env), configuredAgentModel(process.env),
-      configuredIntentModel(process.env, 'A'), configuredDeliveryModel(process.env), adminToken, configuredVoiceCorrector(process.env));
+      configuredIntentModel(process.env, 'A'), configuredDeliveryModel(process.env), adminToken, configuredVoiceCorrector(process.env), {
+        ...configuredActivation(process.env),
+        modelNames: { text: process.env.DISPATCH_TEXT_MODEL?.trim() || 'deepseek-flash',
+          agent: process.env.DISPATCH_AGENT_MODEL?.trim() || 'deepseek-flash' },
+        costRates: configuredCostRates(process.env),
+      });
     const stop = () => {
       server.close(() => { void pool.end(); });
       server.closeIdleConnections();

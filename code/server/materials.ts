@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { Pool, PoolClient } from 'pg';
 import { Material, materialChunkBytes, materialDigestPattern, materialImagePattern, materialMaxBytes,
   MaterialSource } from '../miniprogram/core/materials';
-import { missingDraft, readAccount, readWorkspace, Workspace, writeAccount } from './account-workspace';
+import { requireActiveAccount, missingDraft, readAccount, readWorkspace, Workspace, writeAccount } from './account-workspace';
 import { setAccount, transaction } from './database';
 import { HttpError } from './http-error';
 import { readCommand, readId, validRevision } from './request-input';
@@ -97,6 +97,7 @@ export class MaterialStore {
   append(accountId: string, id: string, offset: number, content: Buffer) {
     return transaction(this.pool, async client => {
       await setAccount(client, accountId);
+      await requireActiveAccount(client, accountId);
       const row = await findMaterial(client, accountId, id, true);
       if (offset < 0 || offset % materialChunkBytes !== 0 || offset >= row.size ||
           content.length !== Math.min(materialChunkBytes, row.size - offset)) {

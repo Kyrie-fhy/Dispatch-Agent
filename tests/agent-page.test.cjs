@@ -29,6 +29,7 @@ function setup(t, initialDraft) {
   let turns = [];
   let onRequest;
   let sequence = 0;
+  let loginCount = 0;
   const card = { ...previewTrip(initialDraft, true), draftId: initialDraft.id, revision: initialDraft.revision,
     previewId: 'pre-1', choices: [null] };
   const event = (kind, payload) => ({ kind, payload, seq: ++sequence });
@@ -43,11 +44,13 @@ function setup(t, initialDraft) {
     return page;
   };
   agentSession.token = '';
+  agentSession.remarkName = '';
+  agentSession.disabledMessage = '';
   agentSession.unsaved = null;
   agentSession.deliveryCustomer = null;
   agentSession.deliveryTarget = null;
   global.wx = {
-    login: ({ success }) => success({ code: 'example-login' }),
+    login: ({ success }) => success({ code: `example-login-${++loginCount}` }),
     request: request => {
       const url = new URL(request.url);
       const path = url.pathname.slice(3);
@@ -55,7 +58,10 @@ function setup(t, initialDraft) {
         ok: (data, statusCode = 200) => request.success({ statusCode, data }),
         fail: () => request.fail({ errMsg: 'offline' }) };
       requests.push(entry);
-      if (path === '/session/wechat') return entry.ok({ token }, 201);
+      if (path === '/session/wechat') {
+        if (onRequest?.(entry)) return;
+        return entry.ok({ token }, 201);
+      }
       assert.equal(request.header.Authorization, `Bearer ${token}`);
       if (onRequest?.(entry)) return;
       if (path === '/session') return entry.ok(null, 204);
@@ -76,8 +82,10 @@ function setup(t, initialDraft) {
     setNavigationBarTitle: ({ title }) => titles.push(title),
   };
   const page = pageFor('agent');
-  t.after(() => { page.onHide(); agentSession.token = ''; agentSession.unsaved = null; });
+  t.after(() => { page.onHide(); agentSession.token = ''; agentSession.remarkName = '';
+    agentSession.disabledMessage = ''; agentSession.unsaved = null; });
   return { page, pageFor, requests, navigation, titles, event, card,
+    loginCalls: () => loginCount,
     setDraft(value) { draft = value; }, setConfirmed(value, id = null) { confirmed = value; confirmedPreviewId = id; },
     setTurns(value) { turns = value; }, setDelivery(value) { delivery = value; }, handle(fn) { onRequest = fn; },
   };
@@ -2146,6 +2154,36 @@ test('6.5-10 profile retries failed alias and catalog loads in place', async t =
   assert.equal(profile.data.error, '');
 });
 
+test('6.8-3 profile switches to the disabled gate when the alias load reports account_disabled', async t => {
+  const draft = order();
+  const { pageFor, handle } = setup(t, draft);
+  const profile = pageFor('profile');
+  handle(request => {
+    if (request.path === '/workspace') {
+      request.ok({ draft, parties: [], draftConfirmed: false, currentTrip: null });
+      return true;
+    }
+    if (request.path === '/customer-aliases') {
+      request.ok({ error: 'account_disabled', message: '当前账号已暂停使用，请联系管理员' }, 403);
+      return true;
+    }
+    if (request.path === '/catalog/summary') {
+      request.ok({ productCount: 12, variantCount: 20, activeVariantCount: 18,
+        discontinuedVariantCount: 2, missingUnitVariantCount: 1 });
+      return true;
+    }
+    return false;
+  });
+  await profile.onShow();
+  await profile.login();
+  assert.equal(agentSession.token, '', '遇到停用必须立刻清空本机会话');
+  assert.equal(profile.data.signedIn, false);
+  assert.equal(profile.data.authGate, 'disabled');
+  assert.equal(profile.data.disabledMessage, '当前账号已暂停使用，请联系管理员');
+  assert.equal(agentSession.disabledMessage, '当前账号已暂停使用，请联系管理员');
+  assert.equal(profile.data.error, '', '停用提示不应落成普通错误条');
+});
+
 test('6.5-10 keeps the new sheets native, equal-width and reachable', () => {
   const read = file => fs.readFileSync(require.resolve(`../code/dist/${file}`), 'utf8');
   const agentWxml = read('pages/agent/index.wxml');
@@ -2966,5 +3004,181 @@ test('6.7-1 profile ships the trip status bar, side-by-side metrics and full-wid
     'height: 80rpx', 'width: 148rpx', 'height: 88rpx', 'var(--hairline-strong)', '.identity-card',
     '.trip-status-dot']) {
     assert.ok(wxss.includes(token), `我的页缺少 v2.0 样式 ${token}`);
+  }
+});
+
+test('6.8-3 activation gate rebinds with a fresh wechat code and restores the remark name', async t => {
+  const draft = order();
+  const { page, pageFor, handle, loginCalls } = setup(t, draft);
+  const sessions = [];
+  handle(request => {
+    if (request.path !== '/session/wechat') return false;
+    sessions.push(request.data);
+    if (!request.data.activationCode) {
+      request.ok({ error: 'activation_required', message: '请输入管理员提供的开通码完成开通' }, 403);
+    } else if (request.data.activationCode !== 'DZ-8F2K-9Q1M') {
+      request.ok({ error: 'invalid_activation_code', message: '开通码无效或已被使用，请联系管理员核对' }, 403);
+    } else {
+      request.ok({ token, remarkName: '老张冻品' }, 201);
+    }
+    return true;
+  });
+
+  await page.onShow();
+  await page.login();
+  assert.equal(page.data.signedIn, false);
+  assert.equal(page.data.authGate, 'activation', '首次进入安静切到输码界面');
+  assert.equal(page.data.error, '', '不显示吓人的红色报错条');
+  assert.equal(loginCalls(), 1);
+
+  page.onActivationInput({ detail: { value: 'DZ-WRONG-CODE' } });
+  await page.submitActivation();
+  assert.equal(page.data.authGate, 'activation', '错码留在输码态');
+  assert.equal(page.data.activationCode, 'DZ-WRONG-CODE', '错码提交后保留用户输入');
+  assert.match(page.data.error, /开通码无效或已被使用/);
+  assert.equal(loginCalls(), 2, '提交开通码必须重新调用 wechatCode');
+  assert.notEqual(sessions[1].code, sessions[0].code, '重新取得全新微信凭证');
+
+  page.onActivationInput({ detail: { value: ' DZ-8F2K-9Q1M ' } });
+  await page.submitActivation();
+  assert.equal(sessions[2].activationCode, 'DZ-8F2K-9Q1M', '开通码去掉首尾空白后提交');
+  assert.notEqual(sessions[2].code, sessions[1].code, '成功绑定同样使用新凭证');
+  assert.equal(loginCalls(), 3);
+  assert.equal(page.data.signedIn, true);
+  assert.equal(page.data.authGate, '');
+  assert.equal(agentSession.token, token);
+  assert.equal(agentSession.remarkName, '老张冻品');
+  assert.equal(agentSession.disabledMessage, '');
+
+  const profile = pageFor('profile');
+  await profile.onShow();
+  assert.equal(profile.data.signedIn, true);
+  assert.equal(profile.data.remarkName, '老张冻品', '我的页身份卡显示后台备注名');
+  const profileWxml = fs.readFileSync(require.resolve('../code/dist/pages/profile/index.wxml'), 'utf8');
+  assert.ok(profileWxml.includes("{{remarkName || '微信账号已登录'}}"));
+  assert.ok(profileWxml.includes('微信账号已登录 · 数据独立同步'));
+  page.onHide();
+});
+
+test('6.8-3 wechat login lands on the disabled card without a scary error banner', async t => {
+  const draft = order();
+  const { page, handle } = setup(t, draft);
+  handle(request => {
+    if (request.path !== '/session/wechat') return false;
+    request.ok({ error: 'account_disabled', message: '当前账号已暂停使用，请联系管理员' }, 403);
+    return true;
+  });
+
+  await page.onShow();
+  await page.login();
+  assert.equal(page.data.signedIn, false);
+  assert.equal(page.data.authGate, 'disabled');
+  assert.equal(page.data.disabledMessage, '当前账号已暂停使用，请联系管理员');
+  assert.equal(page.data.error, '');
+  assert.equal(agentSession.token, '');
+  assert.equal(agentSession.disabledMessage, '当前账号已暂停使用，请联系管理员');
+
+  await page.onShow();
+  assert.equal(page.data.authGate, 'disabled', '回到助手页仍保持停用态');
+
+  const wxml = fs.readFileSync(require.resolve('../code/dist/pages/agent/index.wxml'), 'utf8');
+  for (const token of ['当前账号已暂停使用', '{{disabledMessage ||', '重新登录',
+    '管理员在后台恢复启用后，可点击下方按钮重新登录']) {
+    assert.ok(wxml.includes(token), `停用卡缺少 ${token}`);
+  }
+});
+
+test('6.8-3 account disabled during use clears the agent session and stops polling', async t => {
+  const draft = order();
+  const { page, handle } = setup(t, draft);
+  await page.login();
+  assert.equal(page.data.signedIn, true);
+
+  handle(request => {
+    if (request.path === '/agent/conversation') {
+      request.ok({ error: 'account_disabled', message: '当前账号已暂停使用，请联系管理员' }, 403);
+      return true;
+    }
+    return false;
+  });
+  await page.onShow();
+  assert.equal(agentSession.token, '', '立刻清空本机会话');
+  assert.equal(agentSession.remarkName, '');
+  assert.equal(page.data.signedIn, false);
+  assert.equal(page.data.authGate, 'disabled');
+  assert.equal(page.data.polling, false, '停止轮询');
+  assert.equal(page.data.draftSummary, null, '草稿视图已清空');
+  assert.equal(page.data.disabledMessage, '当前账号已暂停使用，请联系管理员');
+  assert.equal(agentSession.disabledMessage, '当前账号已暂停使用，请联系管理员');
+});
+
+test('6.8-3 account disabled clears the profile session and shows the restricted card', async t => {
+  const draft = order();
+  const { pageFor, handle } = setup(t, draft);
+  const profile = pageFor('profile');
+  await profile.login();
+  assert.equal(profile.data.signedIn, true);
+
+  handle(request => {
+    if (request.path === '/workspace') {
+      request.ok({ error: 'account_disabled', message: '当前账号已暂停使用，请联系管理员' }, 403);
+      return true;
+    }
+    return false;
+  });
+  await profile.onShow();
+  assert.equal(agentSession.token, '');
+  assert.equal(profile.data.signedIn, false);
+  assert.equal(profile.data.authGate, 'disabled');
+  assert.equal(profile.data.disabledMessage, '当前账号已暂停使用，请联系管理员');
+  assert.equal(profile.data.partyCount, 0, '熟客等敏感数据已清空');
+  assert.equal(profile.data.aliases.length, 0);
+  assert.equal(agentSession.disabledMessage, '当前账号已暂停使用，请联系管理员');
+
+  const wxml = fs.readFileSync(require.resolve('../code/dist/pages/profile/index.wxml'), 'utf8');
+  for (const token of ['当前账号已暂停使用', '{{disabledMessage ||', '重新登录']) {
+    assert.ok(wxml.includes(token), `我的页停用卡缺少 ${token}`);
+  }
+});
+
+test('6.8-3 account disabled clears the history session and sensitive rows', async t => {
+  const draft = order();
+  const { page, pageFor, handle } = setup(t, draft);
+  await page.login();
+  const history = pageFor('history');
+  handle(request => {
+    if (request.path === '/trips') {
+      request.ok({ error: 'account_disabled', message: '当前账号已暂停使用，请联系管理员' }, 403);
+      return true;
+    }
+    return false;
+  });
+  await history.onShow();
+  assert.equal(agentSession.token, '', '历史页收到停用立刻清会话');
+  assert.equal(history.data.signedIn, false);
+  assert.deepEqual(history.data.trips, []);
+  assert.equal(history.data.formal, null);
+  assert.equal(history.data.error, '当前账号已暂停使用，请联系管理员');
+  assert.equal(agentSession.disabledMessage, '当前账号已暂停使用，请联系管理员');
+});
+
+test('6.8-3 gate pages keep the cold-chain v2.0 high-contrast native baseline', () => {
+  const read = file => fs.readFileSync(require.resolve(`../code/dist/${file}`), 'utf8');
+  const pairs = [['agent', read('pages/agent/index.wxml'), read('pages/agent/index.wxss')],
+    ['profile', read('pages/profile/index.wxml'), read('pages/profile/index.wxss')]];
+  const emoji = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{26FF}\u{FE0F}]/u;
+  for (const [name, wxml, wxss] of pairs) {
+    for (const banned of ['size="mini"', 'cover-view']) {
+      assert.equal(wxml.includes(banned), false, `${name} 不得出现 ${banned}`);
+    }
+    assert.equal(emoji.test(wxml), false, `${name} 不得出现 Emoji`);
+    for (const token of ['首次使用请输入开通码', '确认开通', '返回微信登录',
+      '当前账号已暂停使用', '重新登录', 'bindtap="submitActivation"', 'bindtap="cancelActivation"']) {
+      assert.ok(wxml.includes(token), `${name} 缺少门禁结构 ${token}`);
+    }
+    for (const token of ['.gate-card', '.gate-input', '.gate-error', '.gate-card-disabled',
+      'height: 96rpx', 'height: 88rpx', 'var(--primary)']) {
+      assert.ok(wxss.includes(token), `${name} 缺少门禁样式 ${token}`);
+    }
   }
 });

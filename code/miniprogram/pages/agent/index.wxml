@@ -69,13 +69,32 @@
 </template>
 
 <view class="agent">
-  <view wx:if="{{!signedIn}}" class="card guest-card">
-    <text class="title">录单助手</text>
-    <text class="muted">发微信截图、语音或文字，核对后出整趟送货单。</text>
-    <button wx:if="{{!revokeFailed}}" class="btn-primary" loading="{{busy}}" disabled="{{busy}}" bindtap="login">微信登录</button>
-    <button wx:else class="btn-danger-ghost" disabled="{{busy}}" bindtap="logout">重试退出</button>
-    <text wx:if="{{error}}" class="error">{{error}}</text>
-  </view>
+  <block wx:if="{{!signedIn}}">
+    <view wx:if="{{authGate === 'activation'}}" class="card gate-card">
+      <text class="gate-title">首次使用请输入开通码</text>
+      <text class="gate-desc">请输入管理员发来的开通码（如 DZ-XXXX-XXXX），绑定一次后以后直接微信登录</text>
+      <input class="gate-input num" value="{{activationCode}}" maxlength="40" placeholder="输入开通码"
+        placeholder-class="gate-placeholder" focus="{{true}}" disabled="{{busy}}"
+        bindinput="onActivationInput" bindconfirm="submitActivation" />
+      <text wx:if="{{error}}" class="gate-error">{{error}}</text>
+      <button class="btn-primary gate-btn" loading="{{busy}}" disabled="{{busy}}" bindtap="submitActivation">确认开通</button>
+      <button class="btn-ghost gate-btn" disabled="{{busy}}" bindtap="cancelActivation">返回微信登录</button>
+    </view>
+    <view wx:elif="{{authGate === 'disabled'}}" class="card gate-card gate-card-disabled">
+      <text class="gate-badge">账号受限</text>
+      <text class="gate-title">当前账号已暂停使用</text>
+      <text class="gate-desc">{{disabledMessage || '当前账号已暂停使用，请联系管理员'}}</text>
+      <text class="gate-note">管理员在后台恢复启用后，可点击下方按钮重新登录</text>
+      <button class="btn-primary gate-btn" loading="{{busy}}" disabled="{{busy}}" bindtap="login">重新登录</button>
+    </view>
+    <view wx:else class="card guest-card">
+      <text class="title">录单助手</text>
+      <text class="muted">发微信截图、语音或文字，核对后出整趟送货单。</text>
+      <button wx:if="{{!revokeFailed}}" class="btn-primary" loading="{{busy}}" disabled="{{busy}}" bindtap="login">微信登录</button>
+      <button wx:else class="btn-danger-ghost" disabled="{{busy}}" bindtap="logout">重试退出</button>
+      <text wx:if="{{error}}" class="error">{{error}}</text>
+    </view>
+  </block>
   <block wx:else>
     <view wx:if="{{draftSummary || deliverySummary}}" class="trip-pill-wrap">
       <view class="trip-pill">

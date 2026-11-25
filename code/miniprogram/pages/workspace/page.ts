@@ -1,4 +1,4 @@
-import { agentSession } from '../../services/agent-session';
+import { agentSession, clearAgentSession } from '../../services/agent-session';
 import { emptyItem, ItemInput, money, nullablePrice } from '../../core/orders';
 import { Material, materialImagePattern, MaterialSource } from '../../core/materials';
 import { localDay, OpeningPreview, ReceiptPreview, Sheet } from '../../core/settlement';
@@ -152,6 +152,14 @@ Page({
         this.clearSession('登录已失效，请重新登录');
         return;
       }
+      if (error instanceof WorkspaceError && error.status === 403 && error.code === 'account_disabled') {
+        const disabledMessage = error.message || '当前账号已暂停使用，请联系管理员';
+        const shared = (this.fromAgent || tab) && agentSession.token === this.token;
+        this.clearSession(disabledMessage);
+        if (shared) clearAgentSession(disabledMessage);
+        else agentSession.disabledMessage = disabledMessage;
+        return;
+      }
       this.setData({ error: errorMessage(error) });
     } finally {
       if (generation === this.generation) this.setData({ busy: false });
@@ -161,8 +169,7 @@ Page({
   clearSession(error = '') {
     const token = this.token;
     if ((this.fromAgent || tab) && agentSession.token === token) {
-      agentSession.token = '';
-      agentSession.unsaved = null;
+      clearAgentSession();
     }
     this.generation += 1;
     this.token = '';
@@ -208,11 +215,20 @@ Page({
     return this.run(async generation => {
       const code = await wechatCode();
       if (generation !== this.generation) return;
-      const { token } = await workspaceRequest<{ token: string }>('POST', '/session/wechat', '', { code });
+      let result: { token: string; remarkName?: string };
+      try {
+        result = await workspaceRequest<{ token: string; remarkName?: string }>('POST', '/session/wechat', '', { code });
+      } catch (error) {
+        if (error instanceof WorkspaceError && error.status === 403 && error.code === 'activation_required') {
+          throw new Error('当前微信尚未开通，请先在「助手」页输入管理员提供的开通码完成开通');
+        }
+        throw error;
+      }
+      const { token } = result;
       if (!/^[A-Za-z0-9_-]{43}$/.test(token)) throw new Error('服务未返回有效的登录凭证，请重试');
       if (generation !== this.generation) { void revokeSession(token).catch(() => {}); return; }
       this.token = token;
-      this.setData({ signedIn: true });
+      this.setData({ signedIn: true, error: '' });
       await this.restore(generation, token);
     });
   },

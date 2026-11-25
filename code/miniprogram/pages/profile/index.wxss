@@ -13,6 +13,69 @@
 }
 .account-btn { margin-top: 20rpx; }
 
+/* ---- 首次开通码门禁与账号停用卡 ---- */
+.gate-card {
+  display: flex;
+  flex-direction: column;
+  gap: 20rpx;
+  margin: 24rpx 0;
+  padding: 36rpx 28rpx;
+}
+.gate-badge {
+  align-self: flex-start;
+  padding: 6rpx 20rpx;
+  border-radius: var(--radius-pill);
+  background: var(--danger-weak);
+  color: #8C3B32;
+  font-size: 26rpx;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.gate-title {
+  font-size: 38rpx;
+  font-weight: 700;
+  line-height: 1.32;
+  color: var(--ink);
+}
+.gate-desc {
+  font-size: 30rpx;
+  line-height: 1.6;
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
+}
+.gate-note {
+  font-size: 30rpx;
+  line-height: 1.55;
+  color: var(--ink-3);
+  overflow-wrap: anywhere;
+}
+.gate-input {
+  box-sizing: border-box;
+  width: 100%;
+  height: 96rpx;
+  padding: 0 24rpx;
+  font-size: 36rpx;
+  letter-spacing: 2rpx;
+  color: var(--ink);
+  background: var(--surface-sunken);
+  border: 2rpx solid var(--hairline-strong);
+  border-radius: var(--radius-md);
+}
+.gate-input:focus { border-color: var(--primary); }
+.gate-placeholder { color: var(--ink-disabled); font-size: 30rpx; letter-spacing: 0; }
+.gate-error {
+  padding: 14rpx 18rpx;
+  border-radius: var(--radius-sm);
+  background: var(--danger-weak);
+  color: var(--danger);
+  font-size: 28rpx;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.gate-btn { margin-top: 0; }
+.gate-card .btn-ghost { height: 88rpx; }
+.gate-card-disabled { border-color: rgba(200, 30, 30, 0.22); }
+
 /* ---- 顶部账号身份卡 ---- */
 .identity-card {
   display: flex;

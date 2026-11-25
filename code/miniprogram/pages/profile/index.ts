@@ -1,5 +1,5 @@
 import type { TripDraft } from '../../core/trips';
-import { agentSession } from '../../services/agent-session';
+import { agentSession, clearAgentSession } from '../../services/agent-session';
 import { newId } from '../../services/ids';
 import { revokeSession, wechatCode, Workspace, WorkspaceError, workspaceRequest } from '../../services/workspace';
 import { errorMessage } from '../order-view';
@@ -27,6 +27,10 @@ Page({
     signedIn: false,
     busy: false,
     error: '',
+    authGate: '' as '' | 'activation' | 'disabled',
+    activationCode: '',
+    disabledMessage: '',
+    remarkName: '',
     revokeFailed: false,
     loaded: false,
     tripMode: '',
@@ -44,16 +48,20 @@ Page({
 
   onShow(): Promise<void> | undefined {
     if (!agentSession.token) {
+      const disabledMessage = agentSession.disabledMessage;
       this.clear();
+      this.setData({ authGate: disabledMessage ? 'disabled' : '', disabledMessage });
       return;
     }
-    this.setData({ signedIn: true });
+    this.setData({ signedIn: true, authGate: '', activationCode: '', disabledMessage: '',
+      remarkName: agentSession.remarkName });
     if (!this.data.busy) return this.run(() => this.reload());
   },
 
   clear(error = '') {
     this.generation += 1;
-    this.setData({ signedIn: false, busy: false, error, revokeFailed: !!this.retiredToken,
+    this.setData({ signedIn: false, busy: false, error, authGate: '', activationCode: '', disabledMessage: '',
+      remarkName: '', revokeFailed: !!this.retiredToken,
       loaded: false, tripMode: '', tripDetail: '', partyCount: 0, canEditForm: false,
       aliases: [], aliasesLoaded: false, aliasError: '', catalogSummary: null, catalogError: '' });
   },
@@ -68,11 +76,15 @@ Page({
   },
 
   showError(error: unknown) {
+    if (error instanceof WorkspaceError && error.status === 403 && error.code === 'account_disabled') {
+      const disabledMessage = error.message || '当前账号已暂停使用，请联系管理员';
+      clearAgentSession(disabledMessage);
+      this.clear();
+      this.setData({ authGate: 'disabled', disabledMessage });
+      return;
+    }
     if (error instanceof WorkspaceError && error.status === 401) {
-      agentSession.token = '';
-      agentSession.unsaved = null;
-      agentSession.deliveryCustomer = null;
-      agentSession.deliveryTarget = null;
+      clearAgentSession();
       this.clear('登录已失效，请重新登录。');
       return;
     }
@@ -121,24 +133,97 @@ Page({
     return this.run(async () => {
       const generation = this.generation;
       const code = await wechatCode();
-      const { token } = await workspaceRequest<{ token: string }>('POST', '/session/wechat', '', { code });
+      let result: { token: string; remarkName?: string };
+      try {
+        result = await workspaceRequest<{ token: string; remarkName?: string }>('POST', '/session/wechat', '', { code });
+      } catch (error) {
+        if (error instanceof WorkspaceError && error.status === 403 && error.code === 'activation_required') {
+          this.setData({ authGate: 'activation', activationCode: '', disabledMessage: '', error: '' });
+          return;
+        }
+        if (error instanceof WorkspaceError && error.status === 403 && error.code === 'account_disabled') {
+          const disabledMessage = error.message || '当前账号已暂停使用，请联系管理员';
+          clearAgentSession(disabledMessage);
+          this.clear();
+          this.setData({ authGate: 'disabled', disabledMessage });
+          return;
+        }
+        throw error;
+      }
+      const { token } = result;
       if (!/^[A-Za-z0-9_-]{43}$/.test(token)) throw new Error('服务未返回有效的登录凭证，请重试');
       if (generation !== this.generation) { void revokeSession(token).catch(() => {}); return; }
       agentSession.token = token;
-      this.setData({ signedIn: true });
+      agentSession.remarkName = result.remarkName ?? '';
+      agentSession.disabledMessage = '';
+      this.setData({ signedIn: true, authGate: '', activationCode: '', disabledMessage: '',
+        remarkName: agentSession.remarkName, error: '' });
       await this.reload();
     });
+  },
+
+  onActivationInput(event: WechatMiniprogram.Input) {
+    this.setData({ activationCode: event.detail.value, error: '' });
+  },
+
+  submitActivation(): Promise<void> | undefined {
+    if (agentSession.token || this.retiredToken) return;
+    const activationCode = this.data.activationCode.trim();
+    if (!activationCode) {
+      this.setData({ error: '请输入开通码' });
+      return;
+    }
+    return this.run(async () => {
+      const generation = this.generation;
+      // 微信登录 code 一次性有效，提交开通码前必须重新取得新凭证。
+      const code = await wechatCode();
+      let result: { token: string; remarkName?: string };
+      try {
+        result = await workspaceRequest<{ token: string; remarkName?: string }>('POST', '/session/wechat', '',
+          { code, activationCode });
+      } catch (error) {
+        if (error instanceof WorkspaceError && error.status === 403 && error.code === 'activation_required') {
+          this.setData({ authGate: 'activation', error: error.message || '请输入管理员提供的开通码完成开通' });
+          return;
+        }
+        if (error instanceof WorkspaceError && error.status === 403 &&
+            (error.code === 'invalid_activation_code' || error.code === 'activation_rate_limited')) {
+          this.setData({ authGate: 'activation', error: error.message || '开通码无效或已被使用，请联系管理员核对' });
+          return;
+        }
+        if (error instanceof WorkspaceError && error.status === 403 && error.code === 'account_disabled') {
+          const disabledMessage = error.message || '当前账号已暂停使用，请联系管理员';
+          clearAgentSession(disabledMessage);
+          this.clear();
+          this.setData({ authGate: 'disabled', disabledMessage });
+          return;
+        }
+        throw error;
+      }
+      const { token } = result;
+      if (!/^[A-Za-z0-9_-]{43}$/.test(token)) throw new Error('服务未返回有效的登录凭证，请重试');
+      if (generation !== this.generation) { void revokeSession(token).catch(() => {}); return; }
+      agentSession.token = token;
+      agentSession.remarkName = result.remarkName ?? '';
+      agentSession.disabledMessage = '';
+      this.setData({ signedIn: true, authGate: '', activationCode: '', disabledMessage: '',
+        remarkName: agentSession.remarkName, error: '' });
+      await this.reload();
+    });
+  },
+
+  cancelActivation(): void {
+    if (this.data.busy) return;
+    this.setData({ authGate: '', activationCode: '', disabledMessage: '', error: '' });
   },
 
   logout(): Promise<void> | undefined {
     if (this.data.busy) return;
     this.retiredToken = agentSession.token || this.retiredToken;
-    agentSession.token = '';
-    agentSession.unsaved = null;
-    agentSession.deliveryCustomer = null;
-    agentSession.deliveryTarget = null;
+    clearAgentSession();
     this.generation += 1;
-    this.setData({ signedIn: false, busy: false, error: '', revokeFailed: !!this.retiredToken,
+    this.setData({ signedIn: false, busy: false, error: '', authGate: '', activationCode: '', disabledMessage: '',
+      remarkName: '', revokeFailed: !!this.retiredToken,
       loaded: false, tripMode: '', tripDetail: '', partyCount: 0, canEditForm: false,
       aliases: [], aliasesLoaded: false, aliasError: '', catalogSummary: null, catalogError: '' });
     return this.run(async () => {

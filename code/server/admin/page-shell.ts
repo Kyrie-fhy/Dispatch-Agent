@@ -418,8 +418,14 @@ export const adminShellScript = `
     var root = el('modalRoot');
     if (!root) return;
     if (modalTimer) { clearTimeout(modalTimer); modalTimer = null; }
+    modalSeq += 1;
     modalDirty = false;
     modalBackdropGuard = false;
+    try {
+      if (document.activeElement && root.contains && root.contains(document.activeElement) && document.activeElement.blur) {
+        document.activeElement.blur();
+      }
+    } catch (e) {}
     if (immediate || !hasRaf || root.classList.contains('hidden')) {
       root.classList.remove('is-closing');
       root.classList.add('hidden');
@@ -464,7 +470,7 @@ export const adminShellScript = `
       if (confirm) { confirm.disabled = false; confirm.textContent = confirmText; }
     };
     var triggerConfirm = function () {
-      if (busy) return;
+      if (busy || mySeq !== modalSeq || root.classList.contains('is-closing') || root.classList.contains('hidden')) return;
       busy = true;
       confirm.disabled = true;
       confirm.textContent = '处理中…';
@@ -489,8 +495,10 @@ export const adminShellScript = `
       card.addEventListener('input', function () { modalDirty = true; });
       card.addEventListener('change', function () { modalDirty = true; });
       card.addEventListener('keydown', function (event) {
+        if (event.isComposing || event.keyCode === 229) return;
         if (event.key === 'Enter' && event.target && event.target.tagName === 'INPUT' &&
           event.target.type !== 'checkbox' && event.target.type !== 'radio' && event.target.type !== 'file') {
+          if (mySeq !== modalSeq || root.classList.contains('is-closing')) return;
           event.preventDefault();
           triggerConfirm();
         }

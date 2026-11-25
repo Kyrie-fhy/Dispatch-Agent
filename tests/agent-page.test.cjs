@@ -3246,6 +3246,30 @@ test('UX & Motion: order sheet guards unsaved prices, voice pad explains tap flo
   await page.notHim(tap({ turn: linkTurn.id, customer: draft.customers[0].id }));
   assert.equal(page.data.scrollTo, 'latest', '点不是他后自动滚动露出选店卡');
 
+  // 2b. Customer sheet preserves typed draft across backdrop close & reopen
+  draft.customers[0].customer = '';
+  page.openCustomerSheet(tap({ customer: draft.customers[0].id }));
+  page.editSheetCustomerName({ detail: { value: '鲜味居砂锅' } });
+  page.closeCustomerSheet();
+  assert.equal(page.data.customerSheet, null);
+  page.openCustomerSheet(tap({ customer: draft.customers[0].id }));
+  assert.equal(page.data.customerSheet.value, '鲜味居砂锅', '补店名抽屉关闭后再打开保留未提交输入');
+  page.closeCustomerSheet();
+
+  // 2c. Retry clears stale voiceMeta and voiceCorrectionHint before replacing text
+  const failedTurn = { id: 'turn-fail', text: '旧失败消息', materialIds: [], revision: draft.revision, status: 'failed', events: [] };
+  page.turns.push(failedTurn);
+  page.voiceMeta = { rawText: '安景鱼豆腐', corrections: [{ from: '安景', to: '安井' }] };
+  page.setData({ text: '安井鱼豆腐', voiceCorrectionHint: '已自动纠正：安景→安井' });
+  let retryModal = null;
+  wx.showModal = spec => { retryModal = spec; };
+  page.retry(tap({ id: 'turn-fail' }));
+  assert.ok(retryModal, '输入框已有内容点重试先弹替换确认');
+  retryModal.success({ confirm: true });
+  assert.equal(page.data.text, '旧失败消息');
+  assert.equal(page.voiceMeta, null, '替换重发必须清空被替换语音的 voiceMeta');
+  assert.equal(page.data.voiceCorrectionHint, '', '替换重发同步清空语音纠偏提示');
+
   // 3. Profile stage card navigation + logout confirmation guard
   const profile = pageFor('profile');
   await profile.onShow();

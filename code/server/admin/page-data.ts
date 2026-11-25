@@ -145,6 +145,7 @@ export const adminDataScript = `
   };
   var catalogQuerySeq = 0;
   var catalogCsvSeq = 0;
+  var catalogLoadSeq = 0;
 
   var autoCatalogCode = function (code) {
     return /^[MV]-[0-9a-f]{8}-[0-9a-f]{4}-/i.test(str(code));
@@ -372,10 +373,11 @@ export const adminDataScript = `
     loadCatalogCustomers(account.id);
   };
   var refreshCatalogInPlace = function (accountId, highlightVariantId) {
+    var reqSeq = ++catalogLoadSeq;
     var tableWrap = el('catalogTableWrap');
     var scrollTop = tableWrap ? tableWrap.scrollTop : 0;
     return request(accountPath(accountId, '/catalog')).then(function (data) {
-      if (!isCurrent('catalog', accountId)) return;
+      if (reqSeq !== catalogLoadSeq || !isCurrent('catalog', accountId)) return;
       catalogView.data = data;
       var overview = el('catalogOverview');
       if (overview) {
@@ -402,15 +404,16 @@ export const adminDataScript = `
         '先到「账号与开通」生成一次性开通码，配送员开通后就能维护他的货品库。', 'accounts', '去账号与开通');
       return Promise.resolve();
     }
+    var reqSeq = ++catalogLoadSeq;
     catalogQuerySeq += 1;
     catalogView.data = null;
     viewRoot().innerHTML = loading('正在读取 ' + App.accountLabel(account) + ' 的货品与价格库…');
     return request(accountPath(account.id, '/catalog')).then(function (data) {
-      if (!isCurrent('catalog', account.id)) return;
+      if (reqSeq !== catalogLoadSeq || !isCurrent('catalog', account.id)) return;
       catalogView.data = data;
       renderCatalogView();
     }, function (error) {
-      if (isCurrent('catalog', account.id)) viewRoot().innerHTML = App.errorCard(error.message);
+      if (reqSeq === catalogLoadSeq && isCurrent('catalog', account.id)) viewRoot().innerHTML = App.errorCard(error.message);
     });
   };
   views.catalog = {
@@ -586,7 +589,10 @@ export const adminDataScript = `
       toast(next === 'active' ? '已重新上架。' : '已快速下架。', 'success');
       App.loadAccounts().catch(function () {});
       if (state.accountId !== targetAccountId) return;
-      return refreshCatalogInPlace(targetAccountId, variant.variantId);
+      return refreshCatalogInPlace(targetAccountId, variant.variantId).catch(function () {
+        if (trigger && trigger.isConnected) { trigger.disabled = false; trigger.textContent = origLabel; }
+        toast('状态已保存，但列表刷新失败，请点顶部「刷新」查看最新状态。', 'error');
+      });
     }, function (error) {
       if (trigger && trigger.isConnected) { trigger.disabled = false; trigger.textContent = origLabel; }
       toast(error.status === 409 ? '货品库已在别处更新，请刷新后再操作。' : error.message, 'error');
@@ -1296,6 +1302,7 @@ export const adminDataScript = `
   /* ================= 模块 5B：错题本 ================= */
 
   var mistakesView = { status: 'open', list: null };
+  var mistakesLoadSeq = 0;
   var mistakeStatusLabel = { open: '待修复', resolved: '已修复' };
   var mistakesFilters = [['open', '待修复'], ['resolved', '已修复'], ['all', '全部']];
   var mistakeCardHtml = function (mistake) {
@@ -1341,15 +1348,19 @@ export const adminDataScript = `
         '先到「账号与开通」生成一次性开通码，配送员开通后就能积累错题。', 'accounts', '去账号与开通');
       return Promise.resolve();
     }
+    var reqSeq = ++mistakesLoadSeq;
+    var expectedStatus = mistakesView.status;
     mistakesView.list = null;
     viewRoot().innerHTML = loading('正在读取错题本…');
-    return request(accountPath(account.id, '/mistakes?status=' + encodeURIComponent(mistakesView.status)))
+    return request(accountPath(account.id, '/mistakes?status=' + encodeURIComponent(expectedStatus)))
       .then(function (data) {
-        if (!isCurrent('mistakes', account.id)) return;
+        if (reqSeq !== mistakesLoadSeq || !isCurrent('mistakes', account.id) || mistakesView.status !== expectedStatus) return;
         mistakesView.list = data && Array.isArray(data.mistakes) ? data.mistakes : [];
         renderMistakesView();
       }, function (error) {
-        if (isCurrent('mistakes', account.id)) viewRoot().innerHTML = App.errorCard(error.message);
+        if (reqSeq === mistakesLoadSeq && isCurrent('mistakes', account.id) && mistakesView.status === expectedStatus) {
+          viewRoot().innerHTML = App.errorCard(error.message);
+        }
       });
   };
   views.mistakes = {
@@ -1361,9 +1372,11 @@ export const adminDataScript = `
   };
 
   var refreshMistakesInPlace = function (accountId) {
-    return request(accountPath(accountId, '/mistakes?status=' + encodeURIComponent(mistakesView.status)))
+    var reqSeq = ++mistakesLoadSeq;
+    var expectedStatus = mistakesView.status;
+    return request(accountPath(accountId, '/mistakes?status=' + encodeURIComponent(expectedStatus)))
       .then(function (data) {
-        if (!isCurrent('mistakes', accountId)) return;
+        if (reqSeq !== mistakesLoadSeq || !isCurrent('mistakes', accountId) || mistakesView.status !== expectedStatus) return;
         mistakesView.list = data && Array.isArray(data.mistakes) ? data.mistakes : [];
         var listBox = el('mistakesList');
         if (listBox) {
@@ -1471,7 +1484,7 @@ export const adminDataScript = `
   /* ================= 事件绑定 ================= */
 
   document.addEventListener('keydown', function (event) {
-    if (event.key !== 'Enter') return;
+    if (event.isComposing || event.keyCode === 229 || event.key !== 'Enter') return;
     var target = event.target;
     if (!target || !target.id) return;
     if (['catalog-query-text', 'catalog-query-product', 'catalog-query-brand', 'catalog-query-spec', 'catalog-query-unit'].indexOf(target.id) >= 0 && isCurrent('catalog')) {

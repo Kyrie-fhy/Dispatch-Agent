@@ -502,8 +502,9 @@ function createAdminHarness(options = {}) {
     navigator: {},
     URL: { createObjectURL: () => 'blob:admin', revokeObjectURL() {} },
     ...(options.FileReader ? { FileReader: options.FileReader } : {}),
+    ...(options.raf ? { requestAnimationFrame: options.raf } : {}),
     console,
-    setTimeout: (callback, delay) => (delay >= 1000 ? 0 : setTimeout(callback, 0)),
+    setTimeout: (callback, delay) => (delay >= 1000 ? 0 : (options.raf && delay === 155 ? 0 : setTimeout(callback, 0))),
     clearTimeout,
   };
   sandbox.window = sandbox;
@@ -1406,4 +1407,107 @@ test('UX & Motion: admin v2 ships dark theme, reduced-motion, no-flash partial u
   harness.fire(resetBtn, 'click');
   assert.equal(harness.document.querySelector('#catalog-search').value, '');
   assert.ok(harness.document.querySelector('#catalogRows').textContent.includes('鱼豆腐'));
+});
+
+test('UX & Motion guards: modal blocks Enter while closing or IME composing, and ignores stale catalog/mistake refreshes', async () => {
+  // 1. Modal closing (155ms .is-closing window) + IME composing guard
+  const baseHarness = createAdminHarness({
+    catalog: adminCatalogFixture(),
+    raf: cb => cb(),
+  });
+  await baseHarness.openSection('catalog');
+  await baseHarness.waitFor(() => baseHarness.document.querySelector('[data-catalog-edit="v-fish"]'), 'edit button');
+  baseHarness.fire(baseHarness.document.querySelector('[data-catalog-edit="v-fish"]'), 'click');
+  const unitInput = baseHarness.document.querySelector('#catUnit');
+  unitInput.value = '';
+  baseHarness.fire(unitInput, 'keydown', { key: 'Enter', isComposing: true });
+  await adminFlush();
+  assert.equal(baseHarness.calls.some(call => call.method === 'PATCH'), false, '输入法选词回车不得误提交');
+  const modalRoot = baseHarness.document.querySelector('#modalRoot');
+  baseHarness.App.closeModal();
+  assert.equal(modalRoot.classList.contains('is-closing'), true, '开启 rAF 时弹窗进入 155ms 退场态');
+  baseHarness.fire(unitInput, 'keydown', { key: 'Enter' });
+  await adminFlush();
+  assert.equal(baseHarness.calls.some(call => call.method === 'PATCH'), false, '退场 155ms 期间回车不得触发 PATCH');
+
+  // 2. Catalog toggle: stale refresh dropped + 503 refresh restores button
+  let releaseOldCatalog;
+  let catalogGetCount = 0;
+  let failNextCatalog = false;
+  const raceHarness = createAdminHarness({
+    catalog: adminCatalogFixture(),
+    handler(call) {
+      if (call.method === 'GET' && call.url === '/admin/api/accounts/A/catalog') {
+        catalogGetCount += 1;
+        if (failNextCatalog) {
+          failNextCatalog = false;
+          return adminJson(503, { error: 'service_unavailable', message: '暂时繁忙' });
+        }
+        if (catalogGetCount === 2) {
+          return new Promise(resolve => {
+            releaseOldCatalog = () => resolve(adminJson(200, { ...adminCatalogFixture(), catalogRevision: 8 }));
+          });
+        }
+        if (catalogGetCount === 3) {
+          return adminJson(200, { ...adminCatalogFixture(), catalogRevision: 9 });
+        }
+        return adminJson(200, adminCatalogFixture());
+      }
+      if (call.method === 'PATCH' && call.url.endsWith('/catalog/variants/v-fish')) {
+        return adminJson(200, { catalogRevision: 8, item: { ...adminCatalogFixture().items[0], status: 'discontinued' } });
+      }
+      return undefined;
+    },
+  });
+  await raceHarness.openSection('catalog');
+  await raceHarness.waitFor(() => raceHarness.document.querySelector('[data-catalog-toggle="v-fish"]'), 'toggle btn');
+  raceHarness.fire(raceHarness.document.querySelector('[data-catalog-toggle="v-fish"]'), 'click');
+  await raceHarness.waitFor(() => Boolean(releaseOldCatalog), 'delayed in-place catalog refresh');
+  // Newer full reload returns revision 9 before the delayed revision 8 finishes
+  raceHarness.App.renderCurrent();
+  await raceHarness.waitFor(() => raceHarness.document.querySelector('#catalogOverview')?.textContent.includes('当前版本 9'), 'revision 9');
+  releaseOldCatalog();
+  await adminFlush(25);
+  assert.ok(raceHarness.document.querySelector('#catalogOverview').textContent.includes('当前版本 9'), '过期局部刷新不得回退版本号');
+
+  // 503 on post-toggle refresh restores button cleanly
+  failNextCatalog = true;
+  const btn = raceHarness.document.querySelector('[data-catalog-toggle="v-fish"]');
+  raceHarness.fire(btn, 'click');
+  await raceHarness.waitFor(() => !btn.disabled && btn.textContent === '快速下架', 'button restored after refresh 503');
+
+  // 3. Mistakes filter race: delayed open refresh must not overwrite resolved tab
+  let releaseOpenRefresh;
+  let openGets = 0;
+  const mistakeHarness = createAdminHarness({
+    handler(call) {
+      if (call.method === 'GET' && call.url === '/admin/api/accounts/A/mistakes?status=open') {
+        openGets += 1;
+        if (openGets === 1) {
+          return adminJson(200, { mistakes: [{ turnId: 't1', category: '货品认错', status: 'open', expectedOutcome: '应为2箱', createdAt: '2026-10-01T10:00:00Z' }] });
+        }
+        return new Promise(resolve => {
+          releaseOpenRefresh = () => resolve(adminJson(200, { mistakes: [{ turnId: 't-stale', category: '旧待修复', status: 'open', expectedOutcome: '旧数据', createdAt: '2026-10-01T10:00:00Z' }] }));
+        });
+      }
+      if (call.method === 'GET' && call.url === '/admin/api/accounts/A/mistakes?status=resolved') {
+        return adminJson(200, { mistakes: [{ turnId: 't-done', category: '已修复条目', status: 'resolved', expectedOutcome: '已完成', createdAt: '2026-10-01T10:00:00Z' }] });
+      }
+      if (call.method === 'PATCH' && call.url.endsWith('/mistakes/t1')) {
+        return adminJson(200, { ok: true });
+      }
+      return undefined;
+    },
+  });
+  await mistakeHarness.openSection('mistakes');
+  await mistakeHarness.waitFor(() => mistakeHarness.document.querySelector('[data-mistake-status="t1"]'), 'mistake status btn');
+  mistakeHarness.fire(mistakeHarness.document.querySelector('[data-mistake-status="t1"]'), 'click');
+  await mistakeHarness.waitFor(() => Boolean(releaseOpenRefresh), 'delayed open mistakes refresh');
+  mistakeHarness.fire(mistakeHarness.document.querySelector('[data-mistake-filter="resolved"]'), 'click');
+  await mistakeHarness.waitFor(() => mistakeHarness.document.querySelector('#mistakesList')?.textContent.includes('已修复条目'), 'resolved list');
+  releaseOpenRefresh();
+  await adminFlush(25);
+  const listText = mistakeHarness.document.querySelector('#mistakesList').textContent;
+  assert.ok(listText.includes('已修复条目'), '已修复列表应保持');
+  assert.equal(listText.includes('旧待修复'), false, '过期的待修复局部刷新不得覆盖已修复列表');
 });

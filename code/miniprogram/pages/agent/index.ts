@@ -975,8 +975,10 @@ Page({
 
   editSheetCustomerName(event: WechatMiniprogram.Input) {
     if (!this.data.customerSheet) return;
-    const updated = { ...this.data.customerSheet, value: event.detail.value };
-    this.setData({ customerSheet: updated, customerSheetRender: updated });
+    const value = event.detail.value;
+    const updated = { ...this.data.customerSheet, value };
+    this.setData({ customerSheet: updated, customerSheetRender: updated,
+      inlineCustomerDrafts: { ...this.data.inlineCustomerDrafts, [updated.id]: value } });
   },
 
   saveInlineCustomerName(event: WechatMiniprogram.TouchEvent): Promise<void> | undefined {
@@ -992,7 +994,12 @@ Page({
   saveCustomerSheet(): Promise<void> | undefined {
     const sheet = this.data.customerSheet;
     if (!sheet) return;
-    return this.saveCustomerName(sheet.id, sheet.value, () => this.closeCustomerSheet());
+    return this.saveCustomerName(sheet.id, sheet.value, () => {
+      const rest = { ...this.data.inlineCustomerDrafts };
+      delete rest[sheet.id];
+      this.setData({ inlineCustomerDrafts: rest });
+      this.closeCustomerSheet();
+    });
   },
 
   pickQuickCustomer(event: WechatMiniprogram.TouchEvent): Promise<void> | undefined {
@@ -1443,7 +1450,8 @@ Page({
     if (!turn || this.data.busy || this.data.polling) return;
     const apply = () => {
       this.card('retry');
-      this.setData({ text: turn.text, inputMode: 'text', focusInput: true,
+      this.voiceMeta = null;
+      this.setData({ text: turn.text, inputMode: 'text', focusInput: true, voiceCorrectionHint: '',
         attachments: turn.materialIds.map((id, index) => ({ id, name: `图片 ${index + 1}` })) });
     };
     if (this.data.text.trim() || this.data.attachments.length) {

@@ -161,7 +161,7 @@ async function findAlias(client: PoolClient, accountId: string, normalizedAlias:
   return existing;
 }
 
-async function writeAlias(client: PoolClient, accountId: string, input: AliasWrite,
+export async function writeAlias(client: PoolClient, accountId: string, input: AliasWrite,
   customers: readonly { id: string; name: string }[]): Promise<CustomerAlias> {
   const { alias, normalizedAlias, customerId, allowRebind, allowCanonicalConflict } = input;
   // Conflict detection stays entirely in JS and runs before any INSERT/UPDATE so callers can

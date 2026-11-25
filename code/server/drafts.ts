@@ -3,10 +3,11 @@ import { Pool } from 'pg';
 import { matchCatalogItem, resolveCatalogAutoPrice } from '../miniprogram/core/catalog';
 import { nullablePrice } from '../miniprogram/core/orders';
 import { emptyTrip, TripDraft } from '../miniprogram/core/trips';
+import { ActivationCodes } from './activation';
 import { loadCatalog } from './catalog';
 import { setAccount, transaction } from './database';
 import { itemIdentityChanged, reconcileManualItem, SaveDraftInput } from './draft-input';
-import { missingDraft, readAccount, readParties, readWorkspace, workspaceDraft, writeAccount } from './account-workspace';
+import { businessSession, disabledAccount, lockAccountActivity, missingDraft, readAccount, readParties, readWorkspace, workspaceDraft, writeAccount } from './account-workspace';
 import { HttpError } from './http-error';
 import { readHistoricalSales } from './memory';
 
@@ -18,7 +19,8 @@ function digest(value: string): Buffer {
 }
 
 export class DraftStore {
-  constructor(private readonly pool: Pool) {}
+  constructor(private readonly pool: Pool, private readonly requireActivation = false,
+    private readonly activationCodes = new ActivationCodes()) {}
 
   async developmentSession(subject: string) {
     if (!developmentAccounts.has(subject)) {
@@ -27,37 +29,85 @@ export class DraftStore {
     return this.startSession('development', subject);
   }
 
-  async wechatSession(appId: string, openId: string) {
-    return this.startSession('wechat', `${appId}:${openId}`);
+  async wechatSession(appId: string, openId: string, activationCode?: string) {
+    return this.startSession('wechat', `${appId}:${openId}`, activationCode);
   }
 
-  private async startSession(provider: 'development' | 'wechat', subject: string) {
+  private async startSession(provider: 'development' | 'wechat', subject: string, activationCode?: string) {
     const token = randomBytes(32).toString('base64url');
     const expiresAt = new Date(Date.now() + sessionLifetimeSeconds * 1000);
-    await transaction(this.pool, async client => {
-      await client.query(`INSERT INTO dispatch.accounts (id, identity_provider, identity_subject)
-        VALUES ($1, $2, $3) ON CONFLICT (identity_provider, identity_subject) DO NOTHING`, [randomUUID(), provider, subject]);
-      const { rows: [account] } = await client.query<{ id: string }>(
-        'SELECT id FROM dispatch.accounts WHERE identity_provider = $1 AND identity_subject = $2', [provider, subject]);
-      await setAccount(client, account.id);
+    const remarkName = await transaction(this.pool, async client => {
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`dispatch.${provider}-subject:${subject}`]);
+      const findAccount = async () => (await client.query<{
+        id: string; activated_at: Date | null; disabled_at: Date | null; session_epoch: number; remark_name: string;
+      }>(`SELECT id, activated_at, disabled_at, session_epoch, remark_name FROM dispatch.accounts
+        WHERE identity_provider = $1 AND identity_subject = $2`, [provider, subject])).rows[0];
+      let account = await findAccount();
+      const accountId = account?.id ?? randomUUID();
+      await lockAccountActivity(client, accountId);
+      // Read the state again after the activity lock so a concurrent disable can never issue a session.
+      if (account) account = await findAccount();
+      if (account?.disabled_at) throw disabledAccount();
+      let remark = account?.remark_name ?? '';
+      if (!account?.activated_at) {
+        const gated = provider === 'wechat' && this.requireActivation;
+        if (gated && !activationCode?.trim()) {
+          throw new HttpError(403, 'activation_required', '请输入管理员提供的开通码完成开通');
+        }
+        const redemption = gated ? await this.activationCodes.unusedForRedemption(client, subject, activationCode!) : null;
+        remark = redemption?.remark_name ?? remark;
+        if (account) {
+          await client.query('UPDATE dispatch.accounts SET activated_at = clock_timestamp(), remark_name = $2 WHERE id = $1',
+            [accountId, remark]);
+        } else {
+          await client.query(`INSERT INTO dispatch.accounts (id, identity_provider, identity_subject, remark_name, activated_at)
+            VALUES ($1, $2, $3, $4, clock_timestamp())`, [accountId, provider, subject, remark]);
+        }
+        if (redemption) {
+          await client.query(`UPDATE dispatch.activation_codes SET redeemed_at = clock_timestamp(), redeemed_account_id = $2
+            WHERE id = $1`, [redemption.id, accountId]);
+        }
+      }
+      await setAccount(client, accountId);
       const draft = emptyTrip(randomUUID);
       await client.query(`INSERT INTO dispatch.workspaces (account_id, draft_id, draft_customers)
         VALUES ($1, $2, $3) ON CONFLICT (account_id) DO NOTHING`,
-      [account.id, draft.id, JSON.stringify(workspaceDraft({ ...draft, currentTripId: null }).customers)]);
-      await client.query('DELETE FROM dispatch.sessions WHERE account_id = $1 AND expires_at <= now()', [account.id]);
-      await client.query('INSERT INTO dispatch.sessions (token_digest, account_id, expires_at) VALUES ($1, $2, $3)',
-        [digest(token), account.id, expiresAt]);
+      [accountId, draft.id, JSON.stringify(workspaceDraft({ ...draft, currentTripId: null }).customers)]);
+      await client.query('DELETE FROM dispatch.sessions WHERE account_id = $1 AND expires_at <= now()', [accountId]);
+      await client.query(`INSERT INTO dispatch.sessions (token_digest, account_id, expires_at, session_epoch)
+        VALUES ($1, $2, $3, $4)`, [digest(token), accountId, expiresAt, account?.session_epoch ?? 0]);
+      return remark;
     });
-    return { token, expiresAt: expiresAt.toISOString() };
+    const session = { token, expiresAt: expiresAt.toISOString() };
+    return provider === 'wechat' ? { ...session, remarkName } : session;
   }
 
   async accountFor(token: string, appId?: string): Promise<string> {
-    const { rows: [session] } = await this.pool.query<{ account_id: string }>(`
-      SELECT s.account_id FROM dispatch.sessions s JOIN dispatch.accounts a ON a.id = s.account_id
+    const { rows: [session] } = await this.pool.query<{
+      account_id: string; session_epoch: number; disabled_at: Date | null; active_due: boolean;
+    }>(`
+      SELECT s.account_id, s.session_epoch, a.disabled_at,
+        (a.last_active_at IS NULL OR a.last_active_at < now() - interval '60 seconds') AS active_due
+      FROM dispatch.sessions s JOIN dispatch.accounts a ON a.id = s.account_id
       WHERE s.token_digest = $1 AND s.expires_at > now() AND a.identity_provider = $2
         AND ($3::text IS NULL OR starts_with(a.identity_subject, $3))
+        AND (s.session_epoch = a.session_epoch OR a.disabled_at IS NOT NULL)
     `, [digest(token), appId ? 'wechat' : 'development', appId ? `${appId}:` : null]);
     if (!session) throw new HttpError(401, 'session_required', '请重新登录');
+    if (session.disabled_at) throw disabledAccount();
+    const scope = businessSession.getStore();
+    if (scope) Object.assign(scope, { accountId: session.account_id, epoch: session.session_epoch });
+    if (session.active_due) {
+      void this.pool.query(`
+        WITH due AS (
+          SELECT id FROM dispatch.accounts WHERE id = $1 AND session_epoch = $2 AND disabled_at IS NULL
+            AND (last_active_at IS NULL OR last_active_at < now() - interval '60 seconds') FOR UPDATE SKIP LOCKED
+        )
+        UPDATE dispatch.accounts a SET last_active_at = now() FROM due WHERE a.id = due.id
+      `, [session.account_id, session.session_epoch]).catch(() => {
+        console.error('无法更新配送员最近活跃时间');
+      });
+    }
     return session.account_id;
   }
 

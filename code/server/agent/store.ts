@@ -5,7 +5,7 @@ import type { AgentEvent, AgentStatus, AgentTurn, DeliveryCardState, DeliveryPro
 import { isObject } from '../../miniprogram/core/orders';
 import { textOrderLimit } from '../../miniprogram/core/text-order';
 import { latest, type TripDraft } from '../../miniprogram/core/trips';
-import { missingDraft, readAccount, readWorkspace, Workspace, workspaceDraft, writeAccount } from '../account-workspace';
+import { lockAccountActivity, requireActiveAccount, missingDraft, readAccount, readWorkspace, Workspace, workspaceDraft, writeAccount } from '../account-workspace';
 import { setAccount, transaction } from '../database';
 import { HttpError } from '../http-error';
 import { readId, readPreviewInput, validRevision } from '../request-input';
@@ -149,6 +149,21 @@ async function endTurn(client: PoolClient, key: TurnKey, status: Exclude<AgentSt
   await event(client, key, 'end', { status, text: message, revision: turn.endRevision, errorCode, elapsedMs: timing.elapsedMs });
 }
 
+export async function interruptAccountTurns(client: PoolClient, account: string, reason: string,
+  message = `${reason}，上一轮已中断。`) {
+  const { rows: running } = await client.query<{ id: string; draft_id: string }>(
+    "SELECT id, draft_id FROM dispatch.agent_turns WHERE account_id = $1 AND status = 'running'", [account]);
+  for (const turn of running) {
+    const key = { account, draftId: turn.draft_id, id: turn.id };
+    const { rows: [step] } = await client.query<{ id: string; state: string }>(`
+      SELECT payload->>'id' AS id, payload->>'state' AS state FROM dispatch.agent_events
+      WHERE account_id = $1 AND turn_id = $2 AND kind = 'step' ORDER BY seq DESC LIMIT 1`, [account, turn.id]);
+    if (step?.state === 'running') await event(client, key, 'step',
+      { id: step.id, state: 'failed', result: `${reason}，处理已中断。` });
+    await endTurn(client, key, 'interrupted', message);
+  }
+}
+
 async function previousQuestions(client: PoolClient, account: string, draftId: string, revision: number, exclude?: string, delivery = false) {
   const { rows: [previous] } = await client.query<PreviousQuestions & { payload: PreviousQuestions['payload'] & { context?: string } }>(`
     SELECT t.id AS "turnId", m.content AS text, e.payload, confirmation.payload AS confirmation
@@ -262,6 +277,7 @@ export class AgentStore {
   append(key: TurnKey, kind: string, payload: object) {
     return transaction(this.pool, async client => {
       await setAccount(client, key.account);
+      await requireActiveAccount(client, key.account);
       const turn = await getTurn(client, key.account, key.id, true);
       if (turn.status === 'running') await event(client, key, kind, payload);
     });
@@ -270,6 +286,7 @@ export class AgentStore {
   finish(key: TurnKey, status: Exclude<AgentStatus, 'running'>, text: string, errorCode?: string) {
     return transaction(this.pool, async client => {
       await setAccount(client, key.account);
+      await requireActiveAccount(client, key.account);
       await endTurn(client, key, status, text, errorCode);
     });
   }
@@ -279,17 +296,8 @@ export class AgentStore {
     for (const { id: account } of rows) {
       await transaction(this.pool, async client => {
         await setAccount(client, account);
-        const { rows: running } = await client.query<{ id: string; draft_id: string }>(
-          "SELECT id, draft_id FROM dispatch.agent_turns WHERE account_id = $1 AND status = 'running'", [account]);
-        for (const turn of running) {
-          const key = { account, draftId: turn.draft_id, id: turn.id };
-          const { rows: [step] } = await client.query<{ id: string; state: string }>(`
-            SELECT payload->>'id' AS id, payload->>'state' AS state FROM dispatch.agent_events
-            WHERE account_id = $1 AND turn_id = $2 AND kind = 'step' ORDER BY seq DESC LIMIT 1`, [account, turn.id]);
-          if (step?.state === 'running') await event(client, key, 'step',
-            { id: step.id, state: 'failed', result: '服务重启，处理已中断。' });
-          await endTurn(client, key, 'interrupted', '服务重启，上一轮已中断，可以重试。');
-        }
+        await lockAccountActivity(client, account);
+        await interruptAccountTurns(client, account, '服务重启', '服务重启，上一轮已中断，可以重试。');
       });
     }
   }

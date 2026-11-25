@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 import { Pool, PoolClient } from 'pg';
 import { nullablePrice } from '../miniprogram/core/orders';
@@ -7,6 +8,29 @@ import { setAccount, transaction } from './database';
 import { HttpError } from './http-error';
 
 export type Workspace = TripDraft & { currentTripId: string | null };
+
+// Carries the authenticated generation into writes and their deferred Agent continuations.
+export const businessSession = new AsyncLocalStorage<{ accountId?: string; epoch?: number }>();
+
+export function disabledAccount() {
+  return new HttpError(403, 'account_disabled', '当前账号已暂停使用，请联系管理员');
+}
+
+export async function lockAccountActivity(client: PoolClient, accountId: string, exclusive = false) {
+  const lock = exclusive ? 'pg_advisory_xact_lock' : 'pg_advisory_xact_lock_shared';
+  await client.query(`SELECT ${lock}(hashtextextended($1, 0))`, ['dispatch.account-active:' + accountId]);
+}
+
+export async function requireActiveAccount(client: PoolClient, accountId: string) {
+  await lockAccountActivity(client, accountId);
+  const { rows: [account] } = await client.query<{ disabled_at: Date | null; session_epoch: number }>(
+    'SELECT disabled_at, session_epoch FROM dispatch.accounts WHERE id = $1', [accountId]);
+  if (account?.disabled_at) throw disabledAccount();
+  const session = businessSession.getStore();
+  if (session?.accountId === accountId && session.epoch !== account?.session_epoch) {
+    throw new HttpError(401, 'session_required', '请重新登录');
+  }
+}
 
 export function missingDraft(): HttpError {
   return new HttpError(404, 'draft_not_found', '未找到草稿');
@@ -62,6 +86,7 @@ export function writeAccount<T>(
 ): Promise<T> {
   return transaction(pool, async client => {
     await setAccount(client, accountId);
+    await requireActiveAccount(client, accountId);
     const workspace = await readWorkspace(client, accountId, true);
     const { inputDigest, previous } = await readAccountResult<T>(client, accountId, requestId, input);
     if (previous) return previous.result;

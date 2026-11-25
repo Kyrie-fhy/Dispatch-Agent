@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const {
-  catalogCsvColumns, extractCatalogAliases, hasQuotedLinePrice, matchCatalogChoice, matchCatalogItem, parseCatalogCsv,
+  catalogCsvColumns, exportCatalogCsv, extractCatalogAliases, hasQuotedLinePrice, matchCatalogChoice, matchCatalogItem, parseCatalogCsv,
   parseSpecTokens, quotedLinePrices, resolveCatalogAutoPrice,
 } = require('../code/dist/core/catalog');
 const { lookupDeliveredPrice, lookupHistoricalPrice, collectHistoricalSales } = require('../code/dist/core/memory');
@@ -40,6 +40,31 @@ test('catalog CSV validates shape, decimal cents, status, duplicate variants, an
   assert.throws(() => parseCatalogCsv(csv([record()]).replace('详情核实状态', '核实')), /表头/);
   assert.throws(() => parseCatalogCsv(csv([record()]).replace(/,""$/, '')), /13 列/);
   assert.throws(() => parseCatalogCsv(csv([record()]).slice(0, -1)), /引号未闭合/);
+});
+
+test('catalog CSV reimports 13 columns, Excel escapes, remarks, and explicit aliases losslessly', () => {
+  const [sample] = parseCatalogCsv(csv([record()]));
+  const original = {
+    ...sample, originalName: "'原名", product: '=鱼肉丸', category: '\t冷冻', brand: '＠禾味',
+    flavorOrGrade: '单规格', specification: '手工规格', unit: null, aliases: ['另一种叫法'],
+    brandAliases: ['禾牌'], verificationStatus: '已核实',
+    remarks: '[Dispatch Catalog v1] 人工原备注\n含逗号,和"引号"',
+  };
+  const exported = exportCatalogCsv([original]);
+  assert.equal(exported.charCodeAt(0), 0xfeff);
+  assert.deepEqual(parseCatalogCsv(exportCatalogCsv([])), []);
+  assert.match(exported, /"'=鱼肉丸"/);
+  assert.match(exported, /"''原名"/);
+  assert.deepEqual(parseCatalogCsv(exported), [original]);
+  const [edited] = parseCatalogCsv(exported.replace(/"120g","单规格"/, '"250g","鱼味"'));
+  assert.equal(edited.specification, '250g·鱼味');
+  assert.equal(edited.flavorOrGrade, '鱼味');
+  assert.deepEqual(edited.aliases, original.aliases);
+  for (const value of ['=1+2', '+启动', '-命令', '@计算', '\t文本', '\r文本', '  ＝表达式']) {
+    assert.throws(() => parseCatalogCsv(csv([record({ product: value })])), /电子表格公式/);
+  }
+  assert.throws(() => parseCatalogCsv(csv([record({ brand: '\uD800' })])), /UTF-8/);
+  assert.throws(() => parseCatalogCsv(csv([record(), record({ variant: '2' })]), 1), /最多支持 1 条/);
 });
 
 test('catalog aliases use packaging and correction cues without treating negative remarks as aliases', () => {

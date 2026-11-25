@@ -145,7 +145,7 @@
 .metric-note {
   margin-top: auto;
   padding-top: 10rpx;
-  font-size: 24rpx;
+  font-size: 26rpx;
   line-height: 1.45;
   color: var(--ink-3);
   overflow-wrap: anywhere;
@@ -153,6 +153,7 @@
 
 /* ---- 全宽重试条 ---- */
 .retry-banner {
+  box-sizing: border-box;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -164,6 +165,7 @@
   border-radius: var(--radius-md);
 }
 .error-row {
+  box-sizing: border-box;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -184,6 +186,7 @@
   height: 80rpx;
   margin: 0;
   padding: 0 20rpx;
+  background: var(--surface);
 }
 
 /* ---- 记住的叫法 ---- */

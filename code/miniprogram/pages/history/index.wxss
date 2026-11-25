@@ -115,14 +115,15 @@
 }
 .trip-hero-body {
   display: flex;
+  flex-wrap: wrap;
   align-items: flex-end;
   justify-content: space-between;
-  gap: 20rpx;
+  gap: 12rpx 20rpx;
   margin-top: 22rpx;
 }
 .trip-hero-left { min-width: 0; }
 .trip-hero-count {
-  font-size: 40rpx;
+  font-size: 36rpx;
   font-weight: 700;
   line-height: 1.25;
   color: var(--ink);
@@ -488,6 +489,11 @@
   display: flex;
   flex-direction: column;
   gap: 4rpx;
+}
+.turn-section + .turn-section,
+.turn-section + .turn-reply {
+  padding-top: 12rpx;
+  border-top: 1rpx solid var(--hairline);
 }
 .turn-label {
   font-size: 28rpx;

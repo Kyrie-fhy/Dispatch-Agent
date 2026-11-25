@@ -1,21 +1,35 @@
-<view class="container">
-  <view class="title">历史趟次</view>
+<view class="history-page">
   <view wx:if="{{error}}" class="error">{{error}}</view>
 
   <view wx:if="{{!signedIn}}" class="card">
-    <view class="section-title">往期档案</view>
-    <view class="hint">微信登录后回看往期趟次的送货单、取货单与对话记录。</view>
+    <view class="empty-title">微信登录后回看趟次</view>
+    <view class="hint">登录后可回看往期趟次的送货单、取货单与对话记录。</view>
     <button class="btn-primary" bindtap="goAssistant">去助手登录</button>
   </view>
 
   <block wx:elif="{{formal}}">
-    <button class="btn-ghost history-back-btn" bindtap="backToList" disabled="{{busy}}">‹ 返回趟次列表</button>
-    <view class="card trip-banner">
-      <view class="trip-banner-time">{{selectedTime}}</view>
-      <view class="trip-banner-meta">
-        <text class="num">{{formal.deliveredCount}}/{{formal.customers.length}} 家已送达</text>
-        <text class="num">{{formal.totalLabel}}</text>
+    <view class="back-bar">
+      <button class="back-pill" bindtap="backToList" disabled="{{busy}}">‹ 全部趟次</button>
+    </view>
+
+    <view class="trip-hero-card">
+      <view class="trip-hero-top">
+        <view class="trip-hero-time num">{{selectedTime}}</view>
+        <view class="readonly-tag">只读档案</view>
       </view>
+      <view class="trip-hero-body">
+        <view class="trip-hero-left">
+          <view class="trip-hero-count num">{{formal.deliveredCount}} / {{formal.deliveryRows.length}} 家已送达</view>
+        </view>
+        <view class="trip-hero-right">
+          <view class="trip-hero-amount-label">{{formal.deliveryTotalTitle}}</view>
+          <view class="trip-hero-amount num {{formal.deliveryAllPending ? 'text-warning' : 'text-primary'}}">{{formal.deliveryTotalAmount}}</view>
+        </view>
+      </view>
+      <view class="trip-progress-track">
+        <view class="trip-progress-fill" style="width: {{formal.deliveryProgressPercent}}%;"></view>
+      </view>
+      <view wx:if="{{formal.deliveryPendingCount > 0 && !formal.deliveryAllPending}}" class="trip-pending-note">另有 {{formal.deliveryPendingCount}} 样待补单价</view>
     </view>
 
     <view class="history-tabs">
@@ -26,37 +40,51 @@
 
     <block wx:if="{{historyTab === 'delivery'}}">
       <block wx:if="{{selectedShop}}">
-        <button class="btn-secondary shop-back-btn" bindtap="closeHistoryShop">‹ 返回本趟门店列表</button>
-        <view class="card">
-          <view class="shop-title-row">
-            <text class="shop-name">{{selectedShop.customer}}</text>
-            <text class="status-tag {{selectedShop.completed ? 'status-done' : 'status-pending'}}">{{selectedShop.completed ? '已确认送达' : '未确认送达'}}</text>
+        <view class="back-bar">
+          <button class="back-pill" bindtap="closeHistoryShop" disabled="{{busy}}">‹ 全部门店</button>
+        </view>
+        <view class="sheet-hero-card">
+          <view class="sheet-hero-top">
+            <view class="sheet-shop-name">{{selectedShop.customer}}</view>
+            <view class="status-pill {{selectedShop.completed ? 'status-done' : 'status-pending'}}">{{selectedShop.completed ? '已确认送达' : '未确认送达'}}</view>
           </view>
-          <view class="amount num">{{selectedShop.totalLabel}}</view>
-          <view wx:for="{{selectedShop.lines}}" wx:for-item="line" wx:key="id" class="line">
-            <view class="product">{{line.productLabel}}</view>
-            <view class="num">原订 {{line.originalQuantity}} {{line.unit}} · 实收 {{line.quantity}} {{line.unit}}</view>
-            <view class="num {{line.priceLabel === '待补价' || line.amountLabel === '待补价' ? 'pending-price' : ''}}">单价 {{line.priceLabel}} · 小计 {{line.amountLabel}}</view>
-            <view class="hint">配送状态 · {{formal.statuses[line.id] || '未记录'}}</view>
+          <view class="sheet-due-label">{{selectedShop.amountTitle}}</view>
+          <view class="sheet-due-amount num {{selectedShop.pendingPriceOnly ? 'text-warning' : ''}}">{{selectedShop.dueLabel}}</view>
+          <view wx:if="{{selectedShop.pendingPrices > 0}}" class="sheet-pending-tip">本单有 {{selectedShop.pendingPrices}} 样未补单价（只读档案）</view>
+        </view>
+        <view class="sheet-lines-card">
+          <view wx:for="{{selectedShop.lines}}" wx:for-item="line" wx:key="id" class="sheet-line">
+            <view class="sheet-line-head">
+              <view class="sheet-line-main">
+                <view class="sheet-line-name">{{line.productLabel}}</view>
+                <view class="sheet-line-meta num">原订 {{line.originalQuantity}}{{line.unit}} · <text class="{{line.quantity !== line.originalQuantity ? 'qty-changed' : 'qty-same'}}">实收 {{line.quantity}}{{line.unit}}</text> · 单价 <text class="{{line.priceLabel === '待补价' ? 'text-warning' : ''}}">{{line.priceLabel}}</text></view>
+              </view>
+              <view class="sheet-line-right">
+                <view class="sheet-line-subtotal num {{line.amountLabel === '待补价' ? 'text-warning' : ''}}">{{line.amountLabel}}</view>
+                <view class="sheet-line-status">{{formal.statuses[line.id] || '未记录'}}</view>
+              </view>
+            </view>
           </view>
         </view>
       </block>
       <block wx:else>
         <view wx:if="{{!formal.deliveryRows.length}}" class="card">
-          <view class="hint">这一趟没有门店货品。</view>
+          <view class="empty-title">这一趟没有门店货品</view>
+          <view class="hint">本趟正式单里没有可回看的门店明细。</view>
         </view>
-        <view wx:for="{{formal.deliveryRows}}" wx:key="id" class="card shop-row" bindtap="openHistoryShop" data-sheet-id="{{item.id}}">
+        <view wx:for="{{formal.deliveryRows}}" wx:key="id"
+          class="shop-card {{item.completed ? 'shop-card-done' : ''}}"
+          bindtap="openHistoryShop" data-sheet-id="{{item.id}}">
           <view class="shop-main">
             <view class="shop-title-row">
-              <text class="shop-name">{{item.customer}}</text>
-              <text class="status-tag {{item.completed ? 'status-done' : 'status-pending'}}">{{item.completed ? '已送达' : '未送达'}}</text>
-              <text wx:if="{{item.pendingPrices}}" class="status-tag status-unpriced num">{{item.pendingPrices}} 项待补价</text>
+              <view class="shop-name">{{item.customer}}</view>
+              <view class="status-pill {{item.completed ? 'status-done' : 'status-pending'}}">{{item.completed ? '已送达' : '未送达'}}</view>
             </view>
-            <view class="shop-meta num">共 {{item.lineCount}} 项货品</view>
+            <view class="shop-meta num">共 {{item.lineCount}} 样货<text wx:if="{{item.pendingPrices}}" class="shop-pending"> · {{item.pendingPrices}} 样待补价</text></view>
           </view>
           <view class="shop-right">
-            <view class="shop-amount-label">{{item.amountTitle}}</view>
-            <view class="shop-amount num {{item.pendingPriceOnly ? 'pending-price' : ''}}">{{item.dueLabel}}</view>
+            <view class="shop-amount num {{item.pendingPriceOnly ? 'text-warning' : ''}}">{{item.dueLabel}}</view>
+            <view class="shop-hint">{{item.amountTitle}}</view>
           </view>
           <view class="shop-arrow">›</view>
         </view>
@@ -64,11 +92,39 @@
     </block>
 
     <block wx:elif="{{historyTab === 'picking'}}">
-      <include src="../workspace/picking.wxml" />
+      <view class="picking-top">
+        <view class="picking-top-main">
+          <view class="picking-title">冷库取货单</view>
+          <view class="picking-sub">按本趟确认出单快照汇总，箱袋分开</view>
+        </view>
+        <view class="picking-count-pill num">{{formal.pickingKindCount}} 种 · {{formal.pickingTotalQty}} 件</view>
+      </view>
+      <view wx:if="{{formal.version > 1}}" class="card">
+        <view class="section-title">第 {{formal.version}} 版取货变化</view>
+        <view wx:if="{{!formal.changes.length}}" class="hint">本次取货数量无变化</view>
+        <view wx:for="{{formal.changes}}" wx:key="id" class="line">
+          <view>{{item.brand ? item.brand + ' ' : ''}}{{item.product}}{{item.specification ? ' · ' + item.specification : ''}}</view>
+          <view class="num">{{item.before}} → {{item.after}} {{item.unit}}</view>
+        </view>
+      </view>
+      <view class="picking-card">
+        <view wx:for="{{formal.pickingRows}}" wx:key="id" class="picking-row">
+          <view class="picking-info">
+            <view class="picking-name">{{item.title}}</view>
+            <view wx:if="{{item.specMeta}}" class="picking-spec">{{item.specMeta}}</view>
+          </view>
+          <view class="picking-qty-badge {{item.isBox ? 'picking-qty-box' : 'picking-qty-other'}}">
+            <text class="picking-qty-num num">{{item.quantity}}</text>
+            <text class="picking-qty-unit">{{item.unit}}</text>
+          </view>
+        </view>
+      </view>
     </block>
 
     <block wx:else>
-      <view wx:if="{{turnsLoading || (busy && turnsLoadedId !== formal.id)}}" class="hint">正在读取当趟对话记录…</view>
+      <view wx:if="{{turnsLoading || (busy && turnsLoadedId !== formal.id)}}" class="card">
+        <view class="hint">正在读取当趟对话记录…</view>
+      </view>
       <view wx:elif="{{!tripTurns.length}}" class="card">
         <view class="hint">这一趟没有对话记录（通过手动表单出单）。</view>
       </view>
@@ -79,30 +135,26 @@
               <text wx:if="{{item.text}}" class="user-text">{{item.text}}</text>
               <text wx:if="{{item.pictures}}" class="user-pictures num">{{item.pictures}} 张图片</text>
             </view>
-            <view class="avatar mine">我</view>
           </view>
-          <view class="assistant-row">
-            <view class="avatar helper">助</view>
-            <view class="assistant-card">
-              <view wx:if="{{item.changes.length}}" class="turn-section">
-                <text class="turn-label">{{item.undone ? '这一步已撤销' : '草稿改动'}}</text>
-                <text wx:for="{{item.changes}}" wx:for-item="change" wx:key="*this" class="turn-line num">{{change}}</text>
-              </view>
-              <view wx:if="{{item.deliverySummary}}" class="turn-section">
-                <text class="turn-label">送货核对 · {{item.deliverySummary.customer}}</text>
-                <text wx:for="{{item.deliverySummary.edits}}" wx:for-item="edit" wx:key="lineId" class="turn-line num">{{edit.name}} 原订 {{edit.originalQuantity}} · 实收 {{edit.receivedQuantity}} · 单价 {{edit.price || '待补价'}}</text>
-                <text class="turn-line num">{{item.deliverySummary.totalLabel}} · {{item.deliverySummary.outcome}}</text>
-              </view>
-              <view wx:if="{{item.previewLabel}}" class="turn-section">
-                <text class="turn-label">{{item.previewLabel}}</text>
-              </view>
-              <view wx:if="{{item.questions.length}}" class="turn-section">
-                <text class="turn-label">当时的待确认</text>
-                <text wx:for="{{item.questions}}" wx:for-item="question" wx:key="*this" class="turn-line">{{question}}</text>
-              </view>
-              <text wx:if="{{item.reply}}" class="turn-reply">{{item.reply}}</text>
-              <text wx:if="{{!item.changes.length && !item.deliverySummary && !item.previewLabel && !item.questions.length && !item.reply}}" class="turn-reply">这一轮已记录。</text>
+          <view class="turn-card">
+            <view wx:if="{{item.changes.length}}" class="turn-section">
+              <text class="turn-label {{item.undone ? 'turn-label-muted' : ''}}">{{item.undone ? '这一步已撤销' : '本轮改动'}}</text>
+              <text wx:for="{{item.changes}}" wx:for-item="change" wx:key="*this" class="turn-line num">{{change}}</text>
             </view>
+            <view wx:if="{{item.deliverySummary}}" class="turn-section">
+              <text class="turn-label">送货核对 · {{item.deliverySummary.customer}}</text>
+              <text wx:for="{{item.deliverySummary.edits}}" wx:for-item="edit" wx:key="lineId" class="turn-line num">{{edit.name}} 原订 {{edit.originalQuantity}} · 实收 {{edit.receivedQuantity}} · 单价 {{edit.price || '待补价'}}</text>
+              <text class="turn-line num">{{item.deliverySummary.totalLabel}} · {{item.deliverySummary.outcome}}</text>
+            </view>
+            <view wx:if="{{item.previewLabel}}" class="turn-section">
+              <text class="turn-preview-pill">{{item.previewLabel}}</text>
+            </view>
+            <view wx:if="{{item.questions.length}}" class="turn-questions">
+              <text class="turn-label">当时的待确认</text>
+              <text wx:for="{{item.questions}}" wx:for-item="question" wx:key="*this" class="turn-line">{{question}}</text>
+            </view>
+            <text wx:if="{{item.reply}}" class="turn-reply">{{item.reply}}</text>
+            <text wx:if="{{!item.changes.length && !item.deliverySummary && !item.previewLabel && !item.questions.length && !item.reply}}" class="turn-reply">这一轮已记录。</text>
           </view>
         </view>
       </view>
@@ -111,17 +163,24 @@
 
   <block wx:else>
     <view wx:if="{{!trips.length}}" class="card">
-      <view class="hint">{{busy ? '正在读取趟次…' : '还没有正式送货单。'}}</view>
+      <view class="empty-title">{{busy ? '正在读取趟次' : '还没有正式送货单'}}</view>
+      <view class="hint">{{busy ? '稍等一下，马上就好。' : '确认出单后，往期趟次会保存在这里，随时回看。'}}</view>
+      <button wx:if="{{!busy}}" class="btn-primary" bindtap="goAssistant">去助手录单</button>
     </view>
-    <view wx:for="{{trips}}" wx:key="id" class="card history-item" bindtap="openTrip" data-id="{{item.id}}">
-      <view class="history-item-head">
-        <text class="section-title">{{item.time}}</text>
-        <text wx:if="{{item.current}}" class="history-current">进行中</text>
+    <view wx:for="{{trips}}" wx:key="id" class="trip-card" bindtap="openTrip" data-id="{{item.id}}">
+      <view class="trip-main">
+        <view class="trip-head">
+          <text class="trip-time num">{{item.time}}</text>
+          <text class="status-pill {{item.statusTone === 'pending' ? 'status-pending' : 'status-done'}}">{{item.statusLabel}}</text>
+        </view>
+        <view class="trip-meta num">{{item.customers}} 家门店 · {{item.lines}} 样货 · {{item.delivered}}/{{item.customers}} 已送达</view>
       </view>
-      <view class="history-meta num">{{item.customers}} 家 · {{item.lines}} 行 · {{item.delivered}}/{{item.customers}} 家已送达</view>
-      <view class="history-total num">{{item.total}}</view>
+      <view class="trip-right">
+        <view class="trip-amount num {{item.allPending ? 'text-warning' : ''}}">{{item.amountDisplay}}</view>
+        <view wx:if="{{item.pendingNote}}" class="trip-pending num">{{item.pendingNote}}</view>
+      </view>
       <view class="shop-arrow">›</view>
     </view>
-    <button wx:if="{{nextBefore}}" class="btn-secondary" bindtap="loadMore" loading="{{busy}}" disabled="{{busy}}">查看更早趟次</button>
+    <button wx:if="{{nextBefore}}" class="btn-secondary history-more-btn" bindtap="loadMore" loading="{{busy}}" disabled="{{busy}}">查看更早趟次</button>
   </block>
 </view>

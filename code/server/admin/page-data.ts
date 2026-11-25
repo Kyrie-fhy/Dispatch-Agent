@@ -144,6 +144,7 @@ export const adminDataScript = `
     customers: null, queryResult: null, queryText: '', csv: { text: '', preview: null }
   };
   var catalogQuerySeq = 0;
+  var catalogCsvSeq = 0;
 
   var autoCatalogCode = function (code) {
     return /^[MV]-[0-9a-f]{8}-[0-9a-f]{4}-/i.test(str(code));
@@ -476,7 +477,7 @@ export const adminDataScript = `
           status: el('catStatus') ? el('catStatus').value : 'active',
           expectedRevision: num(data.catalogRevision)
         };
-        if (addingToExisting) {
+        if (editing || addingToExisting) {
           if (aliasText !== aliasBaseline.aliases) body.aliases = splitList(aliasText);
           if (brandAliasText !== aliasBaseline.brandAliases) body.brandAliases = splitList(brandAliasText);
         } else {
@@ -595,7 +596,9 @@ export const adminDataScript = `
     html += '<p class="field-hint">只增量更新表里列出的货品，表外老货品保持不动，防止误删。</p>';
     box.innerHTML = html;
   };
-  var previewCatalogCsv = function () {
+  var previewCatalogCsv = function (expectedSeq) {
+    var seq = expectedSeq !== undefined ? expectedSeq : ++catalogCsvSeq;
+    catalogView.csv.seq = seq;
     var csv = catalogView.csv.text;
     var targetAccountId = catalogView.csv.accountId || state.accountId;
     var errorNode = el('catalogCsvError');
@@ -608,11 +611,11 @@ export const adminDataScript = `
     if (box) box.innerHTML = '<div class="loading-inline">正在预演差异…</div>';
     request(accountPath(targetAccountId, '/catalog/import/preview'), { method: 'POST', body: { csv: csv } })
       .then(function (preview) {
-        if (!isCurrent('catalog', targetAccountId) || !el('catalogCsvPreview')) return;
+        if (seq !== catalogCsvSeq || !isCurrent('catalog', targetAccountId) || !el('catalogCsvPreview')) return;
         catalogView.csv.preview = preview;
         renderCsvPreview(preview);
       }, function (error) {
-        if (!isCurrent('catalog', targetAccountId)) return;
+        if (seq !== catalogCsvSeq || !isCurrent('catalog', targetAccountId)) return;
         catalogView.csv.preview = null;
         var message = error.message || '预演失败，请检查 CSV 格式。';
         if (errorNode) errorNode.textContent = message;
@@ -621,7 +624,8 @@ export const adminDataScript = `
   };
   var openCatalogCsvModal = function () {
     var targetAccountId = state.accountId;
-    catalogView.csv = { text: '', preview: null, accountId: targetAccountId };
+    var modalSessionSeq = ++catalogCsvSeq;
+    catalogView.csv = { text: '', preview: null, accountId: targetAccountId, seq: modalSessionSeq };
     openModal({
       title: '上传 CSV 增量更新货品',
       bodyHtml: '<p>选择 UTF-8 编码的 .csv 文件。先预演差异，再确认导入。</p>' +
@@ -633,7 +637,9 @@ export const adminDataScript = `
       confirmText: '确认增量导入',
       confirmTone: 'primary',
       onConfirm: function () {
-        if (state.accountId !== targetAccountId) throw new Error('当前查看的配送员已切换，请重新操作');
+        if (state.accountId !== targetAccountId || catalogView.csv.accountId !== targetAccountId) {
+          throw new Error('当前查看的配送员已切换，请重新操作');
+        }
         var errorNode = el('catalogCsvError');
         var preview = catalogView.csv.preview;
         if (!preview || !catalogView.csv.text) {
@@ -661,7 +667,9 @@ export const adminDataScript = `
   var readCatalogCsvFile = function (input) {
     var file = input && input.files ? input.files[0] : null;
     var errorNode = el('catalogCsvError');
-    catalogView.csv = { text: '', preview: null, accountId: catalogView.csv.accountId || state.accountId };
+    var targetAccountId = catalogView.csv.accountId || state.accountId;
+    var readSeq = ++catalogCsvSeq;
+    catalogView.csv = { text: '', preview: null, accountId: targetAccountId, seq: readSeq };
     if (!file) return;
     if (!/\\.csv$/i.test(file.name)) {
       if (errorNode) errorNode.textContent = '请选择 .csv 文件。';
@@ -673,10 +681,12 @@ export const adminDataScript = `
     }
     var reader = new FileReader();
     reader.onload = function () {
+      if (readSeq !== catalogCsvSeq || state.accountId !== targetAccountId || !el('catalogCsvFile')) return;
       catalogView.csv.text = String(reader.result || '');
-      previewCatalogCsv();
+      previewCatalogCsv(readSeq);
     };
     reader.onerror = function () {
+      if (readSeq !== catalogCsvSeq || state.accountId !== targetAccountId) return;
       if (errorNode) errorNode.textContent = '文件读取失败，请确认是 UTF-8 文本。';
     };
     reader.readAsText(file, 'utf-8');

@@ -208,8 +208,12 @@ export const adminOpsScript = `
   var parseYuan = function (value) {
     if (value === null || value === undefined) return null;
     var text = String(value).trim();
-    if (!/^\d+(\.\d{1,2})?$/.test(text)) return null;
-    return Math.round(Number(text) * 100);
+    if (!/^\\d+(?:\\.\\d{1,2})?$/.test(text)) return null;
+    var parts = text.split('.');
+    var whole = parts[0];
+    var frac = ((parts[1] || '') + '00').slice(0, 2);
+    var cents = Number(whole + frac);
+    return Number.isSafeInteger(cents) ? cents : null;
   };
   var draftSummary = function (draft) {
     var stores = 0;
@@ -226,11 +230,12 @@ export const adminOpsScript = `
           && !str(item.quantity).trim() && parseYuan(item.price) === null;
         if (empty) return;
         var quantityText = str(item.quantity).trim();
-        var quantity = /^[1-9]\d*$/.test(quantityText) && Number.isSafeInteger(Number(quantityText))
+        var quantity = /^[1-9]\\d*$/.test(quantityText) && Number.isSafeInteger(Number(quantityText))
           ? Number(quantityText) : null;
         var price = parseYuan(item.price);
-        if (quantity !== null && price !== null && Number.isSafeInteger(quantity * price)) known += quantity * price;
-        else pending++;
+        if (quantity !== null && price !== null && Number.isSafeInteger(quantity * price) && Number.isSafeInteger(known + quantity * price)) {
+          known += quantity * price;
+        } else pending++;
       });
     });
     return { stores: stores, knownCents: known, pending: pending };

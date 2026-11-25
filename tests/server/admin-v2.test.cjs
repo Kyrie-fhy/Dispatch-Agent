@@ -499,6 +499,7 @@ function createAdminHarness(options = {}) {
     fetch,
     navigator: {},
     URL: { createObjectURL: () => 'blob:admin', revokeObjectURL() {} },
+    ...(options.FileReader ? { FileReader: options.FileReader } : {}),
     console,
     setTimeout: (callback, delay) => (delay >= 1000 ? 0 : setTimeout(callback, 0)),
     clearTimeout,
@@ -699,6 +700,117 @@ test('admin v2 offline keeps the reissued one-time code modal open', async () =>
   const modal = harness.document.querySelector('#modalRoot');
   assert.equal(modal.classList.contains('hidden'), false, '旧确认流程不得关闭新码弹窗');
   assert.ok(modal.textContent.includes('一次性开通码已生成'));
+});
+
+test('admin v2 offline drops a late CSV FileReader callback from a previous courier modal', async () => {
+  const readers = [];
+  class FakeFileReader {
+    readAsText(file) {
+      this.file = file;
+      readers.push(this);
+    }
+  }
+  const harness = createAdminHarness({
+    catalog: adminCatalogFixture(),
+    FileReader: FakeFileReader,
+    handler(call) {
+      if (call.method === 'POST' && call.url.endsWith('/catalog/import/preview')) {
+        return adminJson(200, {
+          valid: true, mode: 'incremental', previewToken: 'tok-' + call.body.csv.slice(0, 6),
+          addedProducts: 0, addedVariants: 0, priceChanges: [], statusChanges: [], unitChanges: [],
+          unchangedCount: 1, missingUnitCount: 0, errors: [],
+        });
+      }
+      if (call.method === 'POST' && call.url.endsWith('/catalog/import/confirm')) {
+        return adminJson(200, { importId: 'imp-1', catalogRevision: 8, mode: 'incremental' });
+      }
+      return undefined;
+    },
+  });
+  await harness.openSection('catalog');
+  await harness.waitFor(() => harness.document.querySelector('[data-catalog-upload]'), 'import button A');
+  harness.fire(harness.document.querySelector('[data-catalog-upload]'), 'click');
+  const fileA = harness.document.querySelector('#catalogCsvFile');
+  fileA.files = [{ name: 'A.csv', size: 12 }];
+  harness.fire(fileA, 'change');
+  assert.equal(readers.length, 1);
+
+  const select = harness.document.querySelector('#accountSelect');
+  select.value = 'B';
+  harness.fire(select, 'change');
+  await harness.waitFor(() => harness.App.state.accountId === 'B' && harness.document.querySelector('[data-catalog-upload]'),
+    'import button B');
+  harness.fire(harness.document.querySelector('[data-catalog-upload]'), 'click');
+  const fileB = harness.document.querySelector('#catalogCsvFile');
+  fileB.files = [{ name: 'B.csv', size: 12 }];
+  harness.fire(fileB, 'change');
+  assert.equal(readers.length, 2);
+
+  readers[1].result = 'CSV-B-CONTENT';
+  readers[1].onload();
+  await harness.waitFor(() => harness.calls.some(call => call.url === '/admin/api/accounts/B/catalog/import/preview'),
+    'preview B');
+
+  readers[0].result = 'CSV-A-CONTENT';
+  readers[0].onload();
+  await adminFlush(30);
+
+  harness.fire(harness.document.querySelector('#modalRoot [data-modal-confirm]'), 'click');
+  await harness.waitFor(() => harness.calls.some(call => call.url === '/admin/api/accounts/B/catalog/import/confirm'),
+    'confirm B');
+  const confirm = harness.calls.find(call => call.url === '/admin/api/accounts/B/catalog/import/confirm');
+  assert.equal(confirm.body.csv, 'CSV-B-CONTENT', '迟到的 A 文件回调不得覆盖 B 的导入内容');
+  assert.equal(confirm.body.previewToken, 'tok-CSV-B-');
+});
+
+test('admin v2 offline calculates draft known amount accurately on trips list without regex loss', async () => {
+  const harness = createAdminHarness({
+    handler(call) {
+      if (call.method === 'GET' && call.url === '/admin/api/accounts/A/overview') {
+        return adminJson(200, {
+          accountId: 'A',
+          draftConfirmed: false,
+          currentTripId: null,
+          draft: {
+            id: 'd1', revision: 2,
+            customers: [{
+              id: 'c1', customer: '甲店', partyId: null,
+              items: [
+                { id: 'i1', product: '鱼豆腐', brand: '安井', specification: '500g', unit: '箱', quantity: '2', price: '19.80' },
+                { id: 'i2', product: '虾丸', brand: '', specification: '', unit: '箱', quantity: '1', price: null },
+              ],
+            }],
+          },
+          trips: [],
+          staleDrafts: [],
+        });
+      }
+      return undefined;
+    },
+  });
+  await harness.openSection('trips');
+  await harness.waitFor(() => harness.document.querySelector('#view').textContent.includes('¥39.60'),
+    'draft known amount ¥39.60');
+  const text = harness.document.querySelector('#view').textContent;
+  assert.ok(text.includes('¥39.60'), '草稿有效单价必须按整数分正确汇总');
+  assert.ok(text.includes('1 项待补价'), '缺价行应单独计入待补价');
+});
+
+test('admin v2 offline omits untouched aliases containing Chinese pause commas when editing variant price', async () => {
+  const catalog = adminCatalogFixture();
+  catalog.items[0].aliases = ['鱼丸、鱼饺组合装'];
+  const harness = createAdminHarness({ catalog });
+  await harness.openSection('catalog');
+  await harness.waitFor(() => harness.document.querySelector('[data-catalog-edit="v-fish"]'), 'edit button');
+  harness.fire(harness.document.querySelector('[data-catalog-edit="v-fish"]'), 'click');
+  harness.document.querySelector('#catPrice').value = '21.50';
+  harness.fire(harness.document.querySelector('#modalRoot [data-modal-confirm]'), 'click');
+  await harness.waitFor(() => harness.calls.some(call => call.method === 'PATCH' && call.url.endsWith('/catalog/variants/v-fish')),
+    'variant PATCH');
+  const patched = harness.calls.find(call => call.method === 'PATCH' && call.url.endsWith('/catalog/variants/v-fish'));
+  assert.equal(patched.body.priceCents, 2150);
+  assert.equal('aliases' in patched.body, false, '未改动别名框时编辑规格不得拆分重写已有别名');
+  assert.equal('brandAliases' in patched.body, false, '未改动品牌别名框时编辑规格不得重写已有品牌别名');
 });
 
 test('admin dispatch rejects methods, authentication and cross-origin writes before database access', async () => {

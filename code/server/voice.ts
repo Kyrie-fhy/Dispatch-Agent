@@ -40,11 +40,25 @@ function protectedTerms(text: string) {
   };
 }
 
-export function sanitizeVoiceCorrection(rawText: string, candidate: unknown) {
-  const fallback = { text: rawText, rawText, corrections: [] as VoiceCorrectionEntry[] };
+export type SanitizedVoiceCorrection = {
+  text: string;
+  rawText: string;
+  corrections: VoiceCorrectionEntry[];
+  revertedRuleId?: 'voice.protected_terms_mutated';
+};
+
+export function sanitizeVoiceCorrection(rawText: string, candidate: unknown): SanitizedVoiceCorrection {
+  const fallback: SanitizedVoiceCorrection = { text: rawText, rawText, corrections: [] };
   if (!isObject(candidate) || !validText(candidate.text)) return fallback;
   const text = candidate.text.trim();
-  if (JSON.stringify(protectedTerms(rawText)) !== JSON.stringify(protectedTerms(text))) return fallback;
+  if (JSON.stringify(protectedTerms(rawText)) !== JSON.stringify(protectedTerms(text))) {
+    Object.defineProperty(fallback, 'revertedRuleId', {
+      value: 'voice.protected_terms_mutated',
+      enumerable: false,
+      configurable: true,
+    });
+    return fallback;
+  }
   const corrections: VoiceCorrectionEntry[] = [];
   if (Array.isArray(candidate.corrections)) {
     for (const entry of candidate.corrections) {

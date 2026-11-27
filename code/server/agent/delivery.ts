@@ -6,6 +6,7 @@ import { latest } from '../../miniprogram/core/trips';
 import { HttpError } from '../http-error';
 import type { TripStore } from '../trips';
 import { deliveryPromptVersion, type DeliveryModel } from './delivery-model';
+import { clipDecisions, type ControlDecision } from './decisions';
 import type { PreviousQuestions } from './edit';
 import type { AgentModelTrace } from './model';
 import type { AgentStore, Input, TurnKey } from './store';
@@ -13,7 +14,7 @@ import type { AgentStore, Input, TurnKey } from './store';
 type Trip = Awaited<ReturnType<TripStore['trip']>>;
 type Intent = { adjust: boolean; query: boolean; answering: boolean; lookup?: unknown; shop?: unknown };
 type Sheet = ReturnType<typeof sheetsFor>[number];
-type Candidate = { proposal?: DeliveryProposal; question?: Question; text?: string };
+type Candidate = { proposal?: DeliveryProposal; question?: Question; text?: string; decisions?: ControlDecision[] };
 const intentError = () => new HttpError(502, 'delivery_invalid_model_output', '没能核对这条消息，请重试或去送货单修改。');
 const label = (line: Pick<DeliveryLine, 'brand' | 'product' | 'specification' | 'unit'>) =>
   [line.brand, line.product, line.specification, line.unit].filter(Boolean).join(' / ');
@@ -29,8 +30,8 @@ function sheetsFor({ trip, sheets, deliveryEdits }: Trip) {
   });
 }
 
-function question(text: string, options: string[] = [], customer = ''): Candidate {
-  return { question: { customer, text, options } };
+function question(text: string, options: string[] = [], customer = '', decisions?: ControlDecision[]): Candidate {
+  return { question: { customer, text, options }, ...(decisions?.length ? { decisions } : {}) };
 }
 
 function traceInputSummary(phase: 'intent' | 'candidate', body: object) {
@@ -55,12 +56,13 @@ function traceArguments(output: unknown) {
 }
 
 function traceResult(candidate: Candidate) {
+  const decisions = candidate.decisions?.length ? { decisions: clipDecisions(candidate.decisions) } : {};
   if (candidate.proposal) {
     return { outcome: 'proposal', customer: candidate.proposal.customer, editCount: candidate.proposal.edits.length,
-      canComplete: candidate.proposal.canComplete, pendingPriceNames: candidate.proposal.pendingPriceNames };
+      canComplete: candidate.proposal.canComplete, pendingPriceNames: candidate.proposal.pendingPriceNames, ...decisions };
   }
-  if (candidate.question) return { outcome: 'question', question: candidate.question.text };
-  return { outcome: 'blocked_or_noop', text: candidate.text ?? '' };
+  if (candidate.question) return { outcome: 'question', question: candidate.question.text, ...decisions };
+  return { outcome: 'blocked_or_noop', text: candidate.text ?? '', ...decisions };
 }
 
 function quantityFrom(source: string, line: DeliveryLine, quantity: number) {
@@ -101,17 +103,38 @@ function resolve(trip: Trip, sheets: Sheet[], output: unknown, source: string): 
   const sheet = args.sheetNumber === undefined && named.length === 1 ? named[0] :
     typeof args.sheetNumber === 'number' && Number.isSafeInteger(args.sheetNumber) ? sheets[args.sheetNumber - 1] : undefined;
   if (sheet && (named.includes(sheet) || !named.length) && locked(sheet)) {
-    return { text: `「${sheet.customer}」已确认送达，应收已锁定，不能再改。` };
+    return { text: `「${sheet.customer}」已确认送达，应收已锁定，不能再改。`, decisions: [{
+      ruleId: 'delivery.locked_sheet', decision: 'block', layer: 'delivery',
+      reason: '目标门店已确认送达或核对锁定，禁止修改', target: sheet.customer,
+    }] };
   }
-  if (args.blockedReason === 'new_item_after_issue') return { text: '本趟已出单，不能直接新增原单没有的货品；请先核对原单明细，新订货品可在开始下一趟后录入。' };
-  if (args.blockedReason === 'next_trip_order') return { text: '当前正在本趟送货中，如需录下一趟订单，请先到「送货」页底部点「开始下一趟」。' };
+  if (args.blockedReason === 'new_item_after_issue') {
+    return { text: '本趟已出单，不能直接新增原单没有的货品；请先核对原单明细，新订货品可在开始下一趟后录入。', decisions: [{
+      ruleId: 'delivery.new_item_after_issue', decision: 'block', layer: 'delivery',
+      reason: '本趟已出单，禁止直接新增原单没有的货品', ...(sheet ? { target: sheet.customer } : {}),
+    }] };
+  }
+  if (args.blockedReason === 'next_trip_order') {
+    return { text: '当前正在本趟送货中，如需录下一趟订单，请先到「送货」页底部点「开始下一趟」。', decisions: [{
+      ruleId: 'delivery.next_trip_order', decision: 'block', layer: 'delivery',
+      reason: '送货中拦截下趟新单，引导先点开始下一趟',
+    }] };
+  }
   if (args.blockedReason !== undefined || !sheet || (named.length && !named.includes(sheet))) {
-    return question('请说清楚要核对哪家门店。', sheets.filter(item => !locked(item)).map(item => item.customer));
+    return question('请说清楚要核对哪家门店。', sheets.filter(item => !locked(item)).map(item => item.customer), '', [{
+      ruleId: 'delivery.ambiguous_shop_or_line', decision: 'confirm', layer: 'delivery',
+      reason: '未能唯一定位要核对的门店，需配送员确认',
+    }]);
   }
   if (!args.edits.length && !args.readyToComplete) return question('请说清楚要修改的货品、实收数量或单价。');
   if (!args.edits.length && named.length !== 1) {
     const eligible = named.length ? named : sheets.filter(item => !locked(item));
-    if (eligible.length > 1) return question('请问是哪家店已送到？', eligible.map(item => item.customer));
+    if (eligible.length > 1) {
+      return question('请问是哪家店已送到？', eligible.map(item => item.customer), '', [{
+        ruleId: 'delivery.ambiguous_shop_or_line', decision: 'confirm', layer: 'delivery',
+        reason: '多家未送达门店存在歧义，需确认是哪家店',
+      }]);
+    }
   }
   const edits: DeliveryProposal['edits'] = [];
   const combined = { ...trip.deliveryEdits };
@@ -123,24 +146,38 @@ function resolve(trip: Trip, sheets: Sheet[], output: unknown, source: string): 
     seen.add(line.id);
     const peers = sheets.filter(item => !locked(item) && item.lines.some(row => normalized(row.product) === normalized(line.product)));
     if ((named.length !== 1 && peers.length > 1) || named.length > 1) {
-      return question(`请问是哪家店的${line.product}？`, (named.length ? named : peers).map(item => item.customer));
+      return question(`请问是哪家店的${line.product}？`, (named.length ? named : peers).map(item => item.customer), '', [{
+        ruleId: 'delivery.ambiguous_shop_or_line', decision: 'confirm', layer: 'delivery',
+        reason: '多家门店存在同款货品，需确认具体门店', target: line.product,
+      }]);
     }
     const same = sheet.lines.flatMap((row, index) => normalized(row.product) === normalized(line.product) ? [{ row, index: index + 1 }] : []);
     if (!mentions(source, line.product) && !mentions(line.product, source.trim()) && !mentions(source, lineOption(line, change.lineNumber)) &&
         ![...source.matchAll(/第\s*(\d+|[一二两三四五六七八九十]+)\s*行/g)].some(match => hasSpokenNumber(match[1], String(change.lineNumber)))) {
-      return question(`请指出「${sheet.customer}」要修改的货品或行号。`, sheet.lines.map((row, index) => lineOption(row, index + 1)), sheet.customer);
+      return question(`请指出「${sheet.customer}」要修改的货品或行号。`, sheet.lines.map((row, index) => lineOption(row, index + 1)), sheet.customer, [{
+        ruleId: 'delivery.ambiguous_shop_or_line', decision: 'confirm', layer: 'delivery',
+        reason: '原话未指明要修改的货品或行号，需确认', target: sheet.customer,
+      }]);
     }
     if (same.length > 1) {
       const rowMatches = [...source.matchAll(/第\s*(\d+|[一二两三四五六七八九十]+)\s*行/g)];
       const numbered = same.filter(({ index }) => rowMatches.some(match => hasSpokenNumber(match[1], String(index))));
       const explicit = numbered.length ? numbered : same.filter(({ row }) => [row.unit, row.specification, row.brand].some(value =>
         mentions(source, value) && same.filter(peer => [peer.row.unit, peer.row.specification, peer.row.brand].includes(value)).length === 1));
-      if (explicit.length !== 1 || explicit[0].row.id !== line.id) return question(`请问改哪一行${line.product}？`, same.map(({ row, index }) => lineOption(row, index)), sheet.customer);
+      if (explicit.length !== 1 || explicit[0].row.id !== line.id) {
+        return question(`请问改哪一行${line.product}？`, same.map(({ row, index }) => lineOption(row, index)), sheet.customer, [{
+          ruleId: 'delivery.ambiguous_shop_or_line', decision: 'confirm', layer: 'delivery',
+          reason: '同门店存在多行同款货品，需确认具体行号', target: `${sheet.customer} ${line.product}`.trim(),
+        }]);
+      }
     }
     const receivedQuantity = change.receivedQuantity === undefined ? line.receivedQuantity : change.receivedQuantity;
     if (typeof receivedQuantity !== 'number' || !Number.isSafeInteger(receivedQuantity) || receivedQuantity < 0 ||
         (receivedQuantity !== line.receivedQuantity && !quantityFrom(source, line, receivedQuantity))) {
-      return question(`请说清楚${line.product}实际收了多少${line.unit}。`, [], sheet.customer);
+      return question(`请说清楚${line.product}实际收了多少${line.unit}。`, [], sheet.customer, [{
+        ruleId: 'delivery.ungrounded_quantity_or_price', decision: 'block', layer: 'delivery',
+        reason: '实收数量缺少原话出处或非法，已拦截并转追问', target: `${sheet.customer} ${line.product}`.trim(),
+      }]);
     }
     let unitPriceCents = line.unitPriceCents;
     if (change.price !== undefined && !(change.price === null && line.unitPriceCents === null)) {
@@ -151,7 +188,10 @@ function resolve(trip: Trip, sheets: Sheet[], output: unknown, source: string): 
         if (unitPriceCents === null || (unitPriceCents !== line.unitPriceCents &&
             !hasSpokenNumber(source.replace(/第\s*[\d一二两三四五六七八九十]+\s*行/g, ''), raw))) throw intentError();
       } catch {
-        return question(`请说清楚${line.product}每${line.unit}的单价。`, [], sheet.customer);
+        return question(`请说清楚${line.product}每${line.unit}的单价。`, [], sheet.customer, [{
+          ruleId: 'delivery.ungrounded_quantity_or_price', decision: 'block', layer: 'delivery',
+          reason: '单价缺少原话出处或非法，已拦截并转追问', target: `${sheet.customer} ${line.product}`.trim(),
+        }]);
       }
     }
     if (line.receivedQuantity === receivedQuantity && line.unitPriceCents === unitPriceCents) continue;

@@ -202,7 +202,7 @@ async function caseRedactor(client: PoolClient, accountId: string, snapshot: Sna
       return phones.get(digits)!;
     }).replace(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi, '[邮箱已隐藏]');
   };
-  const schemaValues = /^(id|key|partyKey|linkedPartyKey|partyId|lineId|sheetId|variantId|productId|status|mode|source|medium|role|promptVersion|priceSource|catalogStatus|issuedAt|exportedAt|catalogVariantKey|catalogProductKey)$/;
+  const schemaValues = /^(id|key|partyKey|linkedPartyKey|partyId|lineId|sheetId|variantId|productId|status|mode|source|medium|role|promptVersion|priceSource|catalogStatus|issuedAt|exportedAt|catalogVariantKey|catalogProductKey|ruleId|decision|layer)$/;
   function sanitize(value: unknown, key?: string): unknown {
     if (Array.isArray(value)) return value.map(item => sanitize(item, key));
     if (isObject(value)) return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, sanitize(item, name)]));

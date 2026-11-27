@@ -8,6 +8,7 @@ import { money, nullablePrice, yuanToCents, type ItemInput } from '../miniprogra
 import { toPinyinTokens } from '../miniprogram/core/pinyin';
 import type { CustomerDraft, TripDraft } from '../miniprogram/core/trips';
 import { readAccount, workspaceDraft, writeAccount } from './account-workspace';
+import { clipDecisions, type ControlDecision } from './agent/decisions';
 import { checkDraft } from './agent/store';
 import { setAccount, transaction } from './database';
 import { itemIdentityChanged } from './draft-input';
@@ -165,6 +166,7 @@ function groundedCatalogDetails(item: ItemInput, previous: ItemInput | undefined
 export async function applyCatalogToDraft(client: PoolClient, accountId: string, draft: TripDraft, before: TripDraft,
   catalog?: readonly CatalogVariant[], sourceText?: string) {
   const lines: string[] = [];
+  const decisions: ControlDecision[] = [];
   const changes: { draftCustomerId: string; lineId: string; product: string; status: ItemInput['catalogStatus'];
     priceSource: ItemInput['priceSource'];
     price: string | null; priceHint: string | null;
@@ -194,13 +196,15 @@ export async function applyCatalogToDraft(client: PoolClient, accountId: string,
       ? groundedCatalogDetails(item, previous?.item, normalizedSource, variants, mention)
       : { item, unitGrounded: true, spokenProduct: undefined, spokenBrandProduct: undefined };
     const input = grounded.item;
+    const strippedDetail = changedItems.has(item) && (input.product !== item.product
+      || input.brand !== item.brand || input.specification !== item.specification);
     const rawMatch = matchCatalogItem(input, variants);
     const match: CatalogMatch = !grounded.unitGrounded && 'variant' in rawMatch
       ? { status: 'unit_mismatch', candidates: [rawMatch.variant], matchMethod: rawMatch.matchMethod,
         hint: '原话未提到该计价单位，请核对单位后再配价' }
       : rawMatch;
     const matchedVariants = 'variant' in match ? [match.variant] : match.candidates;
-    return { item, input, match, spokenProduct: grounded.spokenProduct, spokenBrandProduct: grounded.spokenBrandProduct, quote: {
+    return { item, input, strippedDetail, match, spokenProduct: grounded.spokenProduct, spokenBrandProduct: grounded.spokenBrandProduct, quote: {
       products: [input.product, grounded.spokenProduct ?? '', previous?.item.product ?? '', ...matchedVariants.flatMap(variant => variant.aliases)],
       customers: [customer.customer, previous?.customer ?? '', ...aliases.map(alias => alias.alias)],
       specifications: [input.specification, input.brand,
@@ -211,8 +215,17 @@ export async function applyCatalogToDraft(client: PoolClient, accountId: string,
   const quotes = targets.map(row => row.quote);
   const byItem = new Map(targets.map(row => [row.item, row]));
   for (const { customer, item, index } of changed) {
-    const { input, match, quote, spokenProduct, spokenBrandProduct } = byItem.get(item)!;
+    const { input, strippedDetail, match, quote, spokenProduct, spokenBrandProduct } = byItem.get(item)!;
     const previous = previously.get(item.id)?.item;
+    if (strippedDetail) {
+      decisions.push({
+        ruleId: 'catalog.stripped_ungrounded_detail',
+        decision: 'modify',
+        layer: 'catalog',
+        reason: '剥离原话未提及的品牌或规格信息',
+        ...(item.product.trim() ? { target: item.product.trim() } : {}),
+      });
+    }
     const incomingPrice = nullablePrice(input.price);
     const freshPrice = incomingPrice !== null && (input.priceSource == null || input.priceSource === 'spoken')
       && (nullablePrice(previous?.price ?? null) !== incomingPrice || previous?.unit !== input.unit
@@ -231,13 +244,45 @@ export async function applyCatalogToDraft(client: PoolClient, accountId: string,
         priceSource: protectPrevious ? previous.priceSource : null };
     }
     const next = resolveCatalogAutoPrice(candidate, match, customer.partyId, sales);
+    const lineTarget = `${customer.customer} ${next.product || item.product}`.trim();
+    if (match.status === 'unit_mismatch' && next.price === null) {
+      decisions.push({
+        ruleId: 'catalog.unit_mismatch_price_cleared',
+        decision: 'block',
+        layer: 'catalog',
+        reason: match.hint || '计价单位与货品库不一致，单价留空待补',
+        ...(lineTarget ? { target: lineTarget } : {}),
+      });
+    } else if ((match.status === 'ambiguous' || match.status === 'discontinued') && next.price === null) {
+      decisions.push({
+        ruleId: 'catalog.ambiguous_or_discontinued',
+        decision: 'block',
+        layer: 'catalog',
+        reason: match.status === 'discontinued' ? '命中已下架货品，单价留空待核实' : '命中库内同名多款货品，单价留空待选款',
+        ...(lineTarget ? { target: lineTarget } : {}),
+      });
+    }
     if (imagePrice && next.price === null && yuanToCents(incomingPrice) > 0) {
       next.priceHint = [next.priceHint, `图片疑似标价 ¥${incomingPrice}（未自动填入，请核对）`].filter(Boolean).join(' · ');
+      decisions.push({
+        ruleId: 'catalog.image_price_withheld',
+        decision: 'block',
+        layer: 'catalog',
+        reason: `图片疑似标价 ¥${incomingPrice}，未自动落价待核对`,
+        ...(lineTarget ? { target: lineTarget } : {}),
+      });
     }
     if (quoted.length > 1 && (next.priceSource === 'catalog' || next.priceSource === 'customer_history')) {
       next.price = null;
       next.priceSource = null;
       next.priceHint = '原话有多个单价，请核对';
+      decisions.push({
+        ruleId: 'catalog.multi_quote_price_cleared',
+        decision: 'block',
+        layer: 'catalog',
+        reason: '原话有多个单价冲突，已清空自动配价待核对',
+        ...(lineTarget ? { target: lineTarget } : {}),
+      });
     }
     customer.items[index] = next;
     const update = catalogPriceUpdate(customer, previous ?? { ...item, price: null, priceSource: null }, next);
@@ -253,7 +298,7 @@ export async function applyCatalogToDraft(client: PoolClient, accountId: string,
       ...(match.matchMethod ? { matchMethod: match.matchMethod } : {}), ...(spokenName ? { spokenName } : {}),
       input: { product: input.product, brand: input.brand, specification: input.specification, unit: input.unit } });
   }
-  return { lines, changes };
+  return { lines, changes, ...(decisions.length ? { decisions: clipDecisions(decisions) } : {}) };
 }
 
 export async function lockCatalog(client: PoolClient, accountId: string) {

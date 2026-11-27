@@ -9,6 +9,7 @@ import type { Party } from '../../miniprogram/core/settlement';
 import type { Question } from '../../miniprogram/core/agent';
 import { HttpError } from '../http-error';
 import { isPlaceholder, mergeOrder, normalized, safeFields, targetRows } from '../text-orders';
+import { clipDecisions, type ControlDecision } from './decisions';
 
 export function invalidTool(): never {
   throw new HttpError(502, 'invalid_agent_tool', '助手无法读取本次整理结果，可以重试或手动填写。');
@@ -78,17 +79,29 @@ function spokenDraftName(draft: TripDraft, op: Record<string, unknown>, source: 
   return alias?.alias ?? '';
 }
 
-function normalizeAddFill(op: Record<string, unknown>, draft: TripDraft, source: string, directory?: CustomerDirectory) {
+function normalizeAddFill(op: Record<string, unknown>, draft: TripDraft, source: string, directory?: CustomerDirectory,
+  decisions?: ControlDecision[]) {
   const normalizedOp = { ...op };
   if (normalizedOp.action === 'add') {
     // add 只按客户名称归属；行号 target 与选择客户用的联合键对新增没有意义。
     delete normalizedOp.target;
     const spoken = typeof normalizedOp.customer === 'string' ? normalizedOp.customer.trim() : '';
+    const hadCustomerNumber = normalizedOp.customerNumber !== undefined && normalizedOp.customerNumber !== null;
     if (!spoken) {
       // 数字序号只能还原成原话里确实出现过的草稿客户名或已记叫法，否则留空交人工补客户名，
       // 绝不能让模型幻觉的序号把新客户静默塞进已有熟客单。
       const name = spokenDraftName(draft, normalizedOp, source, directory);
       if (name) normalizedOp.customer = name;
+      else if (hadCustomerNumber) {
+        const product = typeof normalizedOp.product === 'string' ? normalizedOp.product.trim() : '';
+        decisions?.push({
+          ruleId: 'edit.stripped_customer_number',
+          decision: 'modify',
+          layer: 'edit',
+          reason: '新增操作携带 customerNumber 但原话未出现对应称呼，已剥离防止静默串单',
+          ...(product ? { target: product } : {}),
+        });
+      }
     }
     if (typeof normalizedOp.customer === 'string' && !normalizedOp.customer.trim()) delete normalizedOp.customer;
   }
@@ -106,8 +119,11 @@ function normalizeAddFill(op: Record<string, unknown>, draft: TripDraft, source:
 export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[], source: string, previous?: PreviousQuestions,
   confirmed = false, directory?: CustomerDirectory, catalogEnabled = false) {
   if (!isObject(value) || !Array.isArray(value.operations) || !value.operations.length || value.operations.length > 24) invalidTool();
+  const decisions: ControlDecision[] = [];
+  const withDecisions = <T extends object>(payload: T): T & { decisions?: ControlDecision[] } =>
+    decisions.length ? { ...payload, decisions: clipDecisions(decisions) } : payload;
   const operations = value.operations.map((op: unknown) => isObject(op) && (op.action === 'add' || op.action === 'fill')
-    ? normalizeAddFill(op, draft, source, directory) : op);
+    ? normalizeAddFill(op, draft, source, directory, decisions) : op);
   const edits = operations.filter((op: unknown) => isObject(op) && (op.action === 'add' || op.action === 'fill'));
   const next = structuredClone(draft);
   const initial = targetRows(draft);
@@ -133,22 +149,56 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
     ? [response, priorText ?? '', selectedMatch.question.customer, selectedMatch.question.text].map(normalized).join(' ')
     : response;
   const checkRepeat = !confirmed && !selected;
-  const issues = (message: string) => ({ issues: [{ code: 'edit_needs_review', message }] });
+  const issues = (message: string) => withDecisions({ issues: [{ code: 'edit_needs_review', message }] });
+  const editTarget = (op: unknown) => isObject(op)
+    ? [typeof op.customer === 'string' ? op.customer.trim() : '', typeof op.product === 'string' ? op.product.trim() : '']
+      .filter(Boolean).join(' ')
+    : '';
 
   if (edits.length) {
-    if (edits.some(op => isObject(op) && typeof op.price === 'string' && op.price.trim() &&
-      !includesValue(response, op.price.trim()))) return issues('请明确说明要填写的单价。');
-    if (edits.some(op => isObject(op) && typeof op.quantity === 'string' && op.quantity.trim() &&
-      !includesValue(response, op.quantity.trim()))) return issues('请说明要填写的确切数量。');
+    const badPrice = edits.find(op => isObject(op) && typeof op.price === 'string' && op.price.trim() &&
+      !includesValue(response, op.price.trim()));
+    if (badPrice) {
+      const target = editTarget(badPrice);
+      decisions.push({
+        ruleId: 'edit.ungrounded_price',
+        decision: 'block',
+        layer: 'edit',
+        reason: '模型给出的单价未在原话中出现，已拦截',
+        ...(target ? { target } : {}),
+      });
+      return issues('请明确说明要填写的单价。');
+    }
+    const badQuantity = edits.find(op => isObject(op) && typeof op.quantity === 'string' && op.quantity.trim() &&
+      !includesValue(response, op.quantity.trim()));
+    if (badQuantity) {
+      const target = editTarget(badQuantity);
+      decisions.push({
+        ruleId: 'edit.ungrounded_quantity',
+        decision: 'block',
+        layer: 'edit',
+        reason: '模型给出的数量未在原话中出现，已拦截',
+        ...(target ? { target } : {}),
+      });
+      return issues('请说明要填写的确切数量。');
+    }
     const contextSource = priorText ? `${source} ${priorText}` : source;
     const merged = mergeOrder(next, { operations: edits }, names, contextSource, true);
     conflicts = merged.conflicts;
-    if (!merged.draft && !conflicts.length) return { issues: merged.issues };
+    if (!merged.draft && !conflicts.length) return withDecisions({ issues: merged.issues });
     if (merged.draft) next.customers = merged.draft.customers;
     for (const conflict of conflicts) {
       const label = [conflict.brand, conflict.product, conflict.specification].filter(Boolean).join(' ');
       const originalRow = actualRows.find(row => row.item.id === conflict.existingRow.id);
       const quantity = checkRepeat && conflict.unit ? repeatedQuantity(response, normalized(conflict.unit)) : undefined;
+      const target = `${conflict.customer} ${conflict.product}`.trim();
+      decisions.push({
+        ruleId: 'edit.duplicate_product_ambiguity',
+        decision: 'confirm',
+        layer: 'edit',
+        reason: '草稿已有同款货品，需确认修改数量还是保留原明细',
+        ...(target ? { target } : {}),
+      });
       if (operations.length === 1 && originalRow && quantity !== undefined && quantity === Number(conflict.quantity)) {
         questions.push(...quantityQuestion(originalRow, quantity).questions);
       } else {
@@ -187,18 +237,42 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
     if (!Number.isSafeInteger(op.target)) invalidTool();
     const old = initial[Number(op.target) - 1];
     const row = old && targetRows(next).find(entry => entry.item.id === old.item.id);
-    if (!row || isPlaceholder(row.item)) return issues('请指明要修改的货品明细。');
+    if (!row || isPlaceholder(row.item)) {
+      decisions.push({
+        ruleId: 'edit.ambiguous_target',
+        decision: 'block',
+        layer: 'edit',
+        reason: '未找到要修改的有效货品明细，已拦截',
+      });
+      return issues('请指明要修改的货品明细。');
+    }
     const label = `${row.customer.customer} ${row.item.product}`.trim();
     const matchScore = ({ item, customer }: typeof row) =>
       Number(Boolean(item.product && targetSource.includes(normalized(item.product)))) +
       Number(Boolean(customer.customer && targetSource.includes(normalized(customer.customer))));
     const score = matchScore(old);
     if (actualRows.length !== 1 && (!score || actualRows.some(candidate => candidate !== old && matchScore(candidate) >= score))) {
+      decisions.push({
+        ruleId: 'edit.ambiguous_target',
+        decision: 'block',
+        layer: 'edit',
+        reason: '原话未能唯一定位目标客户和货品行，已拦截',
+        ...(label ? { target: label } : {}),
+      });
       return issues('请带上客户和货品名称，指明要改哪一行。');
     }
     if (op.action === 'remove_line') {
       if (!confirmed && !/删除|删掉|去掉|不要了|取消这条/.test(response)) {
-        if (!score) return issues('请带上客户或货品名称，指明要删哪一行。');
+        if (!score) {
+          decisions.push({
+            ruleId: 'edit.ambiguous_target',
+            decision: 'block',
+            layer: 'edit',
+            reason: '原话未指明要删除的客户或货品行，已拦截',
+            ...(label ? { target: label } : {}),
+          });
+          return issues('请带上客户或货品名称，指明要删哪一行。');
+        }
         deleting = true;
         confirmations.push(`删掉 ${label} ${row.item.quantity} ${row.item.unit}`);
       }
@@ -218,7 +292,14 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
       const quantity = repeatedQuantity(response, normalized(old.item.unit));
       if (quantity !== undefined &&
           (Number(fields.quantity) === quantity || Number(fields.quantity) === Number(old.item.quantity) + quantity)) {
-        return quantityQuestion(old, quantity);
+        decisions.push({
+          ruleId: 'edit.duplicate_product_ambiguity',
+          decision: 'confirm',
+          layer: 'edit',
+          reason: '重复报同款数量表达含糊，需确认改成还是加上',
+          ...(label ? { target: label } : {}),
+        });
+        return withDecisions(quantityQuestion(old, quantity));
       }
     }
     for (const field of textFields) {
@@ -232,6 +313,13 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
       const append = increment !== undefined && Number(row.item.quantity) + increment === Number(value);
       const eligible = field !== 'price' || /单价|价格|每[公斤斤箱袋件个包]/.test(response);
       if (!includesValue(response, value) && !includesValue(selected, value) && !append) {
+        decisions.push({
+          ruleId: 'edit.ungrounded_update_value',
+          decision: 'block',
+          layer: 'edit',
+          reason: '修改后的值既无原话出处也不是合法增量，已拦截',
+          ...(label ? { target: label } : {}),
+        });
         return issues('请说明本轮要改成的值。');
       }
       if (!confirmed && !((namesProduct || uniqueRow) && (append || (eligible && explicit)))) {
@@ -254,9 +342,16 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
     const accept = deleting ? '删掉' : '改';
     const reject = deleting ? '保留' : '不改';
     const description = confirmations.join('；');
+    decisions.push({
+      ruleId: 'edit.requires_confirmation',
+      decision: 'confirm',
+      layer: 'edit',
+      reason: deleting ? '删除明细需配送员二次确认' : '非显式修改需配送员二次确认',
+      target: description,
+    });
     const question: Question = { customer: '', text: `确认${description}？`,
       options: [accept, reject] };
-    return { confirmation: { operations: value.operations, accept }, question };
+    return withDecisions({ confirmation: { operations: value.operations, accept }, question });
   }
 
   if (!next.customers.length) next.customers = [emptyCustomer(randomUUID)];
@@ -280,9 +375,9 @@ export function prepareEdits(draft: TripDraft, value: unknown, parties: Party[],
   }
   if (added) lines.unshift(`新增 ${added} 行`);
   if (JSON.stringify(next.customers) === JSON.stringify(draft.customers)) {
-    return questions.length ? { questions, conflicts } : issues('草稿已有相同内容，请核对明细。');
+    return questions.length ? withDecisions({ questions, conflicts }) : issues('草稿已有相同内容，请核对明细。');
   }
   if (!lines.length) lines.push('已补充客户或货品信息');
-  return { draft: { ...next, revision: draft.revision + 1 }, lines, added,
-    ...(questions.length ? { questions, conflicts } : {}) };
+  return withDecisions({ draft: { ...next, revision: draft.revision + 1 }, lines, added,
+    ...(questions.length ? { questions, conflicts } : {}) });
 }

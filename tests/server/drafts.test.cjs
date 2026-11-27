@@ -1323,7 +1323,7 @@ test('S7a organizes a private image once, retries failures and protects newer dr
     if (url !== 'https://api.deepseek.com/chat/completions') return originalFetch(url, options);
     const body = JSON.parse(options.body);
     calls.push(body);
-    if (calls.length === 1) return new Response('{}', { status: 503 });
+    if (calls.length === 1) return new Response('{}', { status: 400 });
     if (calls.length === 3) {
       notifyStarted();
       await finish;
@@ -1433,7 +1433,7 @@ test('S7b transcribes WAV without changing a draft and rejects stale results', {
     assert.equal(file.name, 'recording.wav');
     assert.equal(file.type, 'audio/wav');
     assert.deepEqual(Buffer.from(await file.arrayBuffer()), wave);
-    if (calls.length === 1) return new Response('{}', { status: 503 });
+    if (calls.length === 1) return new Response('{}', { status: 400 });
     if (calls.length === 3) {
       entered();
       await finish;

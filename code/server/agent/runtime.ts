@@ -451,7 +451,7 @@ export class AgentRuntime {
 
   private async identify(run: Run, context: Awaited<ReturnType<AgentStore['context']>>) {
     const started = Date.now();
-    let trace: AgentModelTrace | undefined;
+    const traces: AgentModelTrace[] = [];
     let intents: Intent | undefined;
     const customers = context.draft.customers.flatMap(customer => {
       const items = customer.items.filter(item => !isPlaceholder(item));
@@ -467,17 +467,24 @@ export class AgentRuntime {
       if (!this.intentModel) throw new HttpError(503, 'agent_model_unavailable', '助手暂未开启，可以手动填写。');
       intents = await withDeadline(this.intentModel(run.input.text, {
         customers, questions: context.previous?.payload.questions ?? [], lastSummary: context.lastSummary,
-      }, run.signal, value => { trace = value; }), run.signal);
+      }, run.signal, value => { traces.push(value); }), run.signal);
       intents = { ...intents, answering: Boolean(intents.draft && intents.answering && context.previous?.payload.questions.length) };
       return intents;
     } finally {
-      await this.recordModel(run, started, trace, { phase: 'intent', intents, inputSummary });
+      if (!traces.length) {
+        await this.recordModel(run, started, undefined, { phase: 'intent', intents, inputSummary });
+      } else {
+        for (const [index, trace] of traces.entries()) {
+          const last = index === traces.length - 1;
+          await this.recordModel(run, started, trace, { phase: 'intent', ...(last ? { intents } : {}), inputSummary });
+        }
+      }
     }
   }
 
   private async complete(run: Run, prompt: string, input: object, allowed: readonly string[]) {
     const started = Date.now();
-    let trace: AgentModelTrace | undefined;
+    const traces: AgentModelTrace[] = [];
     let reply: AgentReply | undefined;
     const fields = input as Record<string, unknown>;
     const summaryCustomers = Array.isArray(fields.customers) ? fields.customers : undefined;
@@ -492,14 +499,24 @@ export class AgentRuntime {
       if (!this.model) throw new HttpError(503, 'agent_model_unavailable', '助手暂未开启，可以手动填写。');
       const messages: AgentMessage[] = [{ role: 'system', content: prompt },
         { role: 'user', content: JSON.stringify(input) }];
-      reply = await withDeadline(this.model(messages, run.signal, value => { trace = value; }, allowed), run.signal);
+      reply = await withDeadline(this.model(messages, run.signal, value => { traces.push(value); }, allowed), run.signal);
       return reply;
     } finally {
       // 测试桩和部分模型实现不会回填 trace，这里用回复里的原始工具调用补齐内部记录。
-      const toolCalls = trace?.toolCalls?.length ? trace.toolCalls
-        : reply?.tool_calls?.length ? summarizeToolCalls(reply.tool_calls) : undefined;
-      await this.recordModel(run, started, trace, { phase: allowed.length ? 'edit' : 'other',
-        ...(inputSummary ? { inputSummary } : {}), ...(toolCalls ? { toolCalls } : {}) });
+      const phase = allowed.length ? 'edit' : 'other';
+      if (!traces.length) {
+        const toolCalls = reply?.tool_calls?.length ? summarizeToolCalls(reply.tool_calls) : undefined;
+        await this.recordModel(run, started, undefined, { phase,
+          ...(inputSummary ? { inputSummary } : {}), ...(toolCalls ? { toolCalls } : {}) });
+      } else {
+        for (const [index, trace] of traces.entries()) {
+          const last = index === traces.length - 1;
+          const toolCalls = trace.toolCalls?.length ? trace.toolCalls
+            : last && reply?.tool_calls?.length ? summarizeToolCalls(reply.tool_calls) : undefined;
+          await this.recordModel(run, started, trace, { phase,
+            ...(inputSummary ? { inputSummary } : {}), ...(toolCalls ? { toolCalls } : {}) });
+        }
+      }
     }
   }
 

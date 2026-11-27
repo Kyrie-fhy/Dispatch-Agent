@@ -1096,8 +1096,10 @@ export const adminDataScript = `
     var rows = models.map(function (event) {
       var payload = event.payload || {};
       var toolCalls = Array.isArray(payload.toolCalls) ? payload.toolCalls : [];
+      var attempt = num(payload.attempt);
       return '<div class="tech-row"><b>' + esc(payload.model || '模型调用') + '</b>' +
         '<span class="line-sub">' + esc(payload.promptVersion || '—') + ' · ' + esc(payload.outcome || '—') +
+        (attempt > 1 ? ' · ' + esc('第 ' + attempt + ' 次尝试') : '') +
         ' · 耗时 ' + num(payload.elapsedMs) + 'ms · 输入 ' + num(payload.inputTokens) + ' Token · 输出 ' +
         num(payload.outputTokens) + ' Token</span>' +
         (toolCalls.length ? '<span class="line-sub">工具：' + toolCalls.map(function (call) {

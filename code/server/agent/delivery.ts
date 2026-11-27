@@ -249,9 +249,10 @@ export async function runDelivery(store: AgentStore, trips: TripStore, model: De
       output = await model(phase, body, signal, trace => traces.push(trace));
       return output;
     } finally {
-      for (const trace of traces) {
+      for (const [index, trace] of traces.entries()) {
+        const last = index === traces.length - 1;
         const entry: Record<string, unknown> = { ...trace, phase, inputSummary: traceInputSummary(phase, body) };
-        if (phase === 'candidate' && !(Array.isArray(entry.toolCalls) && entry.toolCalls.length)
+        if (last && phase === 'candidate' && !(Array.isArray(entry.toolCalls) && entry.toolCalls.length)
             && isObject(output) && typeof output.tool === 'string' && isObject(output.args)) {
           entry.toolCalls = [{ name: output.tool, arguments: JSON.stringify(output.args).slice(0, 2_000) }];
         }

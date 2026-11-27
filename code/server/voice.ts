@@ -196,12 +196,12 @@ export function configuredSpeechModel(env: NodeJS.ProcessEnv, retryOptions?: Ret
   const key = env.DISPATCH_TEXT_MODEL_KEY?.trim();
   if (!key) return undefined;
   return async (wave, signal) => {
-    const total = linkedTimeoutSignal(32_000, signal);
+    const total = linkedTimeoutSignal(35_000, signal);
     try {
       return await runWithSingleRetry(async () => {
         const form = new FormData();
         form.set('file', new Blob([new Uint8Array(wave)], { type: 'audio/wav' }), 'recording.wav');
-        const perAttempt = linkedTimeoutSignal(18_000, total.signal);
+        const perAttempt = linkedTimeoutSignal(25_000, total.signal);
         try {
           const response = await fetch('https://api.deepseek.com/v1/tools/asr', {
             method: 'POST', redirect: 'error', signal: perAttempt.signal,

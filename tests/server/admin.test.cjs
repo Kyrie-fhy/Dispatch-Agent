@@ -976,7 +976,9 @@ test('7.0-1 mistake redaction preserves ruleId/decision/layer, redacts store nam
   const agentModel = async (_messages, _signal, record) => {
     const operation = { action: 'add', customer: '私密王记餐饮', product: '水饺', quantity: '2', unit: '箱', price: '99' };
     record({ model: 'fixture-agent', promptVersion: 'a1-agent-v5', outcome: 'tool_calls', elapsedMs: 3,
-      inputTokens: 70, outputTokens: 15, toolCalls: [{ name: 'edit_draft', arguments: JSON.stringify({ operations: [operation] }) }] });
+      inputTokens: 70, outputTokens: 15, toolCalls: [{ name: 'edit_draft', arguments: JSON.stringify({
+        operations: [operation], decision: '私密王记餐饮 13812345678', layer: '私密王记餐饮',
+      }) }] });
     return toolReply('edit_draft', { operations: [operation] });
   };
   const intentModel = async (_text, _context, _signal, record) => {
@@ -1024,6 +1026,7 @@ test('7.0-1 mistake redaction preserves ruleId/decision/layer, redacts store nam
     assert.equal(redactedDecision.layer, 'edit');
     assert.match(redactedDecision.target, /门店甲\d+ 水饺/);
     assert.equal(JSON.stringify(mistake.caseJson).includes('私密王记餐饮'), false);
+    assert.equal(JSON.stringify(mistake.caseJson).includes('13812345678'), false);
 
     // Offline render check for guardrailHtml with and without decisions (including XSS escape)
     const { adminDataScript } = require('../../code/server-dist/server/admin/page-data');

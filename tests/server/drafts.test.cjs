@@ -3692,3 +3692,31 @@ test('7.0-1 control-layer ruleId decisions are persisted to internal tool events
   const invalidCandidate = sanitizeVoiceCorrection(rawText, undefined);
   assert.equal(invalidCandidate.revertedRuleId, undefined);
 });
+
+test('7.0-1 P0 regression: emoji at 120-char boundary in decision target never splits UTF-16 surrogates or rolls back PG jsonb', { timeout: 60_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const emojiShop = '甲'.repeat(119) + '😀';
+  const api = await start(db, undefined, undefined, undefined, undefined,
+    async () => makeToolReply(['edit_draft', { operations: [
+      { action: 'add', customer: emojiShop, product: '水饺', quantity: '1', unit: '箱' },
+      { action: 'add', customer: '普通门店', product: '汤圆', quantity: '2', unit: '箱' },
+    ] }]),
+    async () => ({ draft: true, preview: false, query: false, answering: false }));
+  const token = await login(api, 'a');
+  const { rows: [account] } = await db.admin.query("SELECT id FROM dispatch.accounts WHERE identity_subject = 'a'");
+  await db.admin.query("INSERT INTO dispatch.parties (account_id, id, name) VALUES ($1, $2, '已有熟客')", [account.id, randomUUID()]);
+
+  const draft = await read(api, token);
+  const submitted = await agentPost(api, token, 'turns', agentInput(draft, `${emojiShop}一箱水饺，普通门店两箱汤圆`));
+  assert.equal(submitted.status, 202);
+  const done = await waitForAgent(api, token, submitted.data.turnId);
+  assert.equal(done.status, 'completed', JSON.stringify(done));
+  const after = await read(api, token);
+  assert.equal(after.revision, draft.revision + 1);
+  assert.deepEqual(after.customers.map(c => c.customer), [emojiShop, '普通门店']);
+  const { rows: [toolEvent] } = await db.admin.query(
+    "SELECT payload FROM dispatch.agent_events WHERE account_id = $1 AND turn_id = $2 AND kind = 'tool'",
+    [account.id, submitted.data.turnId]);
+  const unresolved = toolEvent.payload.result.decisions.find(d => d.ruleId === 'customer.unresolved_mention');
+  assert.equal(unresolved.target, emojiShop);
+});

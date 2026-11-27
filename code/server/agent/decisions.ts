@@ -11,12 +11,22 @@ export type ControlDecision = {
 
 export const maxControlDecisions = 32;
 
+function clipText(text: string, limit: number): string {
+  return Array.from(text)
+    .slice(0, limit)
+    .join('')
+    .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '');
+}
+
 export function clipDecisions(list: readonly ControlDecision[]): ControlDecision[] {
-  return list.slice(0, maxControlDecisions).map(({ ruleId, decision, layer, reason, target }) => ({
-    ruleId,
-    decision,
-    layer,
-    reason: reason.slice(0, 200),
-    ...(target ? { target: target.slice(0, 120) } : {}),
-  }));
+  return list.slice(0, maxControlDecisions).map(({ ruleId, decision, layer, reason, target }) => {
+    const clippedTarget = target ? clipText(target, 120) : '';
+    return {
+      ruleId,
+      decision,
+      layer,
+      reason: clipText(reason, 200),
+      ...(clippedTarget ? { target: clippedTarget } : {}),
+    };
+  });
 }

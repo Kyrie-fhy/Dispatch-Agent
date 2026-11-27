@@ -970,3 +970,135 @@ test('eval-case export pairs A1/A2 traces, stays read-only and replays through t
     await api.stop();
   }
 });
+
+test('7.0-1 mistake redaction preserves ruleId/decision/layer, redacts store names in target/reason, and admin renders decision badges', { timeout: 60_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const agentModel = async (_messages, _signal, record) => {
+    const operation = { action: 'add', customer: '私密王记餐饮', product: '水饺', quantity: '2', unit: '箱', price: '99' };
+    record({ model: 'fixture-agent', promptVersion: 'a1-agent-v5', outcome: 'tool_calls', elapsedMs: 3,
+      inputTokens: 70, outputTokens: 15, toolCalls: [{ name: 'edit_draft', arguments: JSON.stringify({
+        operations: [operation], decision: '私密王记餐饮 13812345678', layer: '私密王记餐饮',
+      }) }] });
+    return toolReply('edit_draft', { operations: [operation] });
+  };
+  const intentModel = async (_text, _context, _signal, record) => {
+    record({ model: 'fixture-intent', promptVersion: 'a1-agent-v5', outcome: 'received_json', elapsedMs: 1,
+      inputTokens: 30, outputTokens: 5 });
+    return { draft: true, preview: false, query: false, answering: false };
+  };
+  const adminToken = 'admin-decision-redact-token-0123456789';
+  const api = await start(db, { agentModel, intentModel, adminToken });
+  try {
+    const token = await login(api, 'a');
+    const { rows: [account] } = await db.owner.query(
+      "SELECT id FROM dispatch.accounts WHERE identity_provider = 'development' AND identity_subject = 'a'");
+    const partyId = randomUUID();
+    await db.owner.query("INSERT INTO dispatch.parties (account_id, id, name) VALUES ($1, $2, '私密王记餐饮')", [account.id, partyId]);
+    const draft = await read(api, token);
+    const submitted = await api.request('/v1/agent/turns', { method: 'POST', token,
+      body: agentInput(draft, '私密王记餐饮要两箱水饺') });
+    assert.equal(submitted.status, 202);
+    assert.equal((await waitForAgent(api, token, submitted.data.turnId)).status, 'completed');
+
+    const auth = adminAuth(adminToken);
+    const evalCase = await api.request(`/admin/api/accounts/${account.id}/turns/${submitted.data.turnId}/eval-case`, {
+      authorization: auth,
+    });
+    assert.equal(evalCase.status, 200, JSON.stringify(evalCase.data));
+    const toolObs = evalCase.data.observed.tools.find(item => item.name === 'edit_draft');
+    assert.ok(toolObs?.result?.decisions?.length);
+    assert.equal(toolObs.result.decisions[0].ruleId, 'edit.ungrounded_price');
+    assert.equal(toolObs.result.decisions[0].decision, 'block');
+    assert.equal(toolObs.result.decisions[0].layer, 'edit');
+    assert.equal(toolObs.result.decisions[0].target, '私密王记餐饮 水饺');
+
+    const created = await fetch(`${api.origin}/admin/api/accounts/${account.id}/mistakes`, {
+      method: 'POST',
+      headers: { authorization: auth, origin: api.origin, 'content-type': 'application/json' },
+      body: JSON.stringify({ turnId: submitted.data.turnId, category: '价格没配上', expectedOutcome: '不要幻觉填价', includeCatalog: false }),
+    });
+    assert.equal(created.status, 200);
+    const mistake = await created.json();
+    const redactedDecision = mistake.caseJson.observed.tools.find(item => item.name === 'edit_draft')?.result?.decisions?.[0];
+    assert.ok(redactedDecision, JSON.stringify(mistake.caseJson.observed.tools));
+    assert.equal(redactedDecision.ruleId, 'edit.ungrounded_price');
+    assert.equal(redactedDecision.decision, 'block');
+    assert.equal(redactedDecision.layer, 'edit');
+    assert.match(redactedDecision.target, /门店甲\d+ 水饺/);
+    assert.equal(JSON.stringify(mistake.caseJson).includes('私密王记餐饮'), false);
+    assert.equal(JSON.stringify(mistake.caseJson).includes('13812345678'), false);
+
+    // Offline render check for guardrailHtml with and without decisions (including XSS escape)
+    const { adminDataScript } = require('../../code/server-dist/server/admin/page-data');
+    let renderedHtml = '';
+    const viewEl = {
+      get innerHTML() { return renderedHtml; },
+      set innerHTML(html) { renderedHtml = String(html); },
+      querySelectorAll() { return []; },
+    };
+    const turnsFixture = [
+      {
+        id: 'turn-with-decisions', createdAt: '2026-11-27T04:00:00Z', elapsedMs: 1200,
+        status: 'completed', undone: false, unpriced: false, question: true,
+        userText: '测试单', assistantText: '请确认', materials: [],
+        events: [{
+          seq: 1, kind: 'tool', payload: {
+            name: 'edit_draft',
+            result: {
+              outcome: 'issues',
+              decisions: [
+                { ruleId: 'edit.ungrounded_price', decision: 'block', layer: 'edit', reason: '单价未在原话出现 <script>alert(1)</script>', target: '王记 <b>水饺</b>' },
+                { ruleId: 'edit.duplicate_product_ambiguity', decision: 'confirm', layer: 'edit', reason: '已有同款待确认' },
+                { ruleId: 'catalog.stripped_ungrounded_detail', decision: 'modify', layer: 'catalog', reason: '已剥离未提品牌' },
+              ],
+            },
+          },
+        }],
+      },
+      {
+        id: 'turn-legacy-no-decisions', createdAt: '2026-11-27T04:01:00Z', elapsedMs: 800,
+        status: 'completed', undone: false, unpriced: false, question: false,
+        userText: '正常单', assistantText: '已录入', materials: [],
+        events: [{ seq: 1, kind: 'tool', payload: { name: 'edit_draft', result: { outcome: 'applied' } } }],
+      },
+    ];
+    const esc = value => String(value === null || value === undefined ? '' : value)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    const views = {};
+    const sandbox = {
+      window: {
+        __dispatchAdmin: {
+          state: { token: 'tok', section: 'quality', accountId: 'acc-1', qualityFilter: { filter: 'all' } },
+          views, esc, centsToYuan: c => (c / 100).toFixed(2), moneyText: c => `¥${(c / 100).toFixed(2)}`,
+          fmtDay: s => s, fmtTime: s => s, toast: () => {}, copyText: () => {}, openModal: () => {},
+          currentAccount: () => ({ id: 'acc-1', remarkName: '老张' }),
+          accountLabel: () => '老张',
+          errorCard: m => `<div>${m}</div>`,
+          loadMaterialUrl: () => Promise.resolve(''),
+          loadAccounts: () => Promise.resolve(),
+        },
+      },
+      document: {
+        getElementById: id => id === 'view' ? viewEl : null,
+        querySelector: () => null,
+        querySelectorAll: () => [],
+        addEventListener: () => {},
+      },
+      fetch: async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ turns: turnsFixture }) }),
+      setTimeout, clearTimeout, URL, encodeURIComponent,
+    };
+    vm.runInNewContext(adminDataScript, sandbox);
+    views.quality.mount();
+    await new Promise(resolveWait => setTimeout(resolveWait, 30));
+    assert.ok(renderedHtml.includes('decision-list'), '应渲染决策列表');
+    assert.ok(renderedHtml.includes('<span class="badge bad">拦截</span>'), 'block 应渲染拦截徽章');
+    assert.ok(renderedHtml.includes('<span class="badge warn">待确认</span>'), 'confirm 应渲染待确认徽章');
+    assert.ok(renderedHtml.includes('<span class="badge info">已修正</span>'), 'modify 应渲染已修正徽章');
+    assert.ok(renderedHtml.includes('<code class="mono">edit.ungrounded_price</code>'), '应渲染等宽 ruleId');
+    assert.ok(renderedHtml.includes('&lt;script&gt;alert(1)&lt;/script&gt;'), 'reason 必须转义防 XSS');
+    assert.equal(renderedHtml.includes('<script>alert(1)</script>'), false);
+    assert.ok(renderedHtml.includes('这一轮没有需要留空或选款的货品，草稿按正常护栏通过。'), '无 decisions 回合沿用原兜底文案');
+  } finally {
+    await api.stop();
+  }
+});

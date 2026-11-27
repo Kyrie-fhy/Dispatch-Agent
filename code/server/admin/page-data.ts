@@ -1050,11 +1050,20 @@ export const adminDataScript = `
   };
   var guardrailHtml = function (turn) {
     var lines = [];
+    var decisions = [];
     (turn.events || []).forEach(function (event) {
       if (event.kind !== 'tool' || !event.payload || !event.payload.result) return;
       var result = event.payload.result;
       if (Array.isArray(result.catalog)) result.catalog.forEach(function (line) { lines.push(line); });
+      if (Array.isArray(result.decisions)) result.decisions.forEach(function (item) {
+        if (item && typeof item === 'object' && item.ruleId) decisions.push(item);
+      });
     });
+    var decisionMeta = {
+      block: { label: '拦截', tone: 'bad' },
+      confirm: { label: '待确认', tone: 'warn' },
+      modify: { label: '已修正', tone: 'info' }
+    };
     var html = '';
     if (lines.length) {
       html += '<ul class="timeline-list">' + lines.slice(0, 20).map(function (line) {
@@ -1068,6 +1077,14 @@ export const adminDataScript = `
         return '<li><b>' + esc(line.product || '未命名货品') + '</b> ' + price + ' ' + flags + '</li>';
       }).join('') + '</ul>';
     }
+    if (decisions.length) {
+      html += '<ul class="timeline-list decision-list">' + decisions.slice(0, 32).map(function (item) {
+        var meta = decisionMeta[item.decision] || { label: str(item.decision || '规则'), tone: 'neutral' };
+        return '<li>' + badge(meta.label, meta.tone) + ' <code class="mono">' + esc(item.ruleId) + '</code> ' +
+          esc(item.reason || '') +
+          (item.target ? '<span class="line-sub">对象：' + esc(item.target) + '</span>' : '') + '</li>';
+      }).join('') + '</ul>';
+    }
     if (turn.unpriced) {
       html += notice('这一轮有明细没配上价：AI 会留空等你补价，不会把价格算成 ¥0.00。', true);
     }
@@ -1079,8 +1096,10 @@ export const adminDataScript = `
     var rows = models.map(function (event) {
       var payload = event.payload || {};
       var toolCalls = Array.isArray(payload.toolCalls) ? payload.toolCalls : [];
+      var attempt = num(payload.attempt);
       return '<div class="tech-row"><b>' + esc(payload.model || '模型调用') + '</b>' +
         '<span class="line-sub">' + esc(payload.promptVersion || '—') + ' · ' + esc(payload.outcome || '—') +
+        (attempt > 1 ? ' · ' + esc('第 ' + attempt + ' 次尝试') : '') +
         ' · 耗时 ' + num(payload.elapsedMs) + 'ms · 输入 ' + num(payload.inputTokens) + ' Token · 输出 ' +
         num(payload.outputTokens) + ' Token</span>' +
         (toolCalls.length ? '<span class="line-sub">工具：' + toolCalls.map(function (call) {

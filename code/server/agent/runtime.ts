@@ -14,6 +14,7 @@ import { overlappingItems, readDirectory } from '../memory';
 import type { ModelTrace } from '../text-model';
 import { isPlaceholder, normalized, readImageOrder, readable, targetRows, TextOrders } from '../text-orders';
 import { TripStore } from '../trips';
+import { clipDecisions, type ControlDecision } from './decisions';
 import { invalidTool, prepareEdits, PreviousQuestions } from './edit';
 import { AgentMessage, AgentModel, AgentModelTrace, AgentReply, agentPrompt, agentPromptVersion, otherPrompt, summarizeToolCalls } from './model';
 import { AgentStore, checkDraft, event, Input, saveChange, TurnKey } from './store';
@@ -99,18 +100,21 @@ function summarizeOperations(value: unknown) {
 }
 
 function summarizeEditResult(result: Record<string, unknown>) {
+  const decisions = Array.isArray(result.decisions) && result.decisions.length
+    ? { decisions: result.decisions } : {};
   if ('confirmation' in result) {
     const confirmation = isObject(result.confirmation) ? result.confirmation : {};
     return { outcome: 'confirmation', accept: confirmation.accept,
-      question: isObject(result.question) ? String(result.question.text ?? '') : '' };
+      question: isObject(result.question) ? String(result.question.text ?? '') : '', ...decisions };
   }
   if (!('revision' in result) && Array.isArray(result.questions)) {
-    return { outcome: 'questions', questions: summarizeQuestions(result.questions as Question[]) };
+    return { outcome: 'questions', questions: summarizeQuestions(result.questions as Question[]), ...decisions };
   }
-  if ('issues' in result) return { outcome: 'issues', issues: result.issues };
+  if ('issues' in result) return { outcome: 'issues', issues: result.issues, ...decisions };
   return { outcome: 'applied', added: result.added, revision: result.revision, lines: result.lines,
     ...(Array.isArray(result.questions) ? { questions: summarizeQuestions(result.questions as Question[]), conflicts: result.conflicts } : {}),
     ...(result.catalog ? { catalog: result.catalog } : {}),
+    ...decisions,
     customerLinks: Array.isArray(result.links) ? result.links.filter(isObject).map(link => ({
       spoken: link.spoken, canonicalName: link.canonicalName, matchedBy: link.matchedBy, merged: Boolean(link.merged),
     })) : [] };
@@ -354,6 +358,7 @@ export class AgentRuntime {
     });
     const lines: string[] = [];
     const links: CustomerLink[] = [];
+    const decisions: ControlDecision[] = [];
     if (!changed.length) return { lines, links };
     const resolved = directory ?? await readDirectory(client, account);
     for (const customer of changed) {
@@ -361,11 +366,25 @@ export class AgentRuntime {
       const mention = resolveCustomerMention(resolved, spoken);
       if (mention.status !== 'resolved') {
         lines.push(`${spoken}：待选店`);
+        decisions.push({
+          ruleId: 'customer.unresolved_mention',
+          decision: 'confirm',
+          layer: 'customer_link',
+          reason: '未能唯一匹配到熟客档案，需人工选店或新建客户',
+          target: spoken,
+        });
         continue;
       }
       const sibling = draft.customers.find(entry => entry !== customer && entry.partyId === mention.customerId);
       if (sibling && overlappingItems(sibling, customer).length) {
         lines.push(`${spoken} → ${mention.canonicalName}：有相似明细，待核对合并`);
+        decisions.push({
+          ruleId: 'customer.merge_overlap_blocked',
+          decision: 'confirm',
+          layer: 'customer_link',
+          reason: '命中同一熟客但存在同款或相似明细，暂不静默合并',
+          target: `${spoken} → ${mention.canonicalName}`,
+        });
         continue;
       }
       if (sibling) {
@@ -382,7 +401,7 @@ export class AgentRuntime {
       links.push({ draftCustomerId: sibling?.id ?? customer.id, spoken, customerId: mention.customerId,
         canonicalName: mention.canonicalName, matchedBy: mention.matchedBy, merged: Boolean(sibling) });
     }
-    return { lines, links };
+    return { lines, links, ...(decisions.length ? { decisions: clipDecisions(decisions) } : {}) };
   }
 
   private async saveDraftChange(client: PoolClient, run: Run, revision: number, lines: string[], links: CustomerLink[], digest?: string) {
@@ -432,7 +451,7 @@ export class AgentRuntime {
 
   private async identify(run: Run, context: Awaited<ReturnType<AgentStore['context']>>) {
     const started = Date.now();
-    let trace: AgentModelTrace | undefined;
+    const traces: AgentModelTrace[] = [];
     let intents: Intent | undefined;
     const customers = context.draft.customers.flatMap(customer => {
       const items = customer.items.filter(item => !isPlaceholder(item));
@@ -448,17 +467,24 @@ export class AgentRuntime {
       if (!this.intentModel) throw new HttpError(503, 'agent_model_unavailable', '助手暂未开启，可以手动填写。');
       intents = await withDeadline(this.intentModel(run.input.text, {
         customers, questions: context.previous?.payload.questions ?? [], lastSummary: context.lastSummary,
-      }, run.signal, value => { trace = value; }), run.signal);
+      }, run.signal, value => { traces.push(value); }), run.signal);
       intents = { ...intents, answering: Boolean(intents.draft && intents.answering && context.previous?.payload.questions.length) };
       return intents;
     } finally {
-      await this.recordModel(run, started, trace, { phase: 'intent', intents, inputSummary });
+      if (!traces.length) {
+        await this.recordModel(run, started, undefined, { phase: 'intent', intents, inputSummary });
+      } else {
+        for (const [index, trace] of traces.entries()) {
+          const last = index === traces.length - 1;
+          await this.recordModel(run, started, trace, { phase: 'intent', ...(last ? { intents } : {}), inputSummary });
+        }
+      }
     }
   }
 
   private async complete(run: Run, prompt: string, input: object, allowed: readonly string[]) {
     const started = Date.now();
-    let trace: AgentModelTrace | undefined;
+    const traces: AgentModelTrace[] = [];
     let reply: AgentReply | undefined;
     const fields = input as Record<string, unknown>;
     const summaryCustomers = Array.isArray(fields.customers) ? fields.customers : undefined;
@@ -473,14 +499,24 @@ export class AgentRuntime {
       if (!this.model) throw new HttpError(503, 'agent_model_unavailable', '助手暂未开启，可以手动填写。');
       const messages: AgentMessage[] = [{ role: 'system', content: prompt },
         { role: 'user', content: JSON.stringify(input) }];
-      reply = await withDeadline(this.model(messages, run.signal, value => { trace = value; }, allowed), run.signal);
+      reply = await withDeadline(this.model(messages, run.signal, value => { traces.push(value); }, allowed), run.signal);
       return reply;
     } finally {
       // 测试桩和部分模型实现不会回填 trace，这里用回复里的原始工具调用补齐内部记录。
-      const toolCalls = trace?.toolCalls?.length ? trace.toolCalls
-        : reply?.tool_calls?.length ? summarizeToolCalls(reply.tool_calls) : undefined;
-      await this.recordModel(run, started, trace, { phase: allowed.length ? 'edit' : 'other',
-        ...(inputSummary ? { inputSummary } : {}), ...(toolCalls ? { toolCalls } : {}) });
+      const phase = allowed.length ? 'edit' : 'other';
+      if (!traces.length) {
+        const toolCalls = reply?.tool_calls?.length ? summarizeToolCalls(reply.tool_calls) : undefined;
+        await this.recordModel(run, started, undefined, { phase,
+          ...(inputSummary ? { inputSummary } : {}), ...(toolCalls ? { toolCalls } : {}) });
+      } else {
+        for (const [index, trace] of traces.entries()) {
+          const last = index === traces.length - 1;
+          const toolCalls = trace.toolCalls?.length ? trace.toolCalls
+            : last && reply?.tool_calls?.length ? summarizeToolCalls(reply.tool_calls) : undefined;
+          await this.recordModel(run, started, trace, { phase,
+            ...(inputSummary ? { inputSummary } : {}), ...(toolCalls ? { toolCalls } : {}) });
+        }
+      }
     }
   }
 
@@ -612,8 +648,14 @@ export class AgentRuntime {
             if (!('draft' in prepared) || !prepared.draft) return prepared;
             const linked = await this.linkCustomers(client, account, prepared.draft, before, directory);
             const priced = await applyCatalogToDraft(client, account, prepared.draft, before, catalog, String(args.source));
+            const decisions = clipDecisions([
+              ...(prepared.decisions ?? []),
+              ...(linked.decisions ?? []),
+              ...(priced.decisions ?? []),
+            ]);
             if (JSON.stringify(prepared.draft.customers) === JSON.stringify(before.customers)) {
-              return { issues: [{ code: 'edit_needs_review', message: '没有可写入的新内容，请核对货品或明确单价。' }] };
+              return { issues: [{ code: 'edit_needs_review', message: '没有可写入的新内容，请核对货品或明确单价。' }],
+                ...(decisions.length ? { decisions } : {}) };
             }
             const { draft } = readSaveDraft(draftId, { ...prepared.draft, revision: run.revision, requestId });
             const revision = run.revision + 1;
@@ -623,7 +665,8 @@ export class AgentRuntime {
             await this.saveDraftChange(client, run, revision, lines, linked.links);
             return { added: prepared.added, lines, revision, links: linked.links,
               ...(prepared.questions?.length ? { questions: prepared.questions, conflicts: prepared.conflicts } : {}),
-              ...(priced.changes.length ? { catalog: priced.changes } : {}) };
+              ...(priced.changes.length ? { catalog: priced.changes } : {}),
+              ...(decisions.length ? { decisions } : {}) };
           });
         if ('revision' in result && result.revision !== undefined) run.revision = result.revision;
         if ('links' in result && result.links) run.customerLinks.push(...result.links);
@@ -636,7 +679,7 @@ export class AgentRuntime {
       const lineCount = (draft: typeof before) => targetRows(draft).filter(({ item }) => !isPlaceholder(item)).length;
       try {
         const image = readImageOrder({ draftId, revision: run.revision, materialId, requestId: randomUUID() });
-        let linked = { lines: [] as string[], links: [] as CustomerLink[] };
+        let linked: Awaited<ReturnType<AgentRuntime['linkCustomers']>> = { lines: [], links: [] };
         let priced: Awaited<ReturnType<typeof applyCatalogToDraft>> | undefined;
         const result = await withDeadline(this.orders.importImage(account, image, run.checkSession, {
           signal, trace: () => {}, recognized,
@@ -648,15 +691,18 @@ export class AgentRuntime {
           saved: (client, draft, digest) => this.saveDraftChange(client, run, draft.revision,
             [`图片新增 ${lineCount(draft) - lineCount(before)} 行`, ...linked.lines, ...(priced?.lines ?? [])], linked.links, digest),
         }), signal);
+        const decisions = clipDecisions([...(linked.decisions ?? []), ...(priced?.decisions ?? [])]);
         if ('issues' in result) {
-          await this.traceTool(run, name, args, { outcome: 'issues', issues: result.issues });
+          await this.traceTool(run, name, args, { outcome: 'issues', issues: result.issues,
+            ...(decisions.length ? { decisions } : {}) });
           return result;
         }
         run.revision = result.draft.revision;
         run.customerLinks.push(...linked.links);
         const added = lineCount(result.draft) - lineCount(before);
         await this.traceTool(run, name, args, { outcome: 'applied', added, revision: run.revision,
-          ...(priced?.changes.length ? { catalog: priced.changes } : {}) });
+          ...(priced?.changes.length ? { catalog: priced.changes } : {}),
+          ...(decisions.length ? { decisions } : {}) });
         return { added };
       } catch (error) {
         if (error instanceof HttpError && ['duplicate_order_image', 'unsupported_order_image'].includes(error.code)) {

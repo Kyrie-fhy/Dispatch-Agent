@@ -1323,7 +1323,7 @@ test('S7a organizes a private image once, retries failures and protects newer dr
     if (url !== 'https://api.deepseek.com/chat/completions') return originalFetch(url, options);
     const body = JSON.parse(options.body);
     calls.push(body);
-    if (calls.length === 1) return new Response('{}', { status: 503 });
+    if (calls.length === 1) return new Response('{}', { status: 400 });
     if (calls.length === 3) {
       notifyStarted();
       await finish;
@@ -1433,7 +1433,7 @@ test('S7b transcribes WAV without changing a draft and rejects stale results', {
     assert.equal(file.name, 'recording.wav');
     assert.equal(file.type, 'audio/wav');
     assert.deepEqual(Buffer.from(await file.arrayBuffer()), wave);
-    if (calls.length === 1) return new Response('{}', { status: 503 });
+    if (calls.length === 1) return new Response('{}', { status: 400 });
     if (calls.length === 3) {
       entered();
       await finish;
@@ -3574,4 +3574,149 @@ test('A3 Harness: 全量记忆场景', { timeout: 1_800_000 }, async t => {
   } else {
     assert.deepEqual(summary.failures, []);
   }
+});
+
+test('7.0-1 control-layer ruleId decisions are persisted to internal tool events, hidden from client, and include catalog/voice guards', { timeout: 60_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  let nextToolCall;
+  let nextDeliveryCall;
+  const api = await start(db, undefined, undefined, undefined, undefined,
+    async () => nextToolCall(),
+    async () => ({ draft: true, preview: false, query: false, answering: false }),
+    async phase => phase === 'intent'
+      ? { adjust: true, query: false, answering: false, lookup: 'none', shop: '' }
+      : nextDeliveryCall());
+  const token = await login(api, 'a');
+  const { rows: [account] } = await db.admin.query("SELECT id FROM dispatch.accounts WHERE identity_subject = 'a'");
+
+  const catalog = new CatalogStore(db.admin);
+  const csv = [catalogCsvColumns, ['P1', '1', '冻品', '北禾虾丸500g', '北禾', '虾丸', '500g', '单规格', '箱',
+    '130.00', '在售', '已核实', '']].map(fields => fields.join(',')).join('\n');
+  await catalog.importCsv('dev:a', csv);
+
+  const readToolEvents = async turnId => (await db.admin.query(
+    "SELECT payload FROM dispatch.agent_events WHERE account_id = $1 AND turn_id = $2 AND kind = 'tool' ORDER BY seq",
+    [account.id, turnId])).rows.map(row => row.payload);
+
+  // 1. A1 ungrounded price -> edit.ungrounded_price (block) & client polling hides tool events
+  let draft = await read(api, token);
+  nextToolCall = () => makeToolReply(['edit_draft', { operations: [
+    { action: 'add', customer: '王记餐饮', product: '水饺', quantity: '2', unit: '箱', price: '88' },
+  ] }]);
+  const badPriceTurn = await agentPost(api, token, 'turns', agentInput(draft, '王记餐饮要两箱水饺'));
+  assert.equal(badPriceTurn.status, 202);
+  const badPriceDone = await waitForAgent(api, token, badPriceTurn.data.turnId);
+  assert.equal(badPriceDone.status, 'completed');
+  assert.equal(badPriceDone.events.some(event => event.kind === 'tool'), false, '客户端轮询不得包含内部 tool 事件');
+  const badPriceTools = await readToolEvents(badPriceTurn.data.turnId);
+  assert.ok(badPriceTools.some(tool => tool.name === 'edit_draft' && tool.result.outcome === 'issues'
+    && tool.result.decisions?.some(d => d.ruleId === 'edit.ungrounded_price' && d.decision === 'block' && d.layer === 'edit')),
+    JSON.stringify(badPriceTools));
+
+  // 2. A1 catalog unit mismatch -> catalog.unit_mismatch_price_cleared (block)
+  draft = await read(api, token);
+  nextToolCall = () => makeToolReply(['edit_draft', { operations: [
+    { action: 'add', customer: '王记餐饮', product: '虾丸', quantity: '2', unit: '袋' },
+  ] }]);
+  const unitMismatchTurn = await agentPost(api, token, 'turns', agentInput(draft, '王记餐饮要两袋虾丸'));
+  assert.equal(unitMismatchTurn.status, 202);
+  const unitMismatchDone = await waitForAgent(api, token, unitMismatchTurn.data.turnId);
+  assert.equal(unitMismatchDone.status, 'completed');
+  assert.equal(unitMismatchDone.events.some(event => event.kind === 'tool'), false);
+  const unitMismatchTools = await readToolEvents(unitMismatchTurn.data.turnId);
+  assert.ok(unitMismatchTools.some(tool => tool.name === 'edit_draft' && tool.result.outcome === 'applied'
+    && tool.result.decisions?.some(d => d.ruleId === 'catalog.unit_mismatch_price_cleared' && d.decision === 'block' && d.layer === 'catalog')),
+    JSON.stringify(unitMismatchTools));
+
+  // 3. A1 duplicate product ambiguity -> edit.duplicate_product_ambiguity (confirm)
+  draft = await read(api, token);
+  nextToolCall = () => makeToolReply(['edit_draft', { operations: [
+    { action: 'add', customer: '王记餐饮', product: '虾丸', quantity: '1', unit: '袋' },
+  ] }]);
+  const dupTurn = await agentPost(api, token, 'turns', agentInput(draft, '王记餐饮又要一袋虾丸'));
+  assert.equal(dupTurn.status, 202);
+  const dupDone = await waitForAgent(api, token, dupTurn.data.turnId);
+  assert.equal(dupDone.status, 'completed');
+  assert.equal(dupDone.events.some(event => event.kind === 'tool'), false);
+  const dupTools = await readToolEvents(dupTurn.data.turnId);
+  assert.ok(dupTools.some(tool => tool.name === 'edit_draft'
+    && tool.result.decisions?.some(d => d.ruleId === 'edit.duplicate_product_ambiguity' && d.decision === 'confirm' && d.layer === 'edit'
+      && d.target === '王记餐饮 虾丸')),
+    JSON.stringify(dupTools));
+
+  // 4. A2 locked sheet -> delivery.locked_sheet (block) & client polling hides tool events
+  draft = await read(api, token);
+  const priced = await api.request(`/v1/drafts/${draft.id}`, { method: 'PUT', token, body: {
+    requestId: randomUUID(), revision: draft.revision,
+    customers: [{
+      id: draft.customers[0].id, customer: '王记餐饮', partyId: null,
+      items: [{ id: draft.customers[0].items[0].id, product: '虾丸', brand: '', specification: '', unit: '袋', quantity: '2', price: '40' }],
+    }],
+  } });
+  assert.equal(priced.status, 200, JSON.stringify(priced.data));
+  const preview = await api.request('/v1/trips/preview', { method: 'POST', token,
+    body: { draftId: priced.data.draft.id, revision: priced.data.draft.revision, requestId: randomUUID() } });
+  assert.equal(preview.status, 200, JSON.stringify(preview.data));
+  const confirmed = await api.request('/v1/trips/confirm', { method: 'POST', token,
+    body: { previewId: preview.data.preview.previewId, requestId: randomUUID() } });
+  assert.equal(confirmed.status, 200, JSON.stringify(confirmed.data));
+  const sheetId = confirmed.data.sheets[0].sheetId;
+  const completed = await api.request(`/v1/trips/${confirmed.data.trip.id}/sheets/${sheetId}/delivery/complete`, {
+    method: 'POST', token,
+    body: { version: 1, statusRevision: confirmed.data.trip.statusRevision, requestId: randomUUID() },
+  });
+  assert.equal(completed.status, 200, JSON.stringify(completed.data));
+
+  draft = await read(api, token);
+  nextDeliveryCall = () => ({ tool: 'propose_delivery', args: {
+    sheetNumber: 1, edits: [{ lineNumber: 1, receivedQuantity: 1 }], readyToComplete: false,
+  } });
+  const lockedTurn = await agentPost(api, token, 'turns', agentInput(draft, '王记餐饮虾丸改成1袋'));
+  assert.equal(lockedTurn.status, 202, JSON.stringify(lockedTurn.data));
+  const lockedDone = await waitForAgent(api, token, lockedTurn.data.turnId);
+  assert.equal(lockedDone.status, 'completed');
+  assert.equal(lockedDone.events.some(event => event.kind === 'tool'), false, 'A2 客户端轮询不得包含内部 tool 事件');
+  const lockedTools = await readToolEvents(lockedTurn.data.turnId);
+  assert.ok(lockedTools.some(tool => tool.name === 'propose_delivery' && tool.result.outcome === 'blocked_or_noop'
+    && tool.result.decisions?.some(d => d.ruleId === 'delivery.locked_sheet' && d.decision === 'block' && d.layer === 'delivery'
+      && d.target === '王记餐饮')),
+    JSON.stringify(lockedTools));
+
+  // 5. Voice guard rollback exposes voice.protected_terms_mutated while keeping fallback shape compatible
+  const rawText = '两箱乔总管响铃卷，每箱12元';
+  const reverted = sanitizeVoiceCorrection(rawText, { text: '三箱巧总管响铃卷，每箱12元', corrections: [{ from: '乔总管', to: '巧总管' }] });
+  assert.equal(reverted.revertedRuleId, 'voice.protected_terms_mutated');
+  assert.deepEqual(reverted, { text: rawText, rawText, corrections: [] });
+  const passed = sanitizeVoiceCorrection(rawText, { text: '两箱巧总管响铃卷，每箱12元', corrections: [{ from: '乔总管', to: '巧总管' }] });
+  assert.equal(passed.revertedRuleId, undefined);
+  const invalidCandidate = sanitizeVoiceCorrection(rawText, undefined);
+  assert.equal(invalidCandidate.revertedRuleId, undefined);
+});
+
+test('7.0-1 P0 regression: emoji at 120-char boundary in decision target never splits UTF-16 surrogates or rolls back PG jsonb', { timeout: 60_000 }, async t => {
+  const db = await isolatedDatabase(t);
+  const emojiShop = '甲'.repeat(119) + '😀';
+  const api = await start(db, undefined, undefined, undefined, undefined,
+    async () => makeToolReply(['edit_draft', { operations: [
+      { action: 'add', customer: emojiShop, product: '水饺', quantity: '1', unit: '箱' },
+      { action: 'add', customer: '普通门店', product: '汤圆', quantity: '2', unit: '箱' },
+    ] }]),
+    async () => ({ draft: true, preview: false, query: false, answering: false }));
+  const token = await login(api, 'a');
+  const { rows: [account] } = await db.admin.query("SELECT id FROM dispatch.accounts WHERE identity_subject = 'a'");
+  await db.admin.query("INSERT INTO dispatch.parties (account_id, id, name) VALUES ($1, $2, '已有熟客')", [account.id, randomUUID()]);
+
+  const draft = await read(api, token);
+  const submitted = await agentPost(api, token, 'turns', agentInput(draft, `${emojiShop}一箱水饺，普通门店两箱汤圆`));
+  assert.equal(submitted.status, 202);
+  const done = await waitForAgent(api, token, submitted.data.turnId);
+  assert.equal(done.status, 'completed', JSON.stringify(done));
+  const after = await read(api, token);
+  assert.equal(after.revision, draft.revision + 1);
+  assert.deepEqual(after.customers.map(c => c.customer), [emojiShop, '普通门店']);
+  const { rows: [toolEvent] } = await db.admin.query(
+    "SELECT payload FROM dispatch.agent_events WHERE account_id = $1 AND turn_id = $2 AND kind = 'tool'",
+    [account.id, submitted.data.turnId]);
+  const unresolved = toolEvent.payload.result.decisions.find(d => d.ruleId === 'customer.unresolved_mention');
+  assert.equal(unresolved.target, emojiShop);
 });

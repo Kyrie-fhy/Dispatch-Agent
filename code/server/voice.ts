@@ -4,12 +4,13 @@ import { isObject } from '../miniprogram/core/orders';
 import { spokenNumbers } from '../miniprogram/core/spoken-numbers';
 import { textOrderLimit } from '../miniprogram/core/text-order';
 import { HttpError } from './http-error';
+import { isRetryableStatus, linkedTimeoutSignal, readJsonRetryable, RetryableError, type RetryOptions, runWithSingleRetry } from './retry';
 
 export const voiceMaxBytes = 8 * 1024 * 1024;
 export const voiceMaxJsonBytes = 4 * Math.ceil(voiceMaxBytes / 3) + 64;
 const sampleRates = [8000, 16000, 22050, 24000, 32000, 44100, 48000];
 
-export type SpeechModel = (wave: Buffer) => Promise<unknown>;
+export type SpeechModel = (wave: Buffer, signal?: AbortSignal) => Promise<unknown>;
 
 export type VoiceCorrectionEntry = { from: string; to: string };
 export type VoiceVocabulary = {
@@ -40,11 +41,25 @@ function protectedTerms(text: string) {
   };
 }
 
-export function sanitizeVoiceCorrection(rawText: string, candidate: unknown) {
-  const fallback = { text: rawText, rawText, corrections: [] as VoiceCorrectionEntry[] };
+export type SanitizedVoiceCorrection = {
+  text: string;
+  rawText: string;
+  corrections: VoiceCorrectionEntry[];
+  revertedRuleId?: 'voice.protected_terms_mutated';
+};
+
+export function sanitizeVoiceCorrection(rawText: string, candidate: unknown): SanitizedVoiceCorrection {
+  const fallback: SanitizedVoiceCorrection = { text: rawText, rawText, corrections: [] };
   if (!isObject(candidate) || !validText(candidate.text)) return fallback;
   const text = candidate.text.trim();
-  if (JSON.stringify(protectedTerms(rawText)) !== JSON.stringify(protectedTerms(text))) return fallback;
+  if (JSON.stringify(protectedTerms(rawText)) !== JSON.stringify(protectedTerms(text))) {
+    Object.defineProperty(fallback, 'revertedRuleId', {
+      value: 'voice.protected_terms_mutated',
+      enumerable: false,
+      configurable: true,
+    });
+    return fallback;
+  }
   const corrections: VoiceCorrectionEntry[] = [];
   if (Array.isArray(candidate.corrections)) {
     for (const entry of candidate.corrections) {
@@ -177,21 +192,33 @@ export function readTranscript(value: unknown) {
   return text;
 }
 
-export function configuredSpeechModel(env: NodeJS.ProcessEnv): SpeechModel | undefined {
+export function configuredSpeechModel(env: NodeJS.ProcessEnv, retryOptions?: RetryOptions): SpeechModel | undefined {
   const key = env.DISPATCH_TEXT_MODEL_KEY?.trim();
   if (!key) return undefined;
-  return async wave => {
-    const form = new FormData();
-    form.set('file', new Blob([new Uint8Array(wave)], { type: 'audio/wav' }), 'recording.wav');
+  return async (wave, signal) => {
+    const total = linkedTimeoutSignal(35_000, signal);
     try {
-      const response = await fetch('https://api.deepseek.com/v1/tools/asr', {
-        method: 'POST', redirect: 'error', signal: AbortSignal.timeout(25_000),
-        headers: { Authorization: `Bearer ${key}` }, body: form,
-      });
-      if (!response.ok) throw new Error('provider_error');
-      return await response.json();
+      return await runWithSingleRetry(async () => {
+        const form = new FormData();
+        form.set('file', new Blob([new Uint8Array(wave)], { type: 'audio/wav' }), 'recording.wav');
+        const perAttempt = linkedTimeoutSignal(25_000, total.signal);
+        try {
+          const response = await fetch('https://api.deepseek.com/v1/tools/asr', {
+            method: 'POST', redirect: 'error', signal: perAttempt.signal,
+            headers: { Authorization: `Bearer ${key}` }, body: form,
+          });
+          if (!response.ok) {
+            throw isRetryableStatus(response.status) ? new RetryableError(`provider_${response.status}`) : new Error('provider_error');
+          }
+          return await readJsonRetryable(response, 'invalid_response', perAttempt.signal);
+        } finally {
+          perAttempt.cleanup();
+        }
+      }, { signal: total.signal, backoffMs: retryOptions?.backoffMs });
     } catch {
       throw new HttpError(502, 'voice_model_failed', '语音转写暂未完成，可用原录音重试。');
+    } finally {
+      total.cleanup();
     }
   };
 }

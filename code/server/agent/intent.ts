@@ -1,6 +1,7 @@
 import { isObject } from '../../miniprogram/core/orders';
 import type { Question } from '../../miniprogram/core/agent';
 import { HttpError } from '../http-error';
+import { isRetryableStatus, parseJsonRetryable, readJsonRetryable, RetryableError, type RetryOptions, runWithSingleRetry } from '../retry';
 import type { AgentModelTrace } from './model';
 
 export type Intent = { draft: boolean; preview: boolean; query: boolean; answering: boolean };
@@ -50,57 +51,64 @@ export type IntentResult = Intent & { operations?: unknown[]; questions?: unknow
 export type IntentModel = (text: string, context: IntentContext, signal: AbortSignal,
   trace: (trace: AgentModelTrace) => void) => Promise<IntentResult>;
 
-export function configuredIntentModel(env: NodeJS.ProcessEnv, mode: IntentMode): IntentModel | undefined {
+export function configuredIntentModel(env: NodeJS.ProcessEnv, mode: IntentMode, retryOptions?: RetryOptions): IntentModel | undefined {
   const key = env.DISPATCH_TEXT_MODEL_KEY?.trim();
   const model = env.DISPATCH_AGENT_MODEL?.trim() || 'deepseek-flash';
   if (!key) return;
   return async (text, context, signal, record) => {
-    const started = Date.now();
-    const trace: AgentModelTrace = { model, outcome: 'network_error', elapsedMs: 0, promptVersion: intentPromptVersion };
+    const body = JSON.stringify({
+      model, temperature: 0, max_tokens: mode === 'A' ? 80 : 2000, thinking: { type: 'disabled' },
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: mode === 'A' ? intentPrompt : combinedIntentPrompt },
+        { role: 'user', content: buildIntentInput(text, context) },
+      ],
+    });
     try {
-      const response = await fetch('https://api.deepseek.com/chat/completions', {
-        method: 'POST', redirect: 'error', signal,
-        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model, temperature: 0, max_tokens: mode === 'A' ? 80 : 2000, thinking: { type: 'disabled' },
-          response_format: { type: 'json_object' },
-          messages: [
-            { role: 'system', content: mode === 'A' ? intentPrompt : combinedIntentPrompt },
-            { role: 'user', content: buildIntentInput(text, context) },
-          ],
-        }),
-      });
-      trace.outcome = `provider_${response.status}`;
-      if (!response.ok) throw new Error(trace.outcome);
-      trace.outcome = 'invalid_output';
-      const payload = await response.json();
-      if (!isObject(payload)) throw new Error(trace.outcome);
-      if (typeof payload.model === 'string') trace.model = payload.model;
-      if (typeof payload.id === 'string') trace.providerId = payload.id;
-      if (isObject(payload.usage)) {
-        if (typeof payload.usage.prompt_tokens === 'number') trace.inputTokens = payload.usage.prompt_tokens;
-        if (typeof payload.usage.completion_tokens === 'number') trace.outputTokens = payload.usage.completion_tokens;
-      }
-      const choice = Array.isArray(payload.choices) ? payload.choices[0] : undefined;
-      if (choice?.finish_reason !== 'stop') throw new Error(trace.outcome);
-      const value: unknown = JSON.parse(choice.message.content);
-      if (!isObject(value) || typeof value.draft !== 'boolean' || typeof value.query !== 'boolean' ||
-          typeof value.preview !== 'boolean' || typeof value.answering !== 'boolean') {
-        throw new Error(trace.outcome);
-      }
-      const result: IntentResult = { draft: value.draft, preview: value.preview, query: value.query,
-        answering: value.draft && context.questions.length > 0 && value.answering };
-      if (mode === 'B') {
-        if (!Array.isArray(value.operations) || !Array.isArray(value.questions)) throw new Error(trace.outcome);
-        result.operations = value.operations;
-        result.questions = value.questions;
-      }
-      trace.outcome = 'stop';
-      return result;
+      return await runWithSingleRetry(async attempt => {
+        const started = Date.now();
+        const trace: AgentModelTrace = { model, outcome: 'network_error', elapsedMs: 0, promptVersion: intentPromptVersion, attempt };
+        try {
+          const response = await fetch('https://api.deepseek.com/chat/completions', {
+            method: 'POST', redirect: 'error', signal,
+            headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+            body,
+          });
+          trace.outcome = `provider_${response.status}`;
+          if (!response.ok) {
+            throw isRetryableStatus(response.status) ? new RetryableError(trace.outcome) : new Error(trace.outcome);
+          }
+          trace.outcome = 'invalid_output';
+          const payload = await readJsonRetryable(response, trace.outcome, signal);
+          if (!isObject(payload)) throw new RetryableError(trace.outcome);
+          if (typeof payload.model === 'string') trace.model = payload.model;
+          if (typeof payload.id === 'string') trace.providerId = payload.id;
+          if (isObject(payload.usage)) {
+            if (typeof payload.usage.prompt_tokens === 'number') trace.inputTokens = payload.usage.prompt_tokens;
+            if (typeof payload.usage.completion_tokens === 'number') trace.outputTokens = payload.usage.completion_tokens;
+          }
+          const choice = Array.isArray(payload.choices) ? payload.choices[0] : undefined;
+          if (choice?.finish_reason !== 'stop' || typeof choice?.message?.content !== 'string') throw new RetryableError(trace.outcome);
+          const value = parseJsonRetryable(choice.message.content, trace.outcome);
+          if (!isObject(value) || typeof value.draft !== 'boolean' || typeof value.query !== 'boolean' ||
+              typeof value.preview !== 'boolean' || typeof value.answering !== 'boolean') {
+            throw new RetryableError(trace.outcome);
+          }
+          const result: IntentResult = { draft: value.draft, preview: value.preview, query: value.query,
+            answering: value.draft && context.questions.length > 0 && value.answering };
+          if (mode === 'B') {
+            if (!Array.isArray(value.operations) || !Array.isArray(value.questions)) throw new RetryableError(trace.outcome);
+            result.operations = value.operations;
+            result.questions = value.questions;
+          }
+          trace.outcome = 'stop';
+          return result;
+        } finally {
+          record({ ...trace, attempt, elapsedMs: Date.now() - started });
+        }
+      }, { signal, backoffMs: retryOptions?.backoffMs });
     } catch {
       throw new HttpError(502, 'agent_intent_failed', '助手暂时没有看懂，请重试。');
-    } finally {
-      record({ ...trace, elapsedMs: Date.now() - started });
     }
   };
 }

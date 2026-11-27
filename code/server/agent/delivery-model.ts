@@ -1,5 +1,6 @@
 import { isObject } from '../../miniprogram/core/orders';
 import { HttpError } from '../http-error';
+import { isRetryableStatus, parseJsonRetryable, readJsonRetryable, RetryableError, type RetryOptions, runWithSingleRetry } from '../retry';
 import { summarizeToolCalls, type AgentModelTrace } from './model';
 
 export const deliveryPromptVersion = 'a2-delivery-v3';
@@ -32,56 +33,63 @@ export const deliveryTools = [
 export type DeliveryModel = (phase: 'intent' | 'candidate', input: object, signal: AbortSignal,
   trace: (value: AgentModelTrace) => void) => Promise<unknown>;
 
-export function configuredDeliveryModel(env: NodeJS.ProcessEnv): DeliveryModel | undefined {
+export function configuredDeliveryModel(env: NodeJS.ProcessEnv, retryOptions?: RetryOptions): DeliveryModel | undefined {
   const key = env.DISPATCH_TEXT_MODEL_KEY?.trim();
   if (!key) return;
   const model = env.DISPATCH_A2_MODEL?.trim() || 'deepseek-flash';
   return async (phase, input, signal, record) => {
-    const started = Date.now();
-    const trace = { model, promptVersion: deliveryPromptVersion, outcome: 'network_error', elapsedMs: 0 } as AgentModelTrace;
+    const intent = phase === 'intent';
+    const body = JSON.stringify({ model, temperature: 0, max_tokens: intent ? 128 : 900, thinking: { type: 'disabled' },
+      ...(intent ? { response_format: { type: 'json_object' } } : { tools: deliveryTools, tool_choice: 'required', parallel_tool_calls: false }),
+      messages: [{ role: 'system', content: intent ? deliveryIntentPrompt : deliveryCandidatePrompt },
+        { role: 'user', content: JSON.stringify(input) }],
+    });
     try {
-      const intent = phase === 'intent';
-      const response = await fetch('https://api.deepseek.com/chat/completions', {
-        method: 'POST', redirect: 'error', signal,
-        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model, temperature: 0, max_tokens: intent ? 128 : 900, thinking: { type: 'disabled' },
-          ...(intent ? { response_format: { type: 'json_object' } } : { tools: deliveryTools, tool_choice: 'required', parallel_tool_calls: false }),
-          messages: [{ role: 'system', content: intent ? deliveryIntentPrompt : deliveryCandidatePrompt },
-            { role: 'user', content: JSON.stringify(input) }],
-        }),
-      });
-      trace.outcome = `provider_${response.status}`;
-      if (!response.ok) throw new Error(trace.outcome);
-      trace.outcome = 'invalid_response';
-      const payload = await response.json();
-      if (!isObject(payload)) throw new Error(trace.outcome);
-      if (typeof payload.model === 'string') trace.model = payload.model;
-      if (typeof payload.id === 'string') trace.providerId = payload.id;
-      if (isObject(payload.usage)) {
-        if (typeof payload.usage.prompt_tokens === 'number') trace.inputTokens = payload.usage.prompt_tokens;
-        if (typeof payload.usage.completion_tokens === 'number') trace.outputTokens = payload.usage.completion_tokens;
-      }
-      const choice = Array.isArray(payload.choices) ? payload.choices[0] : undefined;
-      const message = choice?.message;
-      if (intent && choice?.finish_reason === 'stop' && typeof message?.content === 'string') {
-        const result: unknown = JSON.parse(message.content);
-        trace.outcome = 'received_json';
-        return result;
-      }
-      if (!intent && choice?.finish_reason === 'tool_calls' && message?.tool_calls?.length === 1) {
-        const tool: unknown = message.tool_calls[0].function;
-        if (isObject(tool) && typeof tool.arguments === 'string') {
-          const args: unknown = JSON.parse(tool.arguments);
-          trace.outcome = 'tool_calls';
-          trace.toolCalls = summarizeToolCalls(message.tool_calls);
-          return { tool: tool.name, args };
+      return await runWithSingleRetry(async attempt => {
+        const started = Date.now();
+        const trace = { model, promptVersion: deliveryPromptVersion, outcome: 'network_error', elapsedMs: 0, attempt } as AgentModelTrace;
+        try {
+          const response = await fetch('https://api.deepseek.com/chat/completions', {
+            method: 'POST', redirect: 'error', signal,
+            headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+            body,
+          });
+          trace.outcome = `provider_${response.status}`;
+          if (!response.ok) {
+            throw isRetryableStatus(response.status) ? new RetryableError(trace.outcome) : new Error(trace.outcome);
+          }
+          trace.outcome = 'invalid_response';
+          const payload = await readJsonRetryable(response, trace.outcome, signal);
+          if (!isObject(payload)) throw new RetryableError(trace.outcome);
+          if (typeof payload.model === 'string') trace.model = payload.model;
+          if (typeof payload.id === 'string') trace.providerId = payload.id;
+          if (isObject(payload.usage)) {
+            if (typeof payload.usage.prompt_tokens === 'number') trace.inputTokens = payload.usage.prompt_tokens;
+            if (typeof payload.usage.completion_tokens === 'number') trace.outputTokens = payload.usage.completion_tokens;
+          }
+          const choice = Array.isArray(payload.choices) ? payload.choices[0] : undefined;
+          const message = choice?.message;
+          if (intent && choice?.finish_reason === 'stop' && typeof message?.content === 'string') {
+            const result = parseJsonRetryable(message.content, trace.outcome);
+            trace.outcome = 'received_json';
+            return result;
+          }
+          if (!intent && choice?.finish_reason === 'tool_calls' && message?.tool_calls?.length === 1) {
+            const tool: unknown = message.tool_calls[0].function;
+            if (isObject(tool) && typeof tool.arguments === 'string') {
+              const args = parseJsonRetryable(tool.arguments, trace.outcome);
+              trace.outcome = 'tool_calls';
+              trace.toolCalls = summarizeToolCalls(message.tool_calls);
+              return { tool: tool.name, args };
+            }
+          }
+          throw new RetryableError(trace.outcome);
+        } finally {
+          record({ ...trace, attempt, elapsedMs: Date.now() - started });
         }
-      }
-      throw new Error(trace.outcome);
+      }, { signal, backoffMs: retryOptions?.backoffMs });
     } catch {
       throw new HttpError(502, 'delivery_model_failed', '现场助手没能处理这条消息，请重试或去送货单修改。');
-    } finally {
-      record({ ...trace, elapsedMs: Date.now() - started });
     }
   };
 }

@@ -203,11 +203,15 @@ async function caseRedactor(client: PoolClient, accountId: string, snapshot: Sna
     }).replace(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi, '[邮箱已隐藏]');
   };
   const schemaValues = /^(id|key|partyKey|linkedPartyKey|partyId|lineId|sheetId|variantId|productId|status|mode|source|medium|role|promptVersion|priceSource|catalogStatus|issuedAt|exportedAt|catalogVariantKey|catalogProductKey)$/;
+  const safeDecisionField = (key: string | undefined, value: string) =>
+    (key === 'ruleId' && /^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(value))
+    || (key === 'decision' && /^(modify|confirm|block)$/.test(value))
+    || (key === 'layer' && /^(edit|customer_link|catalog|delivery|voice)$/.test(value));
   function sanitize(value: unknown, key?: string): unknown {
     if (Array.isArray(value)) return value.map(item => sanitize(item, key));
     if (isObject(value)) return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, sanitize(item, name)]));
     if (typeof value === 'number' && /^(phone|telephone|mobile)$/i.test(key ?? '')) return redact(String(value));
-    if (typeof value !== 'string' || schemaValues.test(key ?? '')) return value;
+    if (typeof value !== 'string' || schemaValues.test(key ?? '') || safeDecisionField(key, value)) return value;
     const embedded = key === 'arguments' ? embeddedJson(value) : undefined;
     return embedded === undefined ? redact(value) : JSON.stringify(sanitize(embedded));
   }
